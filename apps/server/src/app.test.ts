@@ -1,0 +1,1541 @@
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { CoceanDatabase } from "@cocean/database";
+import { convertLegacyStillCore } from "@cocean/still-catalog";
+import { buildApp } from "./app.js";
+import { createSession } from "./auth.js";
+import type { ServerConfig } from "./config.js";
+
+const close: Array<() => Promise<void> | void> = [];
+
+afterEach(async () => {
+  for (const callback of close.splice(0).reverse()) await callback();
+});
+
+function testConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
+  return {
+    host: "127.0.0.1",
+    port: 8787,
+    databasePath: ":memory:",
+    musicRoot: "/path/that/does/not/exist",
+    cacheRoot: "./cache",
+    webRoot: null,
+    musicBrainzEnabled: false,
+    metadataContact: null,
+    musicBrainzBaseUrl: "https://musicbrainz.org/ws/2/",
+    stillCatalogPath: "/path/that/does/not/exist/still-catalog.json",
+    authBootstrapFile: null,
+    sessionTtlHours: 720,
+    cookieSecure: false,
+    credentialKeyPath: join(
+      tmpdir(),
+      `cocean-server-test-${process.pid}.credential-key`,
+    ),
+    ffmpegPath: "ffmpeg",
+    ffprobePath: "ffprobe",
+    appleLookupEnabled: false,
+    appleLookupBaseUrl: "https://itunes.apple.com/",
+    externalLookupTimeoutMs: 8_000,
+    demoData: false,
+    logLevel: "silent",
+    nodeEnv: "test",
+    ...overrides,
+  };
+}
+
+describe("COCEAN HTTP API", () => {
+  it("exposes an empty but valid library", async () => {
+    const database = new CoceanDatabase(":memory:");
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const response = await app.inject({ method: "GET", url: "/api/v1/albums" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      items: [],
+      limit: 100,
+      offset: 0,
+      total: 0,
+    });
+  });
+
+  it("filters grouped library albums by a concrete integrity issue", async () => {
+    const database = new CoceanDatabase(":memory:");
+    const base = {
+      rootId: "music",
+      title: "Shared Album",
+      albumArtist: "Shared Artist",
+      year: 2020,
+      discCount: 1,
+      fileIds: [],
+      audioSummary: null,
+      mixedAudioSpecs: false,
+      artwork: {
+        source: "SIDECAR" as const,
+        url: "/cover.jpg",
+        mimeType: "image/jpeg",
+        width: 1000,
+        height: 1000,
+      },
+      matchStatus: "NEEDS_REVIEW" as const,
+    };
+    database.replaceAlbumsForRoot("music", [
+      { ...base, id: "shared-a", groupKey: "shared-a" },
+      { ...base, id: "shared-b", groupKey: "shared-b" },
+      {
+        ...base,
+        id: "healthy",
+        groupKey: "healthy",
+        title: "Healthy Album",
+      },
+    ]);
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/albums?issue=IDENTITY_OVERLAP",
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    const groupedAlbumId = response.json().items[0]?.id as string;
+    expect(response.json()).toEqual(
+      expect.objectContaining({
+        total: 1,
+        items: [
+          expect.objectContaining({
+            title: "Shared Album",
+            versionCount: 2,
+            issues: expect.arrayContaining([
+              expect.objectContaining({ code: "IDENTITY_OVERLAP" }),
+            ]),
+          }),
+        ],
+      }),
+    );
+
+    const [legacyDetail, groupedDetail] = await Promise.all([
+      app.inject({ method: "GET", url: "/api/v1/albums/shared-a" }),
+      app.inject({
+        method: "GET",
+        url: `/api/v1/albums/${groupedAlbumId}`,
+      }),
+    ]);
+    expect(legacyDetail.statusCode, legacyDetail.body).toBe(200);
+    expect(groupedDetail.statusCode, groupedDetail.body).toBe(200);
+    expect(legacyDetail.json().id).toBe(groupedAlbumId);
+    expect(legacyDetail.json()).toEqual(groupedDetail.json());
+  });
+
+  it("queues a read-only library scan", async () => {
+    const database = new CoceanDatabase(":memory:");
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/scans",
+      payload: { rootId: "music", mode: "FULL" },
+    });
+    expect(response.statusCode).toBe(202);
+    expect(response.json()).toEqual(
+      expect.objectContaining({
+        rootId: "music",
+        mode: "FULL",
+        triggerSource: "MANUAL",
+        status: "QUEUED",
+      }),
+    );
+    const cancelled = await app.inject({
+      method: "POST",
+      url: `/api/v1/scans/${response.json().id}/cancel`,
+    });
+    expect(cancelled.statusCode).toBe(200);
+    expect(cancelled.json()).toEqual(
+      expect.objectContaining({ status: "CANCELLED" }),
+    );
+  });
+
+  it("retries a failed scan with an auditable source and the same root mutex", async () => {
+    const database = new CoceanDatabase(":memory:");
+    database.createScanJob({
+      id: "failed-scan",
+      rootId: "music",
+      mode: "INCREMENTAL",
+      triggerSource: "AUTO_DISCOVERY",
+      retryOfScanJobId: null,
+      status: "QUEUED",
+      totalFiles: 0,
+      processedFiles: 0,
+      parsedFiles: 0,
+      failedFiles: 0,
+      reusedFiles: 0,
+      stableAlbumDirectories: 0,
+      deferredAlbumDirectories: 0,
+      createdAt: "2026-08-12T00:00:00.000Z",
+      startedAt: null,
+      finishedAt: null,
+      error: null,
+      cancelRequestedAt: null,
+    });
+    database.claimNextScanJob();
+    database.finishScanJob("failed-scan", "NAS unavailable");
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+
+    const retried = await app.inject({
+      method: "POST",
+      url: "/api/v1/scans/failed-scan/retry",
+    });
+    expect(retried.statusCode, retried.body).toBe(202);
+    expect(retried.json()).toEqual(
+      expect.objectContaining({
+        rootId: "music",
+        mode: "INCREMENTAL",
+        triggerSource: "RETRY",
+        retryOfScanJobId: "failed-scan",
+      }),
+    );
+    expect(database.scanRequiresAlbumStability(retried.json().id)).toBe(true);
+    const duplicate = await app.inject({
+      method: "POST",
+      url: "/api/v1/scans/failed-scan/retry",
+    });
+    expect(duplicate.statusCode).toBe(409);
+    expect(database.listScanJobs()).toHaveLength(2);
+  });
+
+  it("bootstraps the first owner, signs in with a Session and manages local accounts", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cocean-auth-"));
+    close.push(() => rm(directory, { recursive: true, force: true }));
+    const secret = join(directory, "owner");
+    const ownerPassword = "a-strong-owner-password";
+    await writeFile(secret, `owner:${ownerPassword}\n`, { mode: 0o600 });
+    const database = new CoceanDatabase(":memory:");
+    const app = await buildApp({
+      config: testConfig({
+        authBootstrapFile: secret,
+        credentialKeyPath: join(directory, "credential.key"),
+        nodeEnv: "production",
+      }),
+      database,
+    });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+
+    const wrong = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/login",
+      payload: { username: "owner", password: "not-the-password" },
+    });
+    expect(wrong.statusCode).toBe(401);
+
+    const login = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/login",
+      payload: { username: "owner", password: ownerPassword },
+    });
+    expect(login.statusCode, login.body).toBe(200);
+    const setCookie = String(login.headers["set-cookie"]);
+    expect(setCookie).toContain("HttpOnly");
+    expect(setCookie).toContain("SameSite=Strict");
+    expect(setCookie).not.toContain(ownerPassword);
+    const cookie = setCookie.split(";", 1)[0]!;
+    expect(database.getUserByUsername("owner")?.passwordHash).toMatch(
+      /^scrypt\$/,
+    );
+    expect(database.getUserByUsername("owner")?.passwordHash).not.toContain(
+      ownerPassword,
+    );
+
+    const session = await app.inject({
+      method: "GET",
+      url: "/api/v1/auth/session",
+      headers: { cookie },
+    });
+    expect(session.statusCode).toBe(200);
+    expect(session.json().user).toEqual(
+      expect.objectContaining({ username: "owner", role: "ADMIN" }),
+    );
+
+    const member = await app.inject({
+      method: "POST",
+      url: "/api/v1/users",
+      headers: { cookie },
+      payload: {
+        username: "listener",
+        displayName: "Listener",
+        password: "listener-password-2026",
+        role: "MEMBER",
+      },
+    });
+    expect(member.statusCode, member.body).toBe(201);
+    expect(member.json()).toEqual(
+      expect.objectContaining({ username: "listener", role: "MEMBER" }),
+    );
+
+    const model = await app.inject({
+      method: "PUT",
+      url: "/api/v1/model/configuration",
+      headers: { cookie },
+      payload: {
+        enabled: true,
+        baseUrl: "https://api.openai.com/v1",
+        model: "test-model",
+        apiKey: "private-test-api-key",
+      },
+    });
+    expect(model.statusCode, model.body).toBe(200);
+    expect(model.json()).toEqual(
+      expect.objectContaining({
+        enabled: true,
+        model: "test-model",
+        apiKeyConfigured: true,
+      }),
+    );
+    expect(database.getStoredModelConfiguration().credentialJson).not.toContain(
+      "private-test-api-key",
+    );
+
+    await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/logout",
+      headers: { cookie },
+    });
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: "/api/v1/auth/session",
+          headers: { cookie },
+        })
+      ).statusCode,
+    ).toBe(401);
+  });
+
+  it("verifies a saved OpenAI-compatible model and exposes the real connection state", async () => {
+    const database = new CoceanDatabase(":memory:");
+    let requestBody: Record<string, unknown> | null = null;
+    const app = await buildApp({
+      config: testConfig(),
+      database,
+      modelFetch: async (input, init) => {
+        expect(input.toString()).toBe(
+          "https://models.example.test/v1/chat/completions",
+        );
+        expect(init.headers).toEqual(
+          expect.objectContaining({
+            authorization: "Bearer private-model-key",
+          }),
+        );
+        requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: "OK" } }],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const cookie = adminCookie(database);
+    const saved = await app.inject({
+      method: "PUT",
+      url: "/api/v1/model/configuration",
+      headers: { cookie },
+      payload: {
+        enabled: true,
+        baseUrl: "https://models.example.test/v1/",
+        model: "verified-model",
+        apiKey: "private-model-key",
+      },
+    });
+    expect(saved.statusCode, saved.body).toBe(200);
+    expect(saved.json()).toEqual(
+      expect.objectContaining({ verificationStatus: "UNVERIFIED" }),
+    );
+
+    const verified = await app.inject({
+      method: "POST",
+      url: "/api/v1/model/configuration/verify",
+      headers: { cookie },
+    });
+    expect(verified.statusCode, verified.body).toBe(200);
+    expect(verified.json()).toEqual(
+      expect.objectContaining({
+        model: "verified-model",
+        verificationStatus: "VERIFIED",
+        verificationMessage: "连接正常",
+        lastCheckedAt: expect.any(String),
+      }),
+    );
+    expect(requestBody).toEqual(
+      expect.objectContaining({ model: "verified-model", max_tokens: 1 }),
+    );
+    const capabilities = await app.inject({
+      method: "GET",
+      url: "/api/v1/capabilities",
+    });
+    expect(capabilities.json().model).toEqual(
+      expect.objectContaining({
+        enabled: true,
+        configured: true,
+        verified: true,
+        verificationStatus: "VERIFIED",
+      }),
+    );
+  });
+
+  it("pages every scan failure for full-library acceptance reports", async () => {
+    const database = new CoceanDatabase(":memory:");
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    database.createScanJob({
+      id: "scan-failures",
+      rootId: "music",
+      mode: "FULL",
+      status: "COMPLETED_WITH_WARNINGS",
+      totalFiles: 2,
+      processedFiles: 2,
+      parsedFiles: 0,
+      failedFiles: 2,
+      reusedFiles: 0,
+      createdAt: "2026-08-12T00:00:00.000Z",
+      startedAt: "2026-08-12T00:00:01.000Z",
+      finishedAt: "2026-08-12T00:00:02.000Z",
+      error: null,
+      cancelRequestedAt: null,
+    });
+    for (const [index, code] of [
+      "METADATA_PARSE_FAILED",
+      "UNSUPPORTED_MEDIA",
+    ].entries()) {
+      database.recordScanFailure({
+        scanJobId: "scan-failures",
+        rootId: "music",
+        relativePath: `Artist/Album/${index + 1}.flac`,
+        code,
+        stage: "probe",
+        message: code,
+        recoverable: true,
+      });
+    }
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/scans/scan-failures/failures?limit=1&offset=1",
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      items: [
+        expect.objectContaining({
+          code: "UNSUPPORTED_MEDIA",
+          relativePath: "Artist/Album/2.flac",
+        }),
+      ],
+      limit: 1,
+      offset: 1,
+      total: 2,
+    });
+  });
+
+  it("serves a frozen scan report and paged file-result ledger", async () => {
+    const database = new CoceanDatabase(":memory:");
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    database.createScanJob({
+      id: "scan-report",
+      rootId: "music",
+      mode: "FULL",
+      status: "RUNNING",
+      totalFiles: 0,
+      processedFiles: 0,
+      parsedFiles: 0,
+      failedFiles: 0,
+      reusedFiles: 0,
+      createdAt: "2026-08-12T00:00:00.000Z",
+      startedAt: "2026-08-12T00:00:01.000Z",
+      finishedAt: null,
+      error: null,
+      cancelRequestedAt: null,
+    });
+    database.recordScanDiscovery({
+      scanJobId: "scan-report",
+      rulesVersion: "server-test/1",
+      candidates: 1,
+      regularFiles: 2,
+      auxiliaryFiles: 1,
+      ignoredFiles: 0,
+      skippedSymlinks: 0,
+      traversalErrors: 0,
+    });
+    database.recordScanFileResult({
+      scanJobId: "scan-report",
+      rootId: "music",
+      relativePath: "Artist/Album/SACD.iso",
+      extension: ".iso",
+      candidateKind: "KNOWN_UNSUPPORTED_AUDIO",
+      outcome: "UNSUPPORTED",
+      mediaFileId: null,
+      sizeBytes: null,
+      modifiedAtMs: null,
+      errorCode: "UNSUPPORTED_MEDIA",
+      errorStage: "discover",
+      warningCodes: [],
+    });
+    database.finalizeSuccessfulScan({
+      scanJobId: "scan-report",
+      rootId: "music",
+      stagedFiles: [],
+      seenRelativePaths: ["Artist/Album/SACD.iso"],
+      albums: [],
+      withWarnings: true,
+    });
+
+    const report = await app.inject({
+      method: "GET",
+      url: "/api/v1/scans/scan-report/report",
+    });
+    expect(report.statusCode, report.body).toBe(200);
+    expect(report.json()).toEqual(
+      expect.objectContaining({
+        rulesVersion: "server-test/1",
+        candidates: 1,
+        processed: 1,
+        parsed: 0,
+        unsupported: 1,
+        failed: 0,
+        auxiliaryFiles: 1,
+        summaryHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        invariants: expect.objectContaining({ valid: true }),
+      }),
+    );
+    const files = await app.inject({
+      method: "GET",
+      url: "/api/v1/scans/scan-report/files?limit=1&offset=0&outcome=UNSUPPORTED",
+    });
+    expect(files.statusCode, files.body).toBe(200);
+    expect(files.json()).toEqual({
+      items: [
+        expect.objectContaining({
+          relativePath: "Artist/Album/SACD.iso",
+          candidateKind: "KNOWN_UNSUPPORTED_AUDIO",
+          outcome: "UNSUPPORTED",
+        }),
+      ],
+      limit: 1,
+      offset: 0,
+      total: 1,
+    });
+  });
+
+  it("rejects source-library writeback in v1", async () => {
+    const database = new CoceanDatabase(":memory:");
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const settings = database.getSettings();
+    const cookie = adminCookie(database);
+    const response = await app.inject({
+      method: "PUT",
+      url: "/api/v1/settings",
+      headers: { cookie },
+      payload: { ...settings, sourceWritebackEnabled: true },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual(
+      expect.objectContaining({ error: "SOURCE_WRITEBACK_DISABLED" }),
+    );
+  });
+
+  it("keeps the Music root deployment-managed and rejects unavailable automation", async () => {
+    const database = new CoceanDatabase(":memory:");
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const settings = database.getSettings();
+    const cookie = adminCookie(database);
+
+    const changedRoot = await app.inject({
+      method: "PUT",
+      url: "/api/v1/settings",
+      headers: { cookie },
+      payload: {
+        ...settings,
+        libraryRoots: settings.libraryRoots.map((root) => ({
+          ...root,
+          containerPath: "/tmp/not-the-compose-mount",
+        })),
+      },
+    });
+    expect(changedRoot.statusCode).toBe(400);
+    expect(changedRoot.json()).toEqual(
+      expect.objectContaining({ error: "LIBRARY_ROOT_DEPLOYMENT_MANAGED" }),
+    );
+
+    for (const [field, error] of [
+      ["scanOnStart", "SCAN_ON_START_UNAVAILABLE"],
+      ["deviceCopyMetadataEnabled", "DEVICE_COPY_PIPELINE_UNAVAILABLE"],
+    ] as const) {
+      const response = await app.inject({
+        method: "PUT",
+        url: "/api/v1/settings",
+        headers: { cookie },
+        payload: { ...settings, [field]: true },
+      });
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toEqual(expect.objectContaining({ error }));
+    }
+  });
+
+  it("accepts persisted auto discovery settings and rejects interval boundaries", async () => {
+    const database = new CoceanDatabase(":memory:");
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const settings = database.getSettings();
+    const cookie = adminCookie(database);
+    const enabled = await app.inject({
+      method: "PUT",
+      url: "/api/v1/settings",
+      headers: { cookie },
+      payload: {
+        ...settings,
+        libraryRoots: settings.libraryRoots.map((root) => ({
+          ...root,
+          autoDiscoveryEnabled: true,
+          autoDiscoveryIntervalMinutes: 1,
+        })),
+      },
+    });
+    expect(enabled.statusCode, enabled.body).toBe(200);
+    expect(enabled.json().libraryRoots[0]).toEqual(
+      expect.objectContaining({
+        autoDiscoveryEnabled: true,
+        autoDiscoveryIntervalMinutes: 1,
+      }),
+    );
+
+    for (const interval of [0, 1441]) {
+      const response = await app.inject({
+        method: "PUT",
+        url: "/api/v1/settings",
+        headers: { cookie },
+        payload: {
+          ...enabled.json(),
+          libraryRoots: enabled
+            .json()
+            .libraryRoots.map((root: Record<string, unknown>) => ({
+              ...root,
+              autoDiscoveryIntervalMinutes: interval,
+            })),
+        },
+      });
+      expect(response.statusCode).toBe(400);
+    }
+  });
+
+  it("records ownership without inventing device capabilities", async () => {
+    const database = new CoceanDatabase(":memory:");
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/gear/devices",
+      headers: { cookie: adminCookie(database) },
+      payload: {
+        manufacturer: "Astell&Kern",
+        model: "SP3000M",
+        category: "DAP",
+        ownership: "OWNED",
+      },
+    });
+    expect(response.statusCode, response.body).toBe(201);
+    expect(response.json()).toEqual(
+      expect.objectContaining({
+        model: "SP3000M",
+        ownership: "OWNED",
+        capabilities: expect.objectContaining({
+          verifiedAt: null,
+          supportedFormats: [],
+        }),
+      }),
+    );
+  });
+
+  it("edits an AK File Drop target without exposing or erasing its password", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cocean-target-"));
+    close.push(() => rm(directory, { recursive: true, force: true }));
+    const database = new CoceanDatabase(":memory:");
+    const app = await buildApp({
+      config: testConfig({
+        credentialKeyPath: join(directory, "credential.key"),
+      }),
+      database,
+    });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const cookie = adminCookie(database);
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/delivery-targets",
+      headers: { cookie },
+      payload: {
+        name: "SP3000M",
+        kind: "NETWORK",
+        transport: "AK_FILE_DROP",
+        location: "ftp://192.168.1.20:1234/",
+        username: "player",
+        password: "temporary-player-password",
+        enabled: true,
+      },
+    });
+    expect(created.statusCode, created.body).toBe(201);
+    expect(created.body).not.toContain("temporary-player-password");
+
+    const updated = await app.inject({
+      method: "PUT",
+      url: `/api/v1/delivery-targets/${created.json().id}`,
+      headers: { cookie },
+      payload: {
+        name: "SP3000M · AK File Drop",
+        kind: "NETWORK",
+        transport: "AK_FILE_DROP",
+        location: "ftp://192.168.1.21:1234/",
+        username: "player",
+        password: "",
+        enabled: true,
+      },
+    });
+    expect(updated.statusCode, updated.body).toBe(200);
+    expect(updated.json()).toEqual(
+      expect.objectContaining({
+        location: "ftp://192.168.1.21:1234/",
+        credentialConfigured: true,
+      }),
+    );
+    expect(
+      database.getStoredDeliveryTarget(created.json().id)?.credentialJson,
+    ).toBeTruthy();
+    expect(
+      database.getStoredDeliveryTarget(created.json().id)?.credentialJson,
+    ).not.toContain("temporary-player-password");
+  });
+
+  it("creates and returns a physical-only Album without inventing digital files", async () => {
+    const database = new CoceanDatabase(":memory:");
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/albums",
+      payload: {
+        title: "Physical Album",
+        albumArtist: "Collection Artist",
+        year: 1988,
+        medium: "VINYL",
+      },
+    });
+    expect(response.statusCode, response.body).toBe(201);
+    expect(response.json()).toEqual(
+      expect.objectContaining({
+        title: "Physical Album",
+        hasDigital: false,
+        physicalMedia: ["VINYL"],
+        tracks: [],
+        sourceRoot: null,
+      }),
+    );
+    const list = await app.inject({ method: "GET", url: "/api/v1/albums" });
+    expect(list.json().items).toEqual([
+      expect.objectContaining({ title: "Physical Album", hasDigital: false }),
+    ]);
+  });
+
+  it("adds a physical medium to an exact digital Album identity instead of creating a duplicate", async () => {
+    const database = new CoceanDatabase(":memory:");
+    database.replaceAlbumsForRoot("music", [
+      {
+        id: "digital-album",
+        rootId: "music",
+        groupKey: "artist/folder\0artist\0album",
+        title: "Album",
+        albumArtist: "Artist",
+        year: 1999,
+        discCount: 1,
+        fileIds: [],
+        audioSummary: null,
+        mixedAudioSpecs: false,
+        artwork: {
+          source: "NONE",
+          url: null,
+          mimeType: null,
+          width: null,
+          height: null,
+        },
+        matchStatus: "UNMATCHED",
+      },
+    ]);
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/albums",
+      payload: {
+        title: "Album",
+        albumArtist: "Artist",
+        year: 1999,
+        medium: "CD",
+      },
+    });
+    expect(response.statusCode, response.body).toBe(201);
+    expect(response.json()).toEqual(
+      expect.objectContaining({
+        primaryVersionId: "digital-album",
+        physicalMedia: ["CD"],
+      }),
+    );
+    expect(database.countAlbums()).toBe(1);
+  });
+
+  it("returns the stable LibraryAlbum id consistently for physical-copy POST and GET", async () => {
+    const database = new CoceanDatabase(":memory:");
+    database.replaceAlbumsForRoot("music", [
+      {
+        id: "copy-local-version",
+        rootId: "music",
+        groupKey: "copy",
+        title: "Copy Album",
+        albumArtist: "Artist",
+        year: 2000,
+        discCount: 1,
+        fileIds: [],
+        audioSummary: null,
+        mixedAudioSpecs: false,
+        artwork: {
+          source: "NONE",
+          url: null,
+          mimeType: null,
+          width: null,
+          height: null,
+        },
+        matchStatus: "UNMATCHED",
+      },
+    ]);
+    const stableId = database.getAlbumSummary("copy-local-version")!.id;
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/albums/copy-local-version/physical-copies",
+      payload: { medium: "CD", quantity: 1 },
+    });
+    expect(created.statusCode, created.body).toBe(201);
+    expect(created.json().albumId).toBe(stableId);
+    const listed = await app.inject({
+      method: "GET",
+      url: `/api/v1/albums/${stableId}/physical-copies`,
+    });
+    expect(listed.statusCode, listed.body).toBe(200);
+    expect(listed.json().items).toEqual([
+      expect.objectContaining({ id: created.json().id, albumId: stableId }),
+    ]);
+    expect(
+      database.raw
+        .prepare("SELECT album_id FROM physical_copies WHERE id=?")
+        .get(created.json().id),
+    ).toEqual({ album_id: "copy-local-version" });
+  });
+
+  it("keeps MusicBrainz results as reviewable evidence until confirmation", async () => {
+    const database = new CoceanDatabase(":memory:");
+    database.replaceAlbumsForRoot("music", [
+      {
+        id: "album-match",
+        rootId: "music",
+        groupKey: "artist\0album",
+        title: "Local Album",
+        albumArtist: "Local Artist",
+        year: 1994,
+        discCount: 1,
+        fileIds: [],
+        audioSummary: null,
+        mixedAudioSpecs: false,
+        artwork: {
+          source: "NONE",
+          url: null,
+          mimeType: null,
+          width: null,
+          height: null,
+        },
+        matchStatus: "UNMATCHED",
+      },
+    ]);
+    const app = await buildApp({
+      config: testConfig(),
+      database,
+      releaseCatalogClient: {
+        searchReleases: async (input) => [
+          {
+            id: "candidate-1",
+            albumId: input.albumId,
+            source: "MUSICBRAINZ",
+            sourceId: "f1b2d3c4-1111-4222-8333-123456789abc",
+            title: "Remote Album",
+            artistCredit: "Remote Artist",
+            releaseDate: "1994-09-01",
+            country: "GB",
+            status: "Official",
+            barcode: "1234567890123",
+            labels: ["Still Test"],
+            catalogNumbers: ["STILL-001"],
+            mediaFormats: ["CD"],
+            trackCount: 2,
+            coverArtAvailable: true,
+            sourceScore: 98,
+            fetchedAt: "2026-08-12T00:00:00.000Z",
+          },
+        ],
+      },
+    });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const libraryAlbumId = database.getAlbumSummary("album-match")!.id;
+
+    const search = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${libraryAlbumId}/match-candidates`,
+      payload: {},
+    });
+    expect(search.statusCode, search.body).toBe(200);
+    expect(search.json().items).toEqual([
+      expect.objectContaining({ id: "candidate-1", source: "MUSICBRAINZ" }),
+    ]);
+    expect(database.getAlbum("album-match")).toEqual(
+      expect.objectContaining({
+        title: "Local Album",
+        matchStatus: "NEEDS_REVIEW",
+      }),
+    );
+
+    const confirm = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${libraryAlbumId}/match-candidates/candidate-1/confirm`,
+    });
+    expect(confirm.statusCode, confirm.body).toBe(200);
+    expect(confirm.json().album).toEqual(
+      expect.objectContaining({
+        title: "Local Album",
+        matchStatus: "USER_CONFIRMED",
+        release: expect.objectContaining({
+          musicBrainzReleaseId: "f1b2d3c4-1111-4222-8333-123456789abc",
+        }),
+      }),
+    );
+  });
+
+  it("does not contact a catalog source until it is configured", async () => {
+    const database = new CoceanDatabase(":memory:");
+    database.replaceAlbumsForRoot("music", [
+      {
+        id: "album-unconfigured",
+        rootId: "music",
+        groupKey: "artist\0album",
+        title: "Album",
+        albumArtist: "Artist",
+        year: null,
+        discCount: 1,
+        fileIds: [],
+        audioSummary: null,
+        mixedAudioSpecs: false,
+        artwork: {
+          source: "NONE",
+          url: null,
+          mimeType: null,
+          width: null,
+          height: null,
+        },
+        matchStatus: "UNMATCHED",
+      },
+    ]);
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/albums/album-unconfigured/match-candidates",
+      payload: {},
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual(
+      expect.objectContaining({ error: "CATALOG_SOURCE_NOT_CONFIGURED" }),
+    );
+  });
+
+  it("streams a real indexed track with byte ranges for Listen", async () => {
+    const musicRoot = await mkdtemp(join(tmpdir(), "cocean-listen-"));
+    close.push(() => rm(musicRoot, { recursive: true, force: true }));
+    const relativePath = "Artist/Album/01 Test.flac";
+    await mkdir(join(musicRoot, "Artist/Album"), { recursive: true });
+    await writeFile(join(musicRoot, relativePath), "0123456789");
+    const database = new CoceanDatabase(":memory:", { musicRoot });
+    database.createScanJob({
+      id: "scan-listen",
+      rootId: "music",
+      mode: "FULL",
+      status: "RUNNING",
+      totalFiles: 1,
+      processedFiles: 1,
+      parsedFiles: 1,
+      failedFiles: 0,
+      reusedFiles: 0,
+      createdAt: "2026-08-12T00:00:00.000Z",
+      startedAt: "2026-08-12T00:00:00.000Z",
+      finishedAt: null,
+      error: null,
+      cancelRequestedAt: null,
+    });
+    database.upsertMediaFile("track-1", "music", "scan-listen", {
+      absolutePath: join(musicRoot, relativePath),
+      relativePath,
+      extension: ".flac",
+      sizeBytes: 10,
+      modifiedAtMs: Date.now(),
+      audio: {
+        kind: "PCM",
+        codec: "flac",
+        container: "flac",
+        lossless: true,
+        bitDepth: 24,
+        sampleRate: 96_000,
+        bitrate: null,
+        channels: 2,
+        dsdRate: null,
+      },
+      durationSeconds: 1,
+      tags: {
+        album: "Album",
+        albumArtist: "Artist",
+        title: "Test",
+        artists: ["Artist"],
+        year: 2026,
+        date: null,
+        genre: [],
+        composer: [],
+        label: [],
+        catalogNumber: null,
+        barcode: null,
+        musicBrainzReleaseId: null,
+        discNumber: 1,
+        discTotal: 1,
+        trackNumber: 1,
+        trackTotal: 1,
+      },
+      artwork: [],
+      warnings: [],
+    });
+    database.replaceAlbumsForRoot("music", [
+      {
+        id: "album-listen",
+        rootId: "music",
+        groupKey: "artist\0album",
+        title: "Album",
+        albumArtist: "Artist",
+        year: 2026,
+        discCount: 1,
+        fileIds: ["track-1"],
+        audioSummary: {
+          kind: "PCM",
+          codec: "flac",
+          container: "flac",
+          lossless: true,
+          bitDepth: 24,
+          sampleRate: 96_000,
+          bitrate: null,
+          channels: 2,
+          dsdRate: null,
+        },
+        mixedAudioSpecs: false,
+        artwork: {
+          source: "NONE",
+          url: null,
+          mimeType: null,
+          width: null,
+          height: null,
+        },
+      },
+    ]);
+    const app = await buildApp({
+      config: { ...testConfig(), musicRoot },
+      database,
+    });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/v1/tracks/track-1/listen",
+      headers: { range: "bytes=2-5" },
+    });
+    expect(response.statusCode, response.body).toBe(206);
+    expect(response.headers["content-range"]).toBe("bytes 2-5/10");
+    expect(response.headers["content-type"]).toContain("audio/flac");
+    expect(response.body).toBe("2345");
+    const detail = await app.inject({
+      method: "GET",
+      url: "/api/v1/albums/album-listen",
+    });
+    expect(detail.statusCode, detail.body).toBe(200);
+    expect(detail.json().tracks).toEqual([
+      expect.objectContaining({ id: "track-1", sizeBytes: 10 }),
+    ]);
+  });
+
+  it("serves deterministic verified-catalog recommendations without claiming v0.10 acceptance", async () => {
+    const database = new CoceanDatabase(":memory:");
+    database.installStillCatalog(
+      convertLegacyStillCore({
+        schemaID: "still.local-curated-catalog",
+        schemaVersion: "0.8.0",
+        contentVersion: "catalog-test-v1",
+        recordCount: 2,
+        contentChecksum: "a".repeat(64),
+        records: [
+          {
+            stableEntityID: "still:warm",
+            entityKind: "album",
+            canonicalTitle: "Local Warm Album",
+            primaryArtist: "Local Artist",
+            releaseFamilyID: "release:warm",
+            recordingFamilyID: "recording:warm",
+            musicDomains: ["jazz"],
+            eligibleDomains: ["jazz"],
+            features: ["musical.timbre:warm", "musical.dynamics:soft"],
+            sourceKind: "verified_catalog",
+            sourceRef: "https://example.test/warm",
+            verificationStatus: "verified",
+            editorialStatus: "accepted",
+            contentVersion: "catalog-test-v1",
+            verifiedAt: "2026-08-12T00:00:00.000Z",
+          },
+          {
+            stableEntityID: "still:dark",
+            entityKind: "album",
+            canonicalTitle: "Dark Album",
+            primaryArtist: "Other Artist",
+            releaseFamilyID: "release:dark",
+            recordingFamilyID: "recording:dark",
+            musicDomains: ["ambient"],
+            eligibleDomains: ["ambient"],
+            features: ["musical.timbre:dark"],
+            sourceKind: "verified_catalog",
+            sourceRef: "https://example.test/dark",
+            verificationStatus: "verified",
+            editorialStatus: "accepted",
+            contentVersion: "catalog-test-v1",
+            verifiedAt: "2026-08-12T00:00:00.000Z",
+          },
+        ],
+      }),
+    );
+    database.replaceAlbumsForRoot("music", [
+      {
+        id: "local-warm",
+        rootId: "music",
+        groupKey: "local artist\0local warm album",
+        title: "Local Warm Album",
+        albumArtist: "Local Artist",
+        year: null,
+        discCount: 1,
+        fileIds: [],
+        audioSummary: null,
+        mixedAudioSpecs: false,
+        artwork: {
+          source: "NONE",
+          url: null,
+          mimeType: null,
+          width: null,
+          height: null,
+        },
+        matchStatus: "UNMATCHED",
+      },
+    ]);
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+
+    const today = await app.inject({
+      method: "GET",
+      url: "/api/v1/recommendations/today?dayKey=2026-08-12",
+    });
+    const replay = await app.inject({
+      method: "GET",
+      url: "/api/v1/recommendations/today?dayKey=2026-08-12",
+    });
+    expect(today.statusCode, today.body).toBe(200);
+    expect(today.body).toBe(replay.body);
+    expect(today.json()).toEqual(
+      expect.objectContaining({
+        mode: "VERIFIED_CATALOG_COMPATIBILITY",
+        modelCallCount: 0,
+        v010: expect.objectContaining({
+          status: "WAITING_FOR_ACCEPTED_RUNTIME",
+        }),
+      }),
+    );
+
+    const discover = await app.inject({
+      method: "POST",
+      url: "/api/v1/recommendations/discover",
+      payload: { query: "安静温暖的 90 年代女声" },
+    });
+    expect(discover.statusCode, discover.body).toBe(200);
+    expect(discover.json()).toEqual(
+      expect.objectContaining({
+        query: expect.objectContaining({
+          unsupportedTerms: ["年代", "演唱者性别"],
+        }),
+        primary: expect.objectContaining({
+          stillAlbumId: "still:warm",
+          localAlbum: expect.objectContaining({
+            primaryVersionId: "local-warm",
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("owns the delivery-plan window across clients, isolates targets, rotates stale plans, and rejects duplicate active work", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cocean-delivery-route-"));
+    close.push(() => rm(directory, { recursive: true, force: true }));
+    const musicRoot = join(directory, "music");
+    const cacheRoot = join(directory, "cache");
+    await mkdir(musicRoot, { recursive: true });
+    const database = new CoceanDatabase(":memory:", { musicRoot });
+    database.createScanJob({
+      id: "delivery-route-scan",
+      rootId: "music",
+      mode: "FULL",
+      status: "RUNNING",
+      totalFiles: 4,
+      processedFiles: 4,
+      parsedFiles: 4,
+      failedFiles: 0,
+      reusedFiles: 0,
+      createdAt: "2026-08-13T00:00:00.000Z",
+      startedAt: "2026-08-13T00:00:00.000Z",
+      finishedAt: null,
+      error: null,
+      cancelRequestedAt: null,
+    });
+    const albums = [];
+    for (const suffix of ["one", "two", "three", "four"] as const) {
+      const relativePath = `Artist/Album ${suffix}/01 Track.flac`;
+      const contents = `audio-${suffix}`;
+      const absolutePath = join(musicRoot, relativePath);
+      await mkdir(join(absolutePath, ".."), { recursive: true });
+      await writeFile(absolutePath, contents);
+      const fileId = `delivery-file-${suffix}`;
+      database.upsertMediaFile(fileId, "music", "delivery-route-scan", {
+        absolutePath,
+        relativePath,
+        extension: ".flac",
+        sizeBytes: Buffer.byteLength(contents),
+        modifiedAtMs: 1,
+        fileSha256: createHash("sha256").update(contents).digest("hex"),
+        audio: {
+          kind: "PCM",
+          codec: "flac",
+          container: "flac",
+          lossless: true,
+          bitDepth: 24,
+          sampleRate: 96_000,
+          bitrate: null,
+          channels: 2,
+          dsdRate: null,
+        },
+        durationSeconds: 60,
+        tags: {
+          album: `Album ${suffix}`,
+          albumArtist: "Artist",
+          title: "Track",
+          artists: ["Artist"],
+          year: 2026,
+          date: "2026",
+          genre: [],
+          composer: [],
+          label: [],
+          catalogNumber: null,
+          barcode: null,
+          musicBrainzReleaseId: null,
+          discNumber: 1,
+          discTotal: 1,
+          trackNumber: 1,
+          trackTotal: 1,
+        },
+        rawTags: [],
+        artwork: [],
+        warnings: [],
+      });
+      albums.push({
+        id: `delivery-album-${suffix}`,
+        rootId: "music",
+        groupKey: `artist\0album ${suffix}`,
+        title: `Album ${suffix}`,
+        albumArtist: "Artist",
+        year: 2026,
+        discCount: 1,
+        fileIds: [fileId],
+        audioSummary: null,
+        mixedAudioSpecs: false,
+        artwork: {
+          source: "NONE" as const,
+          url: null,
+          mimeType: null,
+          width: null,
+          height: null,
+        },
+        matchStatus: "NEEDS_REVIEW" as const,
+      });
+    }
+    database.replaceAlbumsForRoot("music", albums);
+    database.finishScanJob("delivery-route-scan");
+    const now = new Date().toISOString();
+    for (const targetId of ["target-one", "target-two", "target-three"])
+      database.createDeliveryTarget({
+        id: targetId,
+        deviceId: null,
+        name: targetId,
+        kind: "MOUNTED_VOLUME",
+        transport: "USB_MOUNT",
+        location: join(directory, targetId),
+        username: null,
+        credentialConfigured: false,
+        enabled: true,
+        verifiedAt: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+    database.createDeliveryTarget({
+      id: "target-ak",
+      deviceId: null,
+      name: "SP3000M",
+      kind: "NETWORK",
+      transport: "AK_FILE_DROP",
+      location: "ftp://sp3000m.test/",
+      username: null,
+      credentialConfigured: false,
+      enabled: true,
+      verifiedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    database.createDeliveryTarget({
+      id: "target-ftp",
+      deviceId: null,
+      name: "Generic FTP",
+      kind: "NETWORK",
+      transport: "FTP",
+      location: "ftp://generic.test/",
+      username: null,
+      credentialConfigured: false,
+      enabled: true,
+      verifiedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const app = await buildApp({
+      config: testConfig({
+        musicRoot,
+        cacheRoot,
+        credentialKeyPath: join(directory, "credential.key"),
+      }),
+      database,
+      deliveryExecution: false,
+    });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const cookie = adminCookie(database);
+    const planId = "11111111-1111-4111-8111-111111111111";
+    const deliver = (album: string, targetId: string, requested?: string) => {
+      const localVersionId = `delivery-album-${album}`;
+      const libraryAlbumId = database.getAlbumSummary(localVersionId)?.id;
+      if (!libraryAlbumId) throw new Error(`Missing ${localVersionId}`);
+      return app.inject({
+        method: "POST",
+        url: `/api/v1/albums/${libraryAlbumId}/deliveries`,
+        headers: { cookie },
+        payload: { targetId, ...(requested ? { planId: requested } : {}) },
+      });
+    };
+
+    const first = await deliver("one", "target-one", planId);
+    expect(first.statusCode, first.body).toBe(202);
+    expect(first.json()).toEqual(
+      expect.objectContaining({
+        planId,
+        fileCount: 1,
+        completedFileCount: 0,
+        totalBytes: Buffer.byteLength("audio-one"),
+      }),
+    );
+    expect(
+      database.getDeliveryJobSourceBundle(first.json().id)
+        ?.deliveryProfileVersion,
+    ).toBeUndefined();
+    const firstLibraryAlbumId =
+      database.getAlbumSummary("delivery-album-one")!.id;
+    const albumHistory = await app.inject({
+      method: "GET",
+      url: `/api/v1/albums/${firstLibraryAlbumId}/deliveries`,
+    });
+    expect(albumHistory.statusCode, albumHistory.body).toBe(200);
+    expect(albumHistory.json().items).toEqual([
+      expect.objectContaining({ id: first.json().id }),
+    ]);
+    const ak = await deliver("two", "target-ak");
+    expect(ak.statusCode, ak.body).toBe(202);
+    expect(
+      database.getDeliveryJobSourceBundle(ak.json().id)?.deliveryProfileVersion,
+    ).toBe("organized-v2");
+    const genericFtp = await deliver("three", "target-ftp");
+    expect(genericFtp.statusCode, genericFtp.body).toBe(202);
+    expect(
+      database.getDeliveryJobSourceBundle(genericFtp.json().id)
+        ?.deliveryProfileVersion,
+    ).toBeUndefined();
+    const second = await deliver("two", "target-one");
+    expect(second.statusCode, second.body).toBe(202);
+    expect(second.json().planId).toBe(planId);
+
+    const duplicate = await deliver("one", "target-one", planId);
+    expect(duplicate.statusCode).toBe(409);
+    expect(duplicate.json()).toEqual(
+      expect.objectContaining({ error: "DELIVERY_ALREADY_ACTIVE" }),
+    );
+
+    const crossTarget = await deliver("three", "target-two", planId);
+    expect(crossTarget.statusCode, crossTarget.body).toBe(202);
+    expect(crossTarget.json().planId).not.toBe(planId);
+
+    const stalePlanId = "22222222-2222-4222-8222-222222222222";
+    database.createDeliveryJob({
+      id: "stale-delivery-plan-job",
+      albumId: "delivery-album-one",
+      targetId: "target-three",
+      targetName: "target-three",
+      transport: "USB_MOUNT",
+      status: "COMPLETED",
+      fileCount: 1,
+      completedFileCount: 0,
+      totalBytes: 9,
+      transferredBytes: 9,
+      verified: true,
+      error: null,
+      createdAt: new Date(Date.now() - 16 * 60 * 1000).toISOString(),
+      startedAt: null,
+      finishedAt: null,
+      planId: stalePlanId,
+    });
+    const stale = await deliver("four", "target-three", stalePlanId);
+    expect(stale.statusCode, stale.body).toBe(202);
+    expect(stale.json().planId).not.toBe(stalePlanId);
+
+    const newestSibling = await deliver("four", "target-one", planId);
+    expect(newestSibling.statusCode, newestSibling.body).toBe(202);
+    expect(newestSibling.json().planId).toBe(planId);
+    database.raw
+      .prepare("UPDATE delivery_jobs SET created_at=? WHERE id=?")
+      .run(
+        new Date(Date.now() + 60_000).toISOString(),
+        newestSibling.json().id,
+      );
+
+    const listed = await app.inject({
+      method: "GET",
+      url: "/api/v1/deliveries?limit=1",
+    });
+    expect(listed.statusCode, listed.body).toBe(200);
+    expect(
+      listed
+        .json()
+        .items.map((job: { id: string }) => job.id)
+        .sort(),
+    ).toEqual(
+      [first.json().id, second.json().id, newestSibling.json().id].sort(),
+    );
+  });
+});
+
+function adminCookie(database: CoceanDatabase): string {
+  const existing = database.getUserByUsername("test-admin");
+  const now = new Date().toISOString();
+  const user = existing
+    ? database.getUser(existing.id)!
+    : {
+        id: "test-admin",
+        username: "test-admin",
+        displayName: "Test Admin",
+        role: "ADMIN" as const,
+        enabled: true,
+        createdAt: now,
+        updatedAt: now,
+        lastLoginAt: null,
+      };
+  if (!existing) database.createUser(user, "unused-test-password-hash");
+  const { token } = createSession(database, user, 1);
+  return `cocean_session=${token}`;
+}

@@ -1,0 +1,27 @@
+{
+  "name": "@cocean/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/worker.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:container": "node ../../scripts/build-container.mjs worker",
+    "dev": "tsx watch src/worker.ts",
+    "start": "node dist/worker.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --exclude 'dist/**' --exclude '.cocean-runtime/**'"
+  },
+  "dependencies": {
+    "@cocean/contracts": "workspace:*",
+    "@cocean/database": "workspace:*",
+    "@cocean/media-scanner": "workspace:*",
+    "better-sqlite3": "13.0.3",
+    "music-metadata": "11.14.0",
+    "pino": "10.3.1",
+    "zod": "4.4.3"
+  }
+}

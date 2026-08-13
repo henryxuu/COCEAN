@@ -1,0 +1,65 @@
+ARG NODE_IMAGE=node:22.22.0-bookworm-slim
+
+FROM ${NODE_IMAGE} AS base
+
+ARG DEBIAN_MIRROR=
+RUN case "${DEBIAN_MIRROR}" in \
+      "") ;; \
+      http://*|https://*) \
+        sed -i "s#http://deb.debian.org#${DEBIAN_MIRROR%/}#g" \
+          /etc/apt/sources.list.d/debian.sources ;; \
+      *) printf 'DEBIAN_MIRROR must be empty or an http(s) URL\n' >&2; exit 64 ;; \
+    esac
+
+FROM base AS build
+
+ARG PNPM_VERSION=11.0.0
+
+ENV PNPM_HOME=/pnpm \
+    PATH=/pnpm:${PATH} \
+    CI=true \
+    COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+
+WORKDIR /workspace
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends build-essential python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Contract: the repository root will contain a pnpm workspace and lockfile once
+# apps/web, apps/server and apps/worker are implemented.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
+    pnpm fetch --frozen-lockfile
+
+COPY . .
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm/store \
+    pnpm install --offline --frozen-lockfile
+ARG COCEAN_APP
+RUN pnpm --filter "@cocean/${COCEAN_APP}" run build:container
+
+# Each app must emit a self-contained runtime directory containing at least:
+# start.mjs, healthcheck.mjs, package.json and all production dependencies.
+RUN test -f "apps/${COCEAN_APP}/.cocean-runtime/start.mjs" \
+    && test -f "apps/${COCEAN_APP}/.cocean-runtime/healthcheck.mjs"
+
+FROM base AS runtime
+
+ARG COCEAN_APP
+ENV NODE_ENV=production \
+    HOME=/tmp
+
+# Worker probes media; Server also needs ffmpeg for explicit browser-compatible
+# DSD preview transcoding. Source files remain read-only in both services.
+RUN if [ "${COCEAN_APP}" = "worker" ] || [ "${COCEAN_APP}" = "server" ]; then \
+      apt-get update \
+      && apt-get install --yes --no-install-recommends ffmpeg \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+WORKDIR /app
+COPY --from=build --chown=node:node "/workspace/apps/${COCEAN_APP}/.cocean-runtime/" /app/
+
+USER node
+CMD ["node", "/app/start.mjs"]

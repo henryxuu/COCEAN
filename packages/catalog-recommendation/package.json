@@ -1,0 +1,30 @@
+{
+  "name": "@cocean/catalog-recommendation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Deterministic compatibility browsing for the versioned Still catalog",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --exclude 'dist/**'"
+  },
+  "dependencies": {
+    "@cocean/contracts": "workspace:*",
+    "@cocean/recommendation-core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "26.2.0"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "@cocean/recommendation-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Deterministic, platform-neutral Still v0.10 recommendation core for COCEAN",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --exclude 'dist/**'"
+  }
+}

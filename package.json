@@ -1,0 +1,28 @@
+{
+  "name": "cocean",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "COCEAN NAS-first private Hi-Fi music library manager",
+  "type": "module",
+  "packageManager": "pnpm@11.0.0",
+  "engines": {
+    "node": ">=22.12.0",
+    "pnpm": ">=11.0.0"
+  },
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "catalog:prepare": "pnpm --filter @cocean/still-catalog build && node scripts/prepare-still-catalog.mjs",
+    "dev": "pnpm -r --filter './packages/**' build && pnpm --parallel --filter @cocean/web --filter @cocean/server --filter @cocean/worker dev",
+    "test": "pnpm -r --filter './packages/**' build && pnpm -r --if-present test",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "check": "pnpm typecheck && pnpm test && pnpm build"
+  },
+  "devDependencies": {
+    "@types/node": "26.2.0",
+    "prettier": "3.9.6",
+    "tsx": "4.23.12",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}
