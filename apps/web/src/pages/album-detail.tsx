@@ -1,8 +1,11 @@
 import {
   formatFullAudioSpec,
   type AlbumDetail,
+  type AlbumSummary,
   type DeliveryJob,
   type DeliveryTarget,
+  type LibraryIdentityDecision,
+  type LibraryIdentityDecisionCommand,
   type LocalVersionSummary,
   type PhysicalMedium,
 } from "@cocean/contracts";
@@ -19,8 +22,13 @@ import {
   Trash2,
   TriangleAlert,
 } from "lucide-react";
-import { useEffect, useState } from "react";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
+import {
+  Link,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import { api } from "../api.js";
 import {
   AlbumArtwork,
@@ -55,18 +63,34 @@ import {
 
 export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
   const { id = "" } = useParams();
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const libraryReturnTo = safeLibraryReturn(searchParams.get("from"));
   const album = useAsync(() => api.album(id), [id]);
   const deliveryTargets = useAsync(() => api.deliveryTargets(), []);
   const deliveries = useAsync(() => api.albumDeliveries(id), [id]);
   const introduction = useAsync(() => api.albumIntroduction(id), [id]);
+  const identityHistory = useAsync(() => api.identityDecisions(id), [id]);
   const capabilities = useAsync(() => api.capabilities(), []);
   const [listeningTrackId, setListeningTrackId] = useState<string | null>(null);
   const [deliveryTargetId, setDeliveryTargetId] = useState("");
   const [delivering, setDelivering] = useState(false);
   const [generatingIntroduction, setGeneratingIntroduction] = useState(false);
   const [copyFormOpen, setCopyFormOpen] = useState(false);
+  const [identityWorking, setIdentityWorking] = useState(false);
+  const [identitySearchResults, setIdentitySearchResults] = useState<
+    AlbumSummary[]
+  >([]);
+  const [identitySearchError, setIdentitySearchError] = useState<string | null>(
+    null,
+  );
+  const [identityTargetDetail, setIdentityTargetDetail] =
+    useState<AlbumDetail | null>(null);
+  const [identityTargetError, setIdentityTargetError] = useState<string | null>(
+    null,
+  );
+  const identitySearchGeneration = useRef(createLatestRequestTracker());
+  const identityTargetGeneration = useRef(createLatestRequestTracker());
   const [copyDraft, setCopyDraft] = useState({
     medium: "CD" as PhysicalMedium,
     label: "",
@@ -102,6 +126,14 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
     const timer = window.setInterval(() => void deliveries.reload(), 1_000);
     return () => window.clearInterval(timer);
   }, [hasActiveDelivery, deliveries.reload]);
+  useEffect(() => {
+    identitySearchGeneration.current.invalidate();
+    identityTargetGeneration.current.invalidate();
+    setIdentitySearchResults([]);
+    setIdentitySearchError(null);
+    setIdentityTargetDetail(null);
+    setIdentityTargetError(null);
+  }, [id]);
   if (album.loading)
     return (
       <div className="page">
@@ -234,6 +266,86 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
       toast.show(error instanceof Error ? error.message : "专辑介绍生成失败");
     } finally {
       setGeneratingIntroduction(false);
+    }
+  };
+  const applyIdentityDecision = async (
+    command: LibraryIdentityDecisionCommand,
+  ) => {
+    setIdentityWorking(true);
+    try {
+      const result = await api.applyIdentityDecision(id, command);
+      await Promise.allSettled([album.reload(), identityHistory.reload()]);
+      toast.show("身份治理决定已保存；源文件与既有版本级依赖未修改");
+      if (command.type === "MERGE") {
+        const params = new URLSearchParams();
+        if (libraryReturnTo) params.set("from", libraryReturnTo);
+        navigate(
+          `/albums/${encodeURIComponent(result.currentLibraryAlbumId)}${params.size ? `?${params.toString()}` : ""}`,
+        );
+      }
+    } catch (error) {
+      await Promise.allSettled([album.reload(), identityHistory.reload()]);
+      toast.show(error instanceof Error ? error.message : "身份治理操作失败");
+    } finally {
+      setIdentityWorking(false);
+    }
+  };
+  const searchMergeTargets = async (query: string) => {
+    const generation = identitySearchGeneration.current.begin();
+    setIdentitySearchError(null);
+    if (!query.trim()) return setIdentitySearchResults([]);
+    try {
+      const result = await api.albumPage({ search: query, limit: 25 });
+      if (identitySearchGeneration.current.isLatest(generation))
+        setIdentitySearchResults(
+          result.items.filter((candidate) => candidate.id !== item.id),
+        );
+    } catch (error) {
+      if (identitySearchGeneration.current.isLatest(generation)) {
+        const message =
+          error instanceof Error ? error.message : "合并目标搜索失败";
+        setIdentitySearchError(message);
+        setIdentitySearchResults([]);
+        toast.show(message);
+      }
+    }
+  };
+  const selectMergeTarget = async (targetId: string) => {
+    const generation = identityTargetGeneration.current.begin();
+    setIdentityTargetDetail(null);
+    setIdentityTargetError(null);
+    if (!targetId) return;
+    try {
+      const detail = await api.album(targetId);
+      if (identityTargetGeneration.current.isLatest(generation))
+        setIdentityTargetDetail(detail);
+    } catch (error) {
+      if (identityTargetGeneration.current.isLatest(generation))
+        setIdentityTargetError(
+          error instanceof Error ? error.message : "无法读取合并目标版本",
+        );
+    }
+  };
+  const undoIdentityDecision = async (decision: LibraryIdentityDecision) => {
+    if (
+      !window.confirm(
+        "撤销会写入一条补偿事件并恢复此前的身份关系。仅修改 COCEAN 数据库视图，不会改动 NAS 文件。是否继续？",
+      )
+    )
+      return;
+    setIdentityWorking(true);
+    try {
+      await api.undoIdentityDecision(id, decision.id, {
+        requestId: createBrowserUuid(),
+        revision: item.revision ?? 0,
+      });
+      await Promise.allSettled([album.reload(), identityHistory.reload()]);
+      toast.show("身份治理决定已撤销，并已记录补偿事件");
+    } catch (error) {
+      await Promise.allSettled([album.reload(), identityHistory.reload()]);
+      toast.show(error instanceof Error ? error.message : "撤销失败");
+    } finally {
+      setIdentityWorking(false);
     }
   };
   return (
@@ -390,6 +502,20 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
           <AlbumLocalVersions
             versions={localVersions}
             versionCount={item.versionCount ?? 1}
+          />
+          <AlbumIdentityGovernance
+            key={item.id}
+            album={item}
+            versions={localVersions}
+            canManage={canManage}
+            working={identityWorking}
+            searchResults={identitySearchResults}
+            searchError={identitySearchError}
+            targetDetail={identityTargetDetail}
+            targetError={identityTargetError}
+            onSearch={searchMergeTargets}
+            onSelectTarget={selectMergeTarget}
+            onApply={applyIdentityDecision}
           />
           {item.physicalCopies.map((copy) => (
             <div className="version-row" key={copy.id}>
@@ -599,6 +725,14 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
           )}
         </section>
       </div>
+
+      <AlbumIdentityHistory
+        decisions={identityHistory.data ?? []}
+        error={identityHistory.error?.message ?? null}
+        canManage={canManage}
+        working={identityWorking}
+        onUndo={undoIdentityDecision}
+      />
 
       <AlbumIntegrityIssues issues={item.issues ?? []} />
 
@@ -877,6 +1011,368 @@ export function AlbumLocalVersions({
       </div>
     );
   });
+}
+
+export function AlbumIdentityGovernance({
+  album,
+  versions,
+  canManage,
+  working,
+  searchResults,
+  searchError,
+  targetDetail,
+  targetError,
+  initialTargetId,
+  onSearch,
+  onSelectTarget,
+  onApply,
+}: {
+  album: AlbumDetail;
+  versions: LocalVersionSummary[];
+  canManage: boolean;
+  working: boolean;
+  searchResults: AlbumSummary[];
+  searchError?: string | null;
+  targetDetail?: AlbumDetail | null;
+  targetError?: string | null;
+  initialTargetId?: string;
+  onSearch: (query: string) => void | Promise<void>;
+  onSelectTarget?: (targetId: string) => void | Promise<void>;
+  onApply: (command: LibraryIdentityDecisionCommand) => void | Promise<void>;
+}) {
+  const [query, setQuery] = useState("");
+  const [targetId, setTargetId] = useState(initialTargetId ?? "");
+  const initialTarget = searchResults.find(
+    (candidate) => candidate.id === initialTargetId,
+  );
+  const [mergePrimaryVersionId, setMergePrimaryVersionId] = useState(
+    initialTarget?.primaryVersionId ?? "",
+  );
+  const target = searchResults.find((candidate) => candidate.id === targetId);
+  const confirmation =
+    "仅修改 COCEAN 数据库中的唱片视图关系，不会移动、改名或删除 NAS 文件；既有投送、实体副本、匹配和介绍仍绑定原本地版本。";
+  const confirmAndApply = (
+    message: string,
+    command: LibraryIdentityDecisionCommand,
+  ) => {
+    if (window.confirm(`${message}\n\n${confirmation}`)) void onApply(command);
+  };
+  if (!canManage)
+    return (
+      <div className="identity-governance-readonly">
+        <strong>身份治理为只读</strong>
+        <small>
+          成员可以查看人工关系和历史；只有管理员可以确认、拆分、合并或设置主版本。
+        </small>
+      </div>
+    );
+  return (
+    <div className="identity-governance" aria-label="唱片身份治理">
+      <div className="identity-governance-heading">
+        <strong>身份治理</strong>
+        <small>{confirmation}</small>
+      </div>
+      <div className="identity-governance-actions">
+        {versions.length > 1 &&
+        versions.some(
+          (version) => version.relationshipStatus === "AUTO_CANDIDATE",
+        ) ? (
+          <Button
+            variant="secondary"
+            disabled={working}
+            onClick={() =>
+              confirmAndApply(
+                "确认这些本地版本属于同一张唱片？",
+                buildConfirmIdentityCommand(album),
+              )
+            }
+          >
+            确认同一唱片
+          </Button>
+        ) : null}
+        {versions.map((version) =>
+          version.isPrimary ? null : (
+            <div className="identity-version-action" key={version.id}>
+              <span>
+                {version.title} · {shortStableId(version.id)}
+                <small>
+                  {version.relativePath ?? "无本地路径"} ·{" "}
+                  {version.audioBadge ?? "规格未知"}
+                </small>
+              </span>
+              <Button
+                variant="quiet"
+                disabled={working}
+                onClick={() =>
+                  confirmAndApply(
+                    `把“${version.title}”设为新 Listen / 投送主版本？`,
+                    buildSetPrimaryIdentityCommand(album, version.id),
+                  )
+                }
+              >
+                设为主版本
+              </Button>
+              {versions.length > 1 ? (
+                <Button
+                  variant="quiet"
+                  disabled={working}
+                  onClick={() =>
+                    confirmAndApply(
+                      `把“${version.title}”拆为独立唱片并保持分开？后续重扫不会自动合并。`,
+                      buildSplitIdentityCommand(album, versions, version.id),
+                    )
+                  }
+                >
+                  拆出并保持分开
+                </Button>
+              ) : null}
+            </div>
+          ),
+        )}
+      </div>
+      <form
+        className="identity-merge-search"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void onSearch(query);
+        }}
+      >
+        <label>
+          <span>跨唱片合并搜索</span>
+          <input
+            value={query}
+            placeholder="搜索唱片或艺术家"
+            onChange={(event) => setQuery(event.target.value)}
+          />
+        </label>
+        <Button
+          type="submit"
+          variant="quiet"
+          disabled={working || !query.trim()}
+        >
+          搜索目标
+        </Button>
+      </form>
+      {searchResults.length ? (
+        <div className="identity-merge-results">
+          <label>
+            <span>保留目标唱片 ID</span>
+            <select
+              value={targetId}
+              onChange={(event) => {
+                const next = searchResults.find(
+                  (candidate) => candidate.id === event.target.value,
+                );
+                setTargetId(event.target.value);
+                setMergePrimaryVersionId(next?.primaryVersionId ?? "");
+                void onSelectTarget?.(event.target.value);
+              }}
+            >
+              <option value="">选择合并目标</option>
+              {searchResults.map((candidate) => (
+                <option value={candidate.id} key={candidate.id}>
+                  {candidate.title} · {candidate.albumArtist}
+                  {candidate.year ? ` · ${candidate.year}` : ""} ·{" "}
+                  {shortStableId(candidate.id)}
+                </option>
+              ))}
+            </select>
+          </label>
+          {targetError ? <p className="error-row">{targetError}</p> : null}
+          {target && targetDetail ? (
+            <>
+              <label>
+                <span>合并后的主版本</span>
+                <select
+                  value={mergePrimaryVersionId}
+                  onChange={(event) =>
+                    setMergePrimaryVersionId(event.target.value)
+                  }
+                >
+                  {versions.map((version) => (
+                    <option value={version.id} key={`source-${version.id}`}>
+                      当前 · {version.title} · {shortStableId(version.id)}
+                    </option>
+                  ))}
+                  {(
+                    targetDetail.localVersions ??
+                    legacyLocalVersions(targetDetail)
+                  ).map((version) => (
+                    <option value={version.id} key={`target-${version.id}`}>
+                      目标 · {version.title} · {shortStableId(version.id)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <Button
+                disabled={working || !mergePrimaryVersionId}
+                onClick={() =>
+                  confirmAndApply(
+                    `把当前唱片合并到“${target.title}”，并保留目标稳定 ID？`,
+                    buildMergeIdentityCommand(
+                      album,
+                      targetDetail,
+                      mergePrimaryVersionId,
+                    ),
+                  )
+                }
+              >
+                合并到目标唱片
+              </Button>
+            </>
+          ) : null}
+        </div>
+      ) : null}
+      {searchError ? <p className="error-row">{searchError}</p> : null}
+    </div>
+  );
+}
+
+export function buildConfirmIdentityCommand(
+  album: AlbumDetail,
+  requestId = createBrowserUuid(),
+): LibraryIdentityDecisionCommand {
+  return {
+    type: "CONFIRM",
+    requestId,
+    revision: album.revision ?? 0,
+    ...(album.primaryVersionId
+      ? { primaryVersionId: album.primaryVersionId }
+      : {}),
+  };
+}
+
+export function buildSetPrimaryIdentityCommand(
+  album: AlbumDetail,
+  primaryVersionId: string,
+  requestId = createBrowserUuid(),
+): LibraryIdentityDecisionCommand {
+  return {
+    type: "SET_PRIMARY",
+    requestId,
+    revision: album.revision ?? 0,
+    primaryVersionId,
+  };
+}
+
+export function buildSplitIdentityCommand(
+  album: AlbumDetail,
+  versions: LocalVersionSummary[],
+  separatedVersionId: string,
+  requestId = createBrowserUuid(),
+): LibraryIdentityDecisionCommand {
+  return {
+    type: "SPLIT",
+    requestId,
+    revision: album.revision ?? 0,
+    partitions: [
+      {
+        versionIds: versions
+          .filter((version) => version.id !== separatedVersionId)
+          .map((version) => version.id),
+      },
+      { versionIds: [separatedVersionId] },
+    ],
+  };
+}
+
+export function buildMergeIdentityCommand(
+  album: AlbumDetail,
+  target: AlbumDetail,
+  primaryVersionId: string,
+  requestId = createBrowserUuid(),
+): LibraryIdentityDecisionCommand {
+  return {
+    type: "MERGE",
+    requestId,
+    revision: album.revision ?? 0,
+    targetLibraryAlbumId: target.id,
+    targetRevision: target.revision ?? 0,
+    primaryVersionId,
+  };
+}
+
+function shortStableId(id: string): string {
+  return id.length <= 12 ? id : `${id.slice(0, 8)}…${id.slice(-4)}`;
+}
+
+export function createLatestRequestTracker() {
+  let generation = 0;
+  return {
+    begin: () => ++generation,
+    isLatest: (candidate: number) => candidate === generation,
+    invalidate: () => {
+      generation += 1;
+    },
+  };
+}
+
+export function AlbumIdentityHistory({
+  decisions,
+  error,
+  canManage,
+  working,
+  onUndo,
+}: {
+  decisions: LibraryIdentityDecision[];
+  error?: string | null;
+  canManage: boolean;
+  working: boolean;
+  onUndo: (decision: LibraryIdentityDecision) => void | Promise<void>;
+}) {
+  const labels: Record<LibraryIdentityDecision["type"], string> = {
+    CONFIRM: "确认同一唱片",
+    MERGE: "合并唱片",
+    SPLIT: "拆分并保持分开",
+    SET_PRIMARY: "设置主版本",
+    UNDO: "撤销补偿",
+  };
+  return (
+    <section className="surface-card identity-history" aria-label="身份历史">
+      <SectionTitle title="身份历史" />
+      {error ? (
+        <p className="error-row">身份历史加载失败：{error}</p>
+      ) : decisions.length ? (
+        decisions.map((decision) => (
+          <div className="version-row" key={decision.id}>
+            <Clock3 />
+            <div>
+              <strong>{labels[decision.type]}</strong>
+              <span>
+                {decision.actor.displayName} · revision{" "}
+                {decision.resultingRevision}
+              </span>
+              <small>{formatDeliveryTime(decision.createdAt)}</small>
+              <small>{identityDecisionSummary(decision)}</small>
+            </div>
+            {canManage && decision.canUndo ? (
+              <Button
+                variant="quiet"
+                disabled={working}
+                onClick={() => void onUndo(decision)}
+              >
+                撤销
+              </Button>
+            ) : null}
+          </div>
+        ))
+      ) : (
+        <p className="quiet-row">尚无人工身份决定；自动候选不会被静默确认。</p>
+      )}
+    </section>
+  );
+}
+
+function identityDecisionSummary(decision: LibraryIdentityDecision): string {
+  if (decision.type === "MERGE")
+    return `目标 ${shortStableId(decision.details.targetLibraryAlbumId ?? "未知")} · 主版本 ${shortStableId(decision.details.primaryVersionId ?? "未知")}`;
+  if (decision.type === "SPLIT")
+    return `拆为 ${decision.details.partitions.length} 组 · ${decision.details.partitions.map((partition) => partition.versionIds.map(shortStableId).join("+")).join(" / ")}`;
+  if (decision.type === "SET_PRIMARY" || decision.type === "CONFIRM")
+    return decision.details.primaryVersionId
+      ? `主版本 ${shortStableId(decision.details.primaryVersionId)}`
+      : "保留当前主版本";
+  return `补偿决定 ${shortStableId(decision.details.compensatedDecisionId ?? "未知")}`;
 }
 
 export function AlbumIntegrityIssues({

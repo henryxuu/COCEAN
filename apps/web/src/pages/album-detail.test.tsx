@@ -7,8 +7,15 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
   AlbumDeliveryRecord,
+  AlbumIdentityGovernance,
+  AlbumIdentityHistory,
   AlbumIntegrityIssues,
   AlbumLocalVersions,
+  buildConfirmIdentityCommand,
+  buildMergeIdentityCommand,
+  buildSetPrimaryIdentityCommand,
+  buildSplitIdentityCommand,
+  createLatestRequestTracker,
   legacyLocalVersions,
 } from "./album-detail.js";
 
@@ -78,6 +85,226 @@ describe("Album 详情本地版本", () => {
     expect(html).toContain("自动候选 · 待确认");
     expect(html).toContain("曲目不完整");
     expect(html).toContain("/library/music/Artist/Album/01.flac");
+  });
+});
+
+describe("Album 详情身份治理", () => {
+  it("为管理员提供确认、设主、拆分和合并入口并明确不修改 NAS", () => {
+    const album = {
+      id: "library-manual",
+      title: "Manual Album",
+      albumArtist: "Artist",
+      year: 2026,
+      artwork: {
+        source: "NONE" as const,
+        url: null,
+        mimeType: null,
+        width: null,
+        height: null,
+      },
+      audioBadge: null,
+      audioSummary: null,
+      mixedAudioSpecs: false,
+      hasDigital: true,
+      physicalMedia: [],
+      matchStatus: "NEEDS_REVIEW" as const,
+      trackCount: 2,
+      discCount: 1,
+      primaryVersionId: "version-a",
+      primaryVersionSource: "AUTOMATIC" as const,
+      revision: 0,
+      versionCount: 2,
+      release: {
+        label: null,
+        catalogNumber: null,
+        barcode: null,
+        country: null,
+        releaseDate: null,
+        musicBrainzReleaseId: null,
+      },
+      tracks: [],
+      physicalCopies: [],
+      sourceRoot: null,
+    } satisfies AlbumDetail;
+    const versions = [
+      version({ id: "version-a", isPrimary: true }),
+      version({ id: "version-b", isPrimary: false }),
+    ];
+    const html = renderToStaticMarkup(
+      <AlbumIdentityGovernance
+        album={album}
+        versions={versions}
+        canManage
+        working={false}
+        searchResults={[
+          {
+            ...album,
+            id: "library-target",
+            title: "Merge Target",
+            primaryVersionId: "target-version",
+            versionCount: 1,
+          },
+        ]}
+        targetDetail={{
+          ...album,
+          id: "library-target",
+          title: "Merge Target",
+          revision: 4,
+          primaryVersionId: "target-version",
+          localVersions: [
+            version({ id: "target-version", title: "Target Cut" }),
+          ],
+        }}
+        initialTargetId="library-target"
+        onSearch={() => undefined}
+        onApply={() => undefined}
+      />,
+    );
+    expect(html).toContain("确认同一唱片");
+    expect(html).toContain("设为主版本");
+    expect(html).toContain("拆出并保持分开");
+    expect(html).toContain("跨唱片合并搜索");
+    expect(html).toContain("Target Cut");
+    expect(html).toContain("24/96");
+    expect(html).toContain("不会移动、改名或删除 NAS 文件");
+  });
+
+  it("以纯函数构造完整 CONFIRM、SET_PRIMARY、SPLIT、MERGE 命令", () => {
+    const album = {
+      id: "library-source",
+      revision: 7,
+      primaryVersionId: "version-a",
+    } as AlbumDetail;
+    const target = {
+      id: "library-target",
+      revision: 9,
+    } as AlbumDetail;
+    const versions = [
+      version({ id: "version-a" }),
+      version({ id: "version-b" }),
+    ];
+    expect(buildConfirmIdentityCommand(album, "confirm-request")).toEqual({
+      type: "CONFIRM",
+      requestId: "confirm-request",
+      revision: 7,
+      primaryVersionId: "version-a",
+    });
+    expect(
+      buildSetPrimaryIdentityCommand(album, "version-b", "primary-request"),
+    ).toEqual({
+      type: "SET_PRIMARY",
+      requestId: "primary-request",
+      revision: 7,
+      primaryVersionId: "version-b",
+    });
+    expect(
+      buildSplitIdentityCommand(album, versions, "version-b", "split-request"),
+    ).toEqual({
+      type: "SPLIT",
+      requestId: "split-request",
+      revision: 7,
+      partitions: [
+        { versionIds: ["version-a"] },
+        { versionIds: ["version-b"] },
+      ],
+    });
+    expect(
+      buildMergeIdentityCommand(
+        album,
+        target,
+        "target-version",
+        "merge-request",
+      ),
+    ).toEqual({
+      type: "MERGE",
+      requestId: "merge-request",
+      revision: 7,
+      targetLibraryAlbumId: "library-target",
+      targetRevision: 9,
+      primaryVersionId: "target-version",
+    });
+  });
+
+  it("只接受最新合并搜索，并明确渲染搜索与历史错误", () => {
+    const tracker = createLatestRequestTracker();
+    const first = tracker.begin();
+    const second = tracker.begin();
+    expect(tracker.isLatest(first)).toBe(false);
+    expect(tracker.isLatest(second)).toBe(true);
+    tracker.invalidate();
+    expect(tracker.isLatest(second)).toBe(false);
+
+    const governance = renderToStaticMarkup(
+      <AlbumIdentityGovernance
+        album={{} as AlbumDetail}
+        versions={[]}
+        canManage
+        working={false}
+        searchResults={[]}
+        searchError="搜索服务暂不可用"
+        onSearch={() => undefined}
+        onApply={() => undefined}
+      />,
+    );
+    expect(governance).toContain("搜索服务暂不可用");
+    const history = renderToStaticMarkup(
+      <AlbumIdentityHistory
+        decisions={[]}
+        error="网络错误"
+        canManage={false}
+        working={false}
+        onUndo={() => undefined}
+      />,
+    );
+    expect(history).toContain("身份历史加载失败");
+    expect(history).not.toContain("尚无人工身份决定");
+  });
+
+  it("成员只读，历史仅对仍可撤销的决定展示撤销", () => {
+    const readonly = renderToStaticMarkup(
+      <AlbumIdentityGovernance
+        album={{} as AlbumDetail}
+        versions={[]}
+        canManage={false}
+        working={false}
+        searchResults={[]}
+        onSearch={() => undefined}
+        onApply={() => undefined}
+      />,
+    );
+    expect(readonly).toContain("身份治理为只读");
+    expect(readonly).not.toContain("确认同一唱片");
+    const history = renderToStaticMarkup(
+      <AlbumIdentityHistory
+        decisions={[
+          {
+            id: "decision-confirm",
+            requestId: "request-confirm",
+            libraryAlbumId: "library-manual",
+            type: "CONFIRM",
+            actor: { id: "admin", displayName: "管理员" },
+            expectedRevision: 0,
+            resultingRevision: 1,
+            details: {
+              targetLibraryAlbumId: null,
+              primaryVersionId: "version-a",
+              partitions: [],
+              compensatedDecisionId: null,
+            },
+            affectedLibraryAlbumIds: ["library-manual"],
+            compensatesDecisionId: null,
+            canUndo: true,
+            createdAt: "2026-08-13T00:00:00.000Z",
+          },
+        ]}
+        canManage
+        working={false}
+        onUndo={() => undefined}
+      />,
+    );
+    expect(history).toContain("确认同一唱片");
+    expect(history).toContain("管理员");
+    expect(history).toContain("撤销");
   });
 });
 
@@ -170,6 +397,8 @@ describe("Album 详情完整性与兼容展示", () => {
       hasDigital: true,
       physicalMedia: [],
       matchStatus: "TRACKS_INCOMPLETE",
+      primaryVersionSource: "AUTOMATIC",
+      revision: 0,
       trackCount: 2,
       discCount: 1,
       sourceVersionCount: 3,

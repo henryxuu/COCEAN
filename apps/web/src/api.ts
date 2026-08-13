@@ -11,6 +11,9 @@ import type {
   DeviceCategory,
   DeviceOwnership,
   LibraryStats,
+  LibraryIdentityDecision,
+  LibraryIdentityDecisionCommand,
+  LibraryIdentityDecisionResult,
   ModelConfiguration,
   ModelVerificationStatus,
   OwnedDevice,
@@ -220,6 +223,42 @@ export const api = {
     return withDemo(
       () => request(`/api/v1/albums/${encodeURIComponent(id)}`),
       () => demoAlbumDetail(id),
+    );
+  },
+  identityDecisions(albumId: string): Promise<LibraryIdentityDecision[]> {
+    return withDemo(
+      () =>
+        request<{ items: LibraryIdentityDecision[] }>(
+          `/api/v1/albums/${encodeURIComponent(albumId)}/identity-decisions`,
+        ).then((result) => result.items),
+      () => [],
+    );
+  },
+  applyIdentityDecision(
+    albumId: string,
+    command: LibraryIdentityDecisionCommand,
+  ): Promise<LibraryIdentityDecisionResult> {
+    if (forceDemo)
+      return Promise.reject(
+        new ApiError(409, "DEMO_WRITE_DISABLED", "演示模式不保存身份治理决定"),
+      );
+    return request(
+      `/api/v1/albums/${encodeURIComponent(albumId)}/identity-decisions`,
+      { method: "POST", body: JSON.stringify(command) },
+    );
+  },
+  undoIdentityDecision(
+    albumId: string,
+    decisionId: string,
+    input: { requestId: string; revision: number },
+  ): Promise<LibraryIdentityDecisionResult> {
+    if (forceDemo)
+      return Promise.reject(
+        new ApiError(409, "DEMO_WRITE_DISABLED", "演示模式不保存身份治理决定"),
+      );
+    return request(
+      `/api/v1/albums/${encodeURIComponent(albumId)}/identity-decisions/${encodeURIComponent(decisionId)}/undo`,
+      { method: "POST", body: JSON.stringify(input) },
     );
   },
   todayRecommendation(dayKey?: string): Promise<CatalogRecommendationResponse> {

@@ -114,4 +114,85 @@ describe("web API client", () => {
       planId: "11111111-1111-4111-8111-111111111111",
     });
   });
+
+  it("encodes identity history URLs and unwraps items", async () => {
+    const requests: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        requests.push(String(input));
+        return new Response(
+          JSON.stringify({ items: [{ id: "decision-one" }] }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      }),
+    );
+    const decisions = await api.identityDecisions("album / 中文");
+    expect(requests).toEqual([
+      "/api/v1/albums/album%20%2F%20%E4%B8%AD%E6%96%87/identity-decisions",
+    ]);
+    expect(decisions).toEqual([{ id: "decision-one" }]);
+  });
+
+  it("posts encoded identity apply commands with the exact JSON body", async () => {
+    const requests: Array<{
+      input: string;
+      init: RequestInit | undefined;
+    }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        requests.push({ input: String(input), init });
+        return new Response(
+          JSON.stringify({ currentLibraryAlbumId: "target" }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      }),
+    );
+    const command = {
+      type: "SET_PRIMARY" as const,
+      requestId: "request-one",
+      revision: 7,
+      primaryVersionId: "version-one",
+    };
+    await api.applyIdentityDecision("album/a", command);
+    expect(requests[0]?.input).toBe(
+      "/api/v1/albums/album%2Fa/identity-decisions",
+    );
+    expect(requests[0]?.init?.method).toBe("POST");
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual(command);
+  });
+
+  it("posts encoded identity undo URLs and the exact request body", async () => {
+    const requests: Array<{
+      input: string;
+      init: RequestInit | undefined;
+    }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        requests.push({ input: String(input), init });
+        return new Response(
+          JSON.stringify({ currentLibraryAlbumId: "album" }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      }),
+    );
+    const body = { requestId: "undo-one", revision: 8 };
+    await api.undoIdentityDecision("album/a", "decision/b", body);
+    expect(requests[0]?.input).toBe(
+      "/api/v1/albums/album%2Fa/identity-decisions/decision%2Fb/undo",
+    );
+    expect(requests[0]?.init?.method).toBe("POST");
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual(body);
+  });
 });
