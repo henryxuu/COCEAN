@@ -1403,6 +1403,7 @@ describe("CoceanDatabase", () => {
     );
     const stableId = grouped[0]!.id;
     expect(database.resolveLocalVersionId(stableId)).toBe("complete-version");
+    expect(database.getLibraryStats().tracks).toBe(21);
     expect(database.getAlbumDeliveryBundle(stableId)?.albumId).toBe(
       "complete-version",
     );

@@ -4382,7 +4382,10 @@ export class CoceanDatabase {
       .prepare(
         `SELECT
           (SELECT COUNT(*) FROM library_albums WHERE primary_version_id IS NOT NULL) AS albums,
-          (SELECT COUNT(*) FROM album_files WHERE is_primary = 1) AS tracks,
+          (SELECT COUNT(*)
+           FROM library_albums la
+           JOIN album_files af ON af.album_id=la.primary_version_id
+           WHERE af.is_primary=1) AS tracks,
           (SELECT COUNT(*) FROM media_files) AS files,
           (SELECT COUNT(DISTINCT library_album_id) FROM library_issues) AS needs_review,
           (SELECT COUNT(DISTINCT library_album_id) FROM library_issues WHERE code='MISSING_ARTWORK') AS missing_artwork,
