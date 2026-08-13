@@ -161,6 +161,8 @@ class MockState:
         unsupported_extension: str = ".iso",
         unsupported_error_code: str = "UNSUPPORTED_MEDIA",
         grouped_local_versions: bool = False,
+        scan_album_issue_count: int = 0,
+        detail_album_issue_count: int = 0,
     ):
         self.incomplete_failures = incomplete_failures
         self.bad_range = bad_range
@@ -174,6 +176,7 @@ class MockState:
         )
         self.post_requests = 0
         self.grouped_local_versions = grouped_local_versions
+        self.detail_album_issue_count = detail_album_issue_count
         self.albums = [album_summary("one", True)]
         if not grouped_local_versions:
             self.albums.append(album_summary("two", False))
@@ -293,7 +296,7 @@ class MockState:
             **report_counts,
             "boundaryEvidence": True,
             "albumCount": 2,
-            "albumIssueCount": 0,
+            "albumIssueCount": scan_album_issue_count,
         }
         digest = hashlib.sha256(js_json(summary).encode("utf-8"))
         for item in sorted(
@@ -327,7 +330,7 @@ class MockState:
             "candidateScope": "SUPPORTED_AND_KNOWN_UNSUPPORTED_AUDIO",
             **report_counts,
             "albumCount": 2,
-            "albumIssueCount": 0,
+            "albumIssueCount": scan_album_issue_count,
             "trackSemantics": "ONE_AUDIO_FILE_ONE_TRACK",
             "cueSheetSupport": "AUXILIARY_ONLY",
             "invariants": {
@@ -493,7 +496,8 @@ def handler_for(state: MockState) -> type[BaseHTTPRequestHandler]:
                 album_id = path.rsplit("/", 1)[-1]
                 self.json_response(
                     200,
-                    album_detail(
+                    {
+                        **album_detail(
                         album_id,
                         album_id == "one",
                         unknown_audio=state.unknown_audio and album_id == "one",
@@ -505,7 +509,16 @@ def handler_for(state: MockState) -> type[BaseHTTPRequestHandler]:
                             if state.grouped_local_versions and album_id == "one"
                             else 1
                         ),
-                    ),
+                        ),
+                        "aggregationIssues": [
+                            {
+                                "code": "DUPLICATE_TRACK_SLOT",
+                                "severity": "WARNING",
+                                "message": "fixture",
+                            }
+                            for _ in range(state.detail_album_issue_count)
+                        ],
+                    },
                 )
                 return
             if path == f"/api/v1/artwork/{ART_HASH}":
@@ -556,6 +569,7 @@ class ApiAcceptanceTests(unittest.TestCase):
         allowed_unsupported_extensions: dict[str, int] | None = None,
         existing_scan_id: str | None = None,
         max_failures: int = 0,
+        max_album_issues: int = 0,
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, object], str]:
         with tempfile.TemporaryDirectory() as directory, mock_server(state) as base_url:
             report_path = Path(directory) / "report.json"
@@ -601,7 +615,7 @@ class ApiAcceptanceTests(unittest.TestCase):
                     "--max-missing-artworks",
                     "1",
                     "--max-album-issues",
-                    "0",
+                    str(max_album_issues),
                     "--listen-mode",
                     "each-track",
                     "--page-size",
@@ -662,6 +676,22 @@ class ApiAcceptanceTests(unittest.TestCase):
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual(report["status"], "passed")
         self.assertEqual(report["coverage"]["albumDetails"], 1)  # type: ignore[index]
+        self.assert_report_is_private(report_text)
+
+    def test_scan_issue_ledger_may_include_non_primary_version_issues(self) -> None:
+        state = MockState(scan_album_issue_count=1)
+        process, report, report_text = self.run_acceptance(
+            state, max_album_issues=1
+        )
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(report["status"], "passed")
+        self.assert_report_is_private(report_text)
+
+    def test_primary_version_issues_cannot_exceed_scan_issue_ledger(self) -> None:
+        state = MockState(detail_album_issue_count=1)
+        process, report, report_text = self.run_acceptance(state)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(report["failure"]["gate"], "library-count-reconciliation")  # type: ignore[index]
         self.assert_report_is_private(report_text)
 
     def test_unsupported_extension_requires_an_explicit_policy_entry(self) -> None:

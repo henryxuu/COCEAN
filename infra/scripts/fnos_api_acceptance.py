@@ -583,9 +583,11 @@ class AcceptanceRun:
                 len(require_list(item.get("aggregationIssues", []), "Album aggregationIssues"))
                 for item in details
             )
-            if evidence["albumIssueCount"] != album_issues:
-                raise AcceptanceError("scan report albumIssueCount does not equal Album details")
-            if album_issues > self.arguments.max_album_issues:
+            if album_issues > evidence["albumIssueCount"]:
+                raise AcceptanceError(
+                    "primary Album issues exceed the full scan issue ledger"
+                )
+            if evidence["albumIssueCount"] > self.arguments.max_album_issues:
                 raise AcceptanceError("Album aggregation issues exceed the configured limit")
             if stats_counts["missingArtwork"] > self.arguments.max_missing_artworks:
                 raise AcceptanceError("Albums without artwork exceed the configured limit")
