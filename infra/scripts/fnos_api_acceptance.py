@@ -552,14 +552,8 @@ class AcceptanceRun:
             detail_tracks = sum(len(require_list(item.get("tracks"), "Album tracks")) for item in details)
             if stats_counts["tracks"] != detail_tracks:
                 raise AcceptanceError("library tracks does not equal detail track count")
-            duplicate_files = sum(
-                require_count(
-                    item.get("duplicateFileCount", 0),
-                    "Album duplicateFileCount",
-                )
-                for item in details
-            )
             represented_local_versions = 0
+            represented_local_files = 0
             for album, detail in zip(albums, details):
                 if album.get("hasDigital") is not True:
                     continue
@@ -568,6 +562,12 @@ class AcceptanceRun:
                     # Backward compatibility for pre-governance Album details, where
                     # one digital Album always represented exactly one local version.
                     represented_local_versions += 1
+                    represented_local_files += len(
+                        require_list(detail.get("tracks"), "Album tracks")
+                    ) + require_count(
+                        detail.get("duplicateFileCount", 0),
+                        "Album duplicateFileCount",
+                    )
                     continue
                 versions = require_list(local_versions, "Album localVersions")
                 if not versions:
@@ -575,6 +575,13 @@ class AcceptanceRun:
                         "digital Album does not expose a represented local version"
                     )
                 represented_local_versions += len(versions)
+                represented_local_files += sum(
+                    require_count(
+                        require_object(version, "Album localVersion").get("fileCount"),
+                        "Album localVersion fileCount",
+                    )
+                    for version in versions
+                )
             if evidence["albumCount"] != represented_local_versions:
                 raise AcceptanceError(
                     "scan report albumCount does not equal represented local versions"
@@ -595,9 +602,9 @@ class AcceptanceRun:
                 raise AcceptanceError(
                     "Album detail Track ids are not a subset of parsed media ids"
                 )
-            if len(self.parsed_media_ids - self.detail_track_ids) != duplicate_files:
+            if len(self.parsed_media_ids) != represented_local_files:
                 raise AcceptanceError(
-                    "collapsed duplicate files do not reconcile with parsed media ids"
+                    "represented local-version files do not reconcile with parsed media ids"
                 )
             expected_detail_warnings = {
                 media_id: self.parsed_warning_codes_by_media_id[media_id]

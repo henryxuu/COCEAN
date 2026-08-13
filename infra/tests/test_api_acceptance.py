@@ -678,6 +678,21 @@ class ApiAcceptanceTests(unittest.TestCase):
         self.assertEqual(report["coverage"]["albumDetails"], 1)  # type: ignore[index]
         self.assert_report_is_private(report_text)
 
+    def test_grouped_album_reconciles_parsed_files_against_version_file_counts(self) -> None:
+        state = MockState(grouped_local_versions=True)
+        process, report, report_text = self.run_acceptance(state)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(report["status"], "passed")
+        self.assert_report_is_private(report_text)
+
+    def test_version_file_counts_cannot_drop_parsed_media(self) -> None:
+        state = MockState(grouped_local_versions=True)
+        state.grouped_local_versions = False
+        process, report, report_text = self.run_acceptance(state)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(report["failure"]["gate"], "library-count-reconciliation")  # type: ignore[index]
+        self.assert_report_is_private(report_text)
+
     def test_scan_issue_ledger_may_include_non_primary_version_issues(self) -> None:
         state = MockState(scan_album_issue_count=1)
         process, report, report_text = self.run_acceptance(
