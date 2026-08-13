@@ -60,6 +60,7 @@ def album_detail(
     *,
     unknown_audio: bool = False,
     warning_codes: list[str] | None = None,
+    local_version_count: int = 1,
 ) -> dict[str, object]:
     result = album_summary(album_id, artwork)
     result.update(
@@ -103,6 +104,35 @@ def album_detail(
                 "containerPath": "/library/music",
                 "readOnly": True,
             },
+            "sourceVersionCount": local_version_count,
+            "duplicateFileCount": local_version_count - 1,
+            "localVersions": [
+                {
+                    "id": f"{album_id}-version-{index + 1}",
+                    "title": f"Album {album_id}",
+                    "albumArtist": "Artist",
+                    "year": 2026,
+                    "isPrimary": index == 0,
+                    "relationshipStatus": "USER_CONFIRMED",
+                    "sourceRoot": {
+                        "id": "music",
+                        "name": "Music",
+                        "containerPath": "/library/music",
+                        "readOnly": True,
+                    },
+                    "relativePath": f"Artist/{album_id}",
+                    "audioBadge": "24-bit / 96 kHz",
+                    "mixedAudioSpecs": False,
+                    "trackCount": 1,
+                    "fileCount": 1,
+                    "sourceVersionCount": 1,
+                    "duplicateFileCount": 0,
+                    "sizeBytes": 10,
+                    "completeness": "COMPLETE",
+                    "issues": [],
+                }
+                for index in range(local_version_count)
+            ],
         }
     )
     if unknown_audio:
@@ -130,6 +160,7 @@ class MockState:
         ledger_warning_codes: list[str] | None = None,
         unsupported_extension: str = ".iso",
         unsupported_error_code: str = "UNSUPPORTED_MEDIA",
+        grouped_local_versions: bool = False,
     ):
         self.incomplete_failures = incomplete_failures
         self.bad_range = bad_range
@@ -142,7 +173,10 @@ class MockState:
             else ledger_warning_codes
         )
         self.post_requests = 0
-        self.albums = [album_summary("one", True), album_summary("two", False)]
+        self.grouped_local_versions = grouped_local_versions
+        self.albums = [album_summary("one", True)]
+        if not grouped_local_versions:
+            self.albums.append(album_summary("two", False))
         failure_count = 2 if incomplete_failures else 1
         self.job = {
             "id": "scan-test",
@@ -428,11 +462,15 @@ def handler_for(state: MockState) -> type[BaseHTTPRequestHandler]:
                 self.json_response(
                     200,
                     {
-                        "albums": 2,
-                        "tracks": 2,
+                        "albums": len(state.albums),
+                        "tracks": len(state.albums),
                         "files": 2,
-                        "needsReview": 2,
-                        "missingArtwork": 1,
+                        "needsReview": len(state.albums),
+                        "missingArtwork": sum(
+                            1
+                            for album in state.albums
+                            if album["artwork"]["source"] == "NONE"
+                        ),
                         "parseFailures": state.job["failedFiles"],
                         "lastScanAt": "2026-08-12T00:00:02Z",
                     },
@@ -461,6 +499,11 @@ def handler_for(state: MockState) -> type[BaseHTTPRequestHandler]:
                         unknown_audio=state.unknown_audio and album_id == "one",
                         warning_codes=(
                             state.warning_codes if album_id == "one" else []
+                        ),
+                        local_version_count=(
+                            2
+                            if state.grouped_local_versions and album_id == "one"
+                            else 1
                         ),
                     ),
                 )
@@ -611,6 +654,14 @@ class ApiAcceptanceTests(unittest.TestCase):
         self.assertTrue(report["policy"]["reusedExistingScan"])  # type: ignore[index]
         self.assertTrue(report["scan"]["reusedExistingScan"])  # type: ignore[index]
         self.assertNotIn("scan-test", report_text)
+        self.assert_report_is_private(report_text)
+
+    def test_grouped_album_reconciles_scan_count_against_local_versions(self) -> None:
+        state = MockState(grouped_local_versions=True)
+        process, report, report_text = self.run_acceptance(state)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["coverage"]["albumDetails"], 1)  # type: ignore[index]
         self.assert_report_is_private(report_text)
 
     def test_unsupported_extension_requires_an_explicit_policy_entry(self) -> None:

@@ -559,9 +559,26 @@ class AcceptanceRun:
                 )
                 for item in details
             )
-            digital_albums = sum(1 for item in albums if item.get("hasDigital") is True)
-            if evidence["albumCount"] != digital_albums:
-                raise AcceptanceError("scan report albumCount does not equal digital Albums")
+            represented_local_versions = 0
+            for album, detail in zip(albums, details):
+                if album.get("hasDigital") is not True:
+                    continue
+                local_versions = detail.get("localVersions")
+                if local_versions is None:
+                    # Backward compatibility for pre-governance Album details, where
+                    # one digital Album always represented exactly one local version.
+                    represented_local_versions += 1
+                    continue
+                versions = require_list(local_versions, "Album localVersions")
+                if not versions:
+                    raise AcceptanceError(
+                        "digital Album does not expose a represented local version"
+                    )
+                represented_local_versions += len(versions)
+            if evidence["albumCount"] != represented_local_versions:
+                raise AcceptanceError(
+                    "scan report albumCount does not equal represented local versions"
+                )
             album_issues = sum(
                 len(require_list(item.get("aggregationIssues", []), "Album aggregationIssues"))
                 for item in details
