@@ -17,6 +17,7 @@ import {
 } from "@cocean/catalog-sources";
 import {
   catalogRecommendationResponseSchema,
+  confirmReleaseCandidateCommandSchema,
   coceanSettingsSchema,
   deviceCategorySchema,
   deviceOwnershipSchema,
@@ -24,10 +25,16 @@ import {
   physicalMediumSchema,
   scanFileOutcomeSchema,
   scanModeSchema,
+  undoAlbumMetadataCommandSchema,
   undoLibraryIdentityDecisionCommandSchema,
+  updateAlbumMetadataCommandSchema,
   type ReleaseCandidate,
 } from "@cocean/contracts";
-import { CoceanDatabase, LibraryIdentityDecisionError } from "@cocean/database";
+import {
+  AlbumMetadataDecisionError,
+  CoceanDatabase,
+  LibraryIdentityDecisionError,
+} from "@cocean/database";
 import { parseRuntimeStillCatalog } from "@cocean/still-catalog";
 import { z } from "zod";
 import type { ServerConfig } from "./config.js";
@@ -90,6 +97,10 @@ const scanRequestSchema = z.object({
 });
 const matchSearchSchema = z.object({
   limit: z.number().int().min(1).max(25).default(8),
+  localVersionId: z.string().min(1).optional(),
+});
+const matchCandidatesQuerySchema = z.object({
+  localVersionId: z.string().min(1).optional(),
 });
 const todayRecommendationQuerySchema = z.object({
   dayKey: z
@@ -763,8 +774,79 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       return reply
         .code(404)
         .send({ error: "ALBUM_NOT_FOUND", message: "没有找到这张专辑" });
+    if (!readSession(database, request.headers.cookie)) {
+      const { metadata: _metadata, ...publicAlbum } = album;
+      return publicAlbum;
+    }
     return album;
   });
+
+  app.get("/api/v1/albums/:id/metadata", async (request, reply) => {
+    if (!requireSession(request, reply)) return;
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const metadata = database.getAlbumMetadata(id);
+    if (!metadata)
+      return reply
+        .code(404)
+        .send({ error: "ALBUM_NOT_FOUND", message: "没有找到这张专辑" });
+    return metadata;
+  });
+
+  app.patch("/api/v1/albums/:id/metadata", async (request, reply) => {
+    const admin = requireAdmin(request, reply);
+    if (!admin) return;
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const command = updateAlbumMetadataCommandSchema.parse(request.body ?? {});
+    try {
+      return database.applyAlbumMetadata(id, command, {
+        id: admin.user.id,
+        displayName: admin.user.displayName,
+      });
+    } catch (error) {
+      if (error instanceof AlbumMetadataDecisionError)
+        return reply
+          .code(error.code === "INVALID_METADATA_DECISION" ? 400 : 409)
+          .send({ error: error.code, message: error.message });
+      throw error;
+    }
+  });
+
+  app.get("/api/v1/albums/:id/metadata-history", async (request, reply) => {
+    if (!requireSession(request, reply)) return;
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    if (!database.getAlbumMetadata(id))
+      return reply
+        .code(404)
+        .send({ error: "ALBUM_NOT_FOUND", message: "没有找到这张专辑" });
+    return { items: database.listAlbumMetadataHistory(id) };
+  });
+
+  app.post(
+    "/api/v1/albums/:id/metadata-history/:eventId/undo",
+    async (request, reply) => {
+      const admin = requireAdmin(request, reply);
+      if (!admin) return;
+      const { id, eventId } = z
+        .object({ id: z.string(), eventId: z.string() })
+        .parse(request.params);
+      const command = undoAlbumMetadataCommandSchema.parse(request.body ?? {});
+      try {
+        return database.undoAlbumMetadataEvent(
+          id,
+          eventId,
+          command.requestId,
+          command.expectedMetadataRevision,
+          { id: admin.user.id, displayName: admin.user.displayName },
+        );
+      } catch (error) {
+        if (error instanceof AlbumMetadataDecisionError)
+          return reply
+            .code(error.code === "INVALID_METADATA_DECISION" ? 400 : 409)
+            .send({ error: error.code, message: error.message });
+        throw error;
+      }
+    },
+  );
 
   app.get("/api/v1/albums/:id/identity-decisions", async (request, reply) => {
     if (!requireSession(request, reply)) return;
@@ -828,14 +910,16 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   app.get("/api/v1/albums/:id/match-candidates", async (request, reply) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
+    const query = matchCandidatesQuerySchema.parse(request.query);
     if (!database.getAlbum(id))
       return reply
         .code(404)
         .send({ error: "ALBUM_NOT_FOUND", message: "没有找到这张专辑" });
-    return { items: database.listReleaseCandidates(id) };
+    return { items: database.listReleaseCandidates(id, query.localVersionId) };
   });
 
   app.post("/api/v1/albums/:id/match-candidates", async (request, reply) => {
+    if (!requireAdmin(request, reply)) return;
     const { id } = z.object({ id: z.string() }).parse(request.params);
     const album = database.getAlbum(id);
     if (!album)
@@ -850,17 +934,35 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
           : "MusicBrainz 当前关闭；请先在部署环境设置 COCEAN_MUSICBRAINZ_ENABLED=true",
       });
     }
-    const { limit } = matchSearchSchema.parse(request.body ?? {});
+    const { limit, localVersionId } = matchSearchSchema.parse(
+      request.body ?? {},
+    );
+    const selectedVersionId =
+      localVersionId ?? album.primaryVersionId ?? album.localVersions?.[0]?.id;
+    const selectedVersion = album.localVersions?.find(
+      (version) => version.id === selectedVersionId,
+    );
+    if (!selectedVersionId || !selectedVersion)
+      return reply.code(409).send({
+        error: "METADATA_DECISION_CONFLICT",
+        message: "候选目标版本已不属于当前唱片",
+      });
     try {
       const candidates = await releaseCatalogClient.searchReleases({
-        albumId: album.id,
-        title: album.title,
-        artist: album.albumArtist,
-        year: album.year,
+        albumId: selectedVersionId,
+        title: selectedVersion.title,
+        artist: selectedVersion.albumArtist,
+        year: selectedVersion.year,
         limit,
       });
-      database.replaceReleaseCandidates(album.id, candidates);
-      return { items: database.listReleaseCandidates(album.id) };
+      database.replaceReleaseCandidates(
+        album.id,
+        candidates,
+        selectedVersionId,
+      );
+      return {
+        items: database.listReleaseCandidates(album.id, selectedVersionId),
+      };
     } catch (error) {
       request.log.warn(
         { err: error, albumId: album.id },
@@ -876,6 +978,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   app.post(
     "/api/v1/albums/:albumId/match-candidates/:candidateId/confirm",
     async (request, reply) => {
+      const admin = requireAdmin(request, reply);
+      if (!admin) return;
       const { albumId, candidateId } = z
         .object({ albumId: z.string(), candidateId: z.string() })
         .parse(request.params);
@@ -884,14 +988,36 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
           .code(404)
           .send({ error: "ALBUM_NOT_FOUND", message: "没有找到这张专辑" });
       }
-      const candidate = database.confirmReleaseCandidate(albumId, candidateId);
-      if (!candidate) {
-        return reply.code(404).send({
-          error: "MATCH_CANDIDATE_NOT_FOUND",
-          message: "没有找到这条发行版候选",
-        });
+      const command = confirmReleaseCandidateCommandSchema.parse(
+        request.body ?? {},
+      );
+      try {
+        const confirmed = database.confirmReleaseCandidateMetadata(
+          albumId,
+          candidateId,
+          command.localVersionId,
+          command.requestId,
+          command.expectedMetadataRevision,
+          { id: admin.user.id, displayName: admin.user.displayName },
+        );
+        if (!confirmed) {
+          return reply.code(404).send({
+            error: "MATCH_CANDIDATE_NOT_FOUND",
+            message: "没有找到这条发行版候选，或候选已经漂移",
+          });
+        }
+        return {
+          candidate: confirmed.candidate,
+          album: database.getAlbum(albumId),
+          metadataEvent: confirmed.result.event,
+        };
+      } catch (error) {
+        if (error instanceof AlbumMetadataDecisionError)
+          return reply
+            .code(error.code === "INVALID_METADATA_DECISION" ? 400 : 409)
+            .send({ error: error.code, message: error.message });
+        throw error;
       }
-      return { candidate, album: database.getAlbum(albumId) };
     },
   );
 

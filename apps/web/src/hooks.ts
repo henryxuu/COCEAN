@@ -15,9 +15,11 @@ export function useAsync<T>(
     try {
       const result = await loader();
       if (currentGeneration === generation.current) setData(result);
+      return result;
     } catch (caught) {
       if (currentGeneration === generation.current)
         setError(caught instanceof Error ? caught : new Error(String(caught)));
+      return null;
     } finally {
       if (currentGeneration === generation.current) setLoading(false);
     }

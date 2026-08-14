@@ -328,6 +328,145 @@ describe("COCEAN HTTP API", () => {
     expect(repeatedUndo.statusCode).toBe(409);
   });
 
+  it("exposes atomic admin metadata governance with member-readable provenance and stable conflicts", async () => {
+    const database = new CoceanDatabase(":memory:");
+    database.replaceAlbumsForRoot("music", [
+      {
+        id: "metadata-http",
+        rootId: "music",
+        groupKey: "metadata-http",
+        title: "Observed",
+        albumArtist: "Artist",
+        year: 2000,
+        discCount: 1,
+        fileIds: [],
+        audioSummary: null,
+        mixedAudioSpecs: false,
+        artwork: {
+          source: "NONE",
+          url: null,
+          mimeType: null,
+          width: null,
+          height: null,
+        },
+      },
+    ]);
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const albumId = database.getAlbumSummary("metadata-http")!.id;
+    const member = sessionCookieFor(database, "MEMBER");
+    const admin = adminCookie(database);
+    const anonymous = await app.inject({
+      method: "GET",
+      url: `/api/v1/albums/${albumId}/metadata-history`,
+    });
+    expect(anonymous.statusCode).toBe(401);
+    const memberMetadata = await app.inject({
+      method: "GET",
+      url: `/api/v1/albums/${albumId}/metadata`,
+      headers: { cookie: member },
+    });
+    expect(memberMetadata.statusCode, memberMetadata.body).toBe(200);
+    expect(memberMetadata.json().album.title.observed.value).toBe("Observed");
+    const anonymousDetail = await app.inject({
+      method: "GET",
+      url: `/api/v1/albums/${albumId}`,
+    });
+    expect(anonymousDetail.statusCode).toBe(200);
+    expect(anonymousDetail.json().metadata).toBeUndefined();
+    const memberDetail = await app.inject({
+      method: "GET",
+      url: `/api/v1/albums/${albumId}`,
+      headers: { cookie: member },
+    });
+    expect(memberDetail.json().metadata.album.title.observed.value).toBe(
+      "Observed",
+    );
+    const memberWrite = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/albums/${albumId}/metadata`,
+      headers: { cookie: member },
+      payload: {
+        requestId: "member-metadata-write",
+        expectedMetadataRevision: 0,
+        commands: [{ action: "SET", field: "title", value: "Denied" }],
+      },
+    });
+    expect(memberWrite.statusCode).toBe(403);
+    const invalid = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/albums/${albumId}/metadata`,
+      headers: { cookie: admin },
+      payload: {
+        requestId: "invalid-metadata-write",
+        expectedMetadataRevision: 0,
+        commands: [
+          { action: "SET", field: "title", value: "Must Roll Back" },
+          {
+            action: "SET",
+            field: "barcode",
+            versionId: "metadata-http",
+            value: "123",
+          },
+        ],
+      },
+    });
+    expect(invalid.statusCode).toBe(400);
+    expect(database.getAlbum(albumId)?.title).toBe("Observed");
+    const updated = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/albums/${albumId}/metadata`,
+      headers: { cookie: admin },
+      payload: {
+        requestId: "valid-metadata-write",
+        expectedMetadataRevision: 0,
+        commands: [
+          { action: "SET", field: "title", value: "Curated" },
+          { action: "CLEAR", field: "year" },
+        ],
+      },
+    });
+    expect(updated.statusCode, updated.body).toBe(200);
+    expect(updated.json().metadata).toEqual(
+      expect.objectContaining({ metadataRevision: 1 }),
+    );
+    const stale = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/albums/${albumId}/metadata`,
+      headers: { cookie: admin },
+      payload: {
+        requestId: "stale-metadata-write",
+        expectedMetadataRevision: 0,
+        commands: [{ action: "SET", field: "title", value: "Stale" }],
+      },
+    });
+    expect(stale.statusCode).toBe(409);
+    const history = await app.inject({
+      method: "GET",
+      url: `/api/v1/albums/${albumId}/metadata-history`,
+      headers: { cookie: member },
+    });
+    expect(history.statusCode, history.body).toBe(200);
+    expect(history.json().items).toEqual([
+      expect.objectContaining({ type: "UPDATE", canUndo: true }),
+    ]);
+    const eventId = history.json().items[0].id as string;
+    const undone = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/metadata-history/${eventId}/undo`,
+      headers: { cookie: admin },
+      payload: {
+        requestId: "undo-metadata-write",
+        expectedMetadataRevision: 1,
+      },
+    });
+    expect(undone.statusCode, undone.body).toBe(200);
+    expect(undone.json().metadata.album.title.effectiveValue).toBe("Observed");
+  });
+
   it("queues a read-only library scan", async () => {
     const database = new CoceanDatabase(":memory:");
     const app = await buildApp({ config: testConfig(), database });
@@ -1144,6 +1283,7 @@ describe("COCEAN HTTP API", () => {
     const search = await app.inject({
       method: "POST",
       url: `/api/v1/albums/${libraryAlbumId}/match-candidates`,
+      headers: { cookie: adminCookie(database) },
       payload: {},
     });
     expect(search.statusCode, search.body).toBe(200);
@@ -1160,11 +1300,17 @@ describe("COCEAN HTTP API", () => {
     const confirm = await app.inject({
       method: "POST",
       url: `/api/v1/albums/${libraryAlbumId}/match-candidates/candidate-1/confirm`,
+      headers: { cookie: adminCookie(database) },
+      payload: {
+        requestId: "confirm-candidate-1",
+        expectedMetadataRevision: 0,
+        localVersionId: "album-match",
+      },
     });
     expect(confirm.statusCode, confirm.body).toBe(200);
     expect(confirm.json().album).toEqual(
       expect.objectContaining({
-        title: "Local Album",
+        title: "Remote Album",
         matchStatus: "USER_CONFIRMED",
         release: expect.objectContaining({
           musicBrainzReleaseId: "f1b2d3c4-1111-4222-8333-123456789abc",
@@ -1205,11 +1351,93 @@ describe("COCEAN HTTP API", () => {
     const response = await app.inject({
       method: "POST",
       url: "/api/v1/albums/album-unconfigured/match-candidates",
+      headers: { cookie: adminCookie(database) },
       payload: {},
     });
     expect(response.statusCode).toBe(409);
     expect(response.json()).toEqual(
       expect.objectContaining({ error: "CATALOG_SOURCE_NOT_CONFIGURED" }),
+    );
+  });
+
+  it("searches MusicBrainz with the explicitly selected LocalVersion facts", async () => {
+    const database = new CoceanDatabase(":memory:");
+    const makeAlbum = (
+      id: string,
+      title: string,
+      artist: string,
+      year: number,
+    ) => ({
+      id,
+      rootId: "music",
+      groupKey: id,
+      title,
+      albumArtist: artist,
+      year,
+      discCount: 1,
+      fileIds: [],
+      audioSummary: null,
+      mixedAudioSpecs: false,
+      artwork: {
+        source: "NONE" as const,
+        url: null,
+        mimeType: null,
+        width: null,
+        height: null,
+      },
+    });
+    database.replaceAlbumsForRoot("music", [
+      makeAlbum("search-primary", "Primary Facts", "Primary Artist", 2001),
+      makeAlbum(
+        "search-secondary",
+        "Secondary Facts",
+        "Secondary Artist",
+        2002,
+      ),
+    ]);
+    const source = database.getAlbumSummary("search-secondary")!;
+    const target = database.getAlbumSummary("search-primary")!;
+    database.applyLibraryIdentityDecision(
+      source.id,
+      {
+        type: "MERGE",
+        requestId: "search-version-merge",
+        revision: source.revision,
+        targetLibraryAlbumId: target.id,
+        targetRevision: target.revision,
+        primaryVersionId: "search-primary",
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    let received: unknown = null;
+    const app = await buildApp({
+      config: testConfig(),
+      database,
+      releaseCatalogClient: {
+        searchReleases: async (input) => {
+          received = input;
+          return [];
+        },
+      },
+    });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${target.id}/match-candidates`,
+      headers: { cookie: adminCookie(database) },
+      payload: { localVersionId: "search-secondary" },
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    expect(received).toEqual(
+      expect.objectContaining({
+        albumId: "search-secondary",
+        title: "Secondary Facts",
+        artist: "Secondary Artist",
+        year: 2002,
+      }),
     );
   });
 

@@ -3,7 +3,7 @@ import { appendFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import BetterSqlite3 from "better-sqlite3";
-import { CoceanDatabase } from "./client.js";
+import { AlbumMetadataDecisionError, CoceanDatabase } from "./client.js";
 import {
   createVerifiedDatabaseBackup,
   verifyDatabaseBackup,
@@ -164,8 +164,8 @@ describe("CoceanDatabase", () => {
       expect.objectContaining({
         schema: "cocean.database-backup/v1",
         releaseVersion: "0.1.0",
-        schemaVersion: 17,
-        migrationCount: 17,
+        schemaVersion: 18,
+        migrationCount: 18,
         sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       }),
     );
@@ -346,6 +346,15 @@ describe("CoceanDatabase", () => {
     );
     legacy
       .prepare(
+        `UPDATE albums SET match_status='USER_CONFIRMED',label='Legacy Label',
+         catalog_number='LEG-001',barcode='1234567890123',country='GB',
+         release_date='2020-02-03',
+         musicbrainz_release_id='aaaaaaaa-1111-4222-8333-123456789abc'
+         WHERE id='legacy-complete'`,
+      )
+      .run();
+    legacy
+      .prepare(
         `INSERT INTO physical_copies
           (id, album_id, medium, quantity, created_at, updated_at)
          VALUES ('legacy-cd', 'legacy-short', 'CD', 1, ?, ?)`,
@@ -365,6 +374,26 @@ describe("CoceanDatabase", () => {
     expect(
       upgraded.raw.prepare("SELECT id, album_id FROM physical_copies").all(),
     ).toEqual([{ id: "legacy-cd", album_id: "legacy-short" }]);
+    const migratedRelease = upgraded
+      .getAlbumMetadata("legacy-complete")!
+      .versions.find((version) => version.versionId === "legacy-complete")!;
+    for (const [field, value] of Object.entries({
+      label: "Legacy Label",
+      catalogNumber: "LEG-001",
+      barcode: "1234567890123",
+      country: "GB",
+      releaseDate: "2020-02-03",
+    }))
+      expect(
+        migratedRelease.fields[field as keyof typeof migratedRelease.fields]
+          .confirmedExternal,
+      ).toEqual(
+        expect.objectContaining({
+          value,
+          provider: "MUSICBRAINZ",
+          candidateId: "aaaaaaaa-1111-4222-8333-123456789abc",
+        }),
+      );
     expect(
       upgraded.raw
         .prepare(
@@ -372,8 +401,8 @@ describe("CoceanDatabase", () => {
         )
         .get(),
     ).toEqual({
-      version: 17,
-      name: "manual_library_album_identity_governance",
+      version: 18,
+      name: "album_metadata_governance",
     });
   });
 
@@ -1181,8 +1210,8 @@ describe("CoceanDatabase", () => {
     ).toEqual(candidate);
     expect(database.getAlbum("album-match")).toEqual(
       expect.objectContaining({
-        title: "Local Title",
-        albumArtist: "Local Artist",
+        title: "Remote Title",
+        albumArtist: "Remote Artist",
         matchStatus: "USER_CONFIRMED",
         release: expect.objectContaining({
           label: "Still Test",
@@ -1203,6 +1232,683 @@ describe("CoceanDatabase", () => {
           musicBrainzReleaseId: candidate.sourceId,
         }),
       }),
+    );
+  });
+
+  it("applies metadata SET CLEAR RESET atomically with exact idempotency and append-only undo", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    database.replaceAlbumsForRoot("music", [
+      {
+        id: "metadata-album",
+        rootId: "music",
+        groupKey: "artist\0observed",
+        title: "Observed Title",
+        albumArtist: "Observed Artist",
+        year: 2001,
+        discCount: 1,
+        fileIds: [],
+        audioSummary: null,
+        mixedAudioSpecs: false,
+        artwork: {
+          source: "NONE",
+          url: null,
+          mimeType: null,
+          width: null,
+          height: null,
+        },
+      },
+    ]);
+    const libraryId = database.getAlbumSummary("metadata-album")!.id;
+    const actor = { id: "admin", displayName: "Admin" };
+    const input = {
+      requestId: "metadata-request-1",
+      expectedMetadataRevision: 0,
+      commands: [
+        {
+          action: "SET" as const,
+          field: "title" as const,
+          value: "Fixed Title",
+        },
+        { action: "CLEAR" as const, field: "year" as const },
+      ],
+    };
+    const first = database.applyAlbumMetadata(libraryId, input, actor);
+    expect(first.metadata).toEqual(
+      expect.objectContaining({
+        metadataRevision: 1,
+        album: expect.objectContaining({
+          title: expect.objectContaining({
+            effectiveValue: "Fixed Title",
+            effectiveSource: "USER_OVERRIDE",
+            observed: expect.objectContaining({ value: "Observed Title" }),
+          }),
+          year: expect.objectContaining({
+            effectiveValue: null,
+            effectiveSource: "USER_OVERRIDE",
+            observed: expect.objectContaining({ value: 2001 }),
+          }),
+        }),
+      }),
+    );
+    expect(database.applyAlbumMetadata(libraryId, input, actor).event.id).toBe(
+      first.event.id,
+    );
+    expect(database.getAlbumMetadata(libraryId)?.metadataRevision).toBe(1);
+    expect(database.getAlbumSummary(libraryId)?.year).toBeNull();
+    expect(database.listAlbums()[0]?.year).toBeNull();
+    expect(database.getAlbum(libraryId)?.year).toBeNull();
+    expect(database.getAlbumDeliveryBundle(libraryId)?.year).toBeNull();
+    expect(() =>
+      database.applyAlbumMetadata(
+        libraryId,
+        { ...input, commands: [{ action: "RESET", field: "title" }] },
+        actor,
+      ),
+    ).toThrowError(AlbumMetadataDecisionError);
+    expect(() =>
+      database.applyAlbumMetadata(
+        libraryId,
+        {
+          requestId: "metadata-invalid",
+          expectedMetadataRevision: 1,
+          commands: [
+            { action: "SET", field: "albumArtist", value: "Must Roll Back" },
+            {
+              action: "SET",
+              field: "label",
+              versionId: "missing-version",
+              value: "Invalid",
+            },
+          ],
+        },
+        actor,
+      ),
+    ).toThrowError(AlbumMetadataDecisionError);
+    expect(database.getAlbum(libraryId)?.albumArtist).toBe("Observed Artist");
+
+    const undone = database.undoAlbumMetadataEvent(
+      libraryId,
+      first.event.id,
+      "metadata-undo-1",
+      1,
+      actor,
+    );
+    expect(undone.metadata.metadataRevision).toBe(2);
+    expect(undone.metadata.album.title.effectiveValue).toBe("Observed Title");
+    expect(undone.metadata.album.year.effectiveValue).toBe(2001);
+    expect(database.listAlbumMetadataHistory(libraryId)).toEqual([
+      expect.objectContaining({
+        type: "UNDO",
+        compensatesEventId: first.event.id,
+      }),
+      expect.objectContaining({ type: "UPDATE", canUndo: false }),
+    ]);
+  });
+
+  it("preserves album overrides across primary changes and rejects conflicting metadata merges", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    const base = {
+      rootId: "music",
+      title: "Grouped",
+      albumArtist: "Artist",
+      discCount: 1,
+      fileIds: [],
+      audioSummary: null,
+      mixedAudioSpecs: false,
+      artwork: {
+        source: "NONE" as const,
+        url: null,
+        mimeType: null,
+        width: null,
+        height: null,
+      },
+    };
+    database.replaceAlbumsForRoot("music", [
+      { ...base, id: "group-a", groupKey: "a", year: 2000 },
+      { ...base, id: "group-b", groupKey: "b", year: 2001 },
+      {
+        ...base,
+        id: "other",
+        groupKey: "other",
+        title: "Other",
+        year: 2002,
+      },
+    ]);
+    const grouped = database.getAlbumSummary("group-a")!;
+    const other = database.getAlbumSummary("other")!;
+    const actor = { id: "admin", displayName: "Admin" };
+    database.applyAlbumMetadata(
+      grouped.id,
+      {
+        requestId: "group-title",
+        expectedMetadataRevision: 0,
+        commands: [{ action: "SET", field: "title", value: "Curated" }],
+      },
+      actor,
+    );
+    database.applyAlbumMetadata(
+      other.id,
+      {
+        requestId: "other-title",
+        expectedMetadataRevision: 0,
+        commands: [{ action: "SET", field: "title", value: "Different" }],
+      },
+      actor,
+    );
+    const alternate = database
+      .getAlbum(grouped.id)!
+      .localVersions!.find((version) => !version.isPrimary)!;
+    database.applyLibraryIdentityDecision(
+      grouped.id,
+      {
+        type: "SET_PRIMARY",
+        requestId: "set-primary-metadata",
+        revision: grouped.revision,
+        primaryVersionId: alternate.id,
+      },
+      actor,
+    );
+    expect(database.getAlbum(grouped.id)).toEqual(
+      expect.objectContaining({ title: "Curated", metadataRevision: 2 }),
+    );
+    expect(() =>
+      database.applyLibraryIdentityDecision(
+        grouped.id,
+        {
+          type: "MERGE",
+          requestId: "merge-metadata-conflict",
+          revision: database.getAlbumSummary(grouped.id)!.revision,
+          targetLibraryAlbumId: other.id,
+          targetRevision: other.revision,
+          primaryVersionId: alternate.id,
+        },
+        actor,
+      ),
+    ).toThrowError(/字段冲突/);
+    expect(database.getAlbum(grouped.id)?.title).toBe("Curated");
+    expect(database.getAlbum(other.id)?.title).toBe("Different");
+  });
+
+  it("keeps album overrides on the primary partition and moves version metadata during a split", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    const album = (id: string) => ({
+      ...albumInput(id, []),
+      title: "Split Governed",
+      albumArtist: "Split Artist",
+      year: 2004,
+    });
+    database.replaceAlbumsForRoot("music", [
+      album("metadata-split-a"),
+      album("metadata-split-b"),
+    ]);
+    const parent = database.getAlbumSummary("metadata-split-a")!;
+    const primaryVersionId = parent.primaryVersionId!;
+    const childVersionId =
+      primaryVersionId === "metadata-split-a"
+        ? "metadata-split-b"
+        : "metadata-split-a";
+    const candidate = {
+      id: "metadata-split-candidate",
+      albumId: childVersionId,
+      source: "MUSICBRAINZ" as const,
+      sourceId: "a1b2c3d4-1111-4222-8333-123456789abc",
+      title: "Split Governed",
+      artistCredit: "Split Artist",
+      releaseDate: "2004-01-02",
+      country: "GB",
+      status: "Official",
+      barcode: "1234567890123",
+      labels: ["Child Label"],
+      catalogNumbers: ["CHILD-001"],
+      mediaFormats: ["CD"],
+      trackCount: 1,
+      coverArtAvailable: false,
+      sourceScore: 99,
+      fetchedAt: "2026-08-12T00:00:00.000Z",
+    };
+    database.replaceReleaseCandidates(parent.id, [candidate], childVersionId);
+    database.confirmReleaseCandidateMetadata(
+      parent.id,
+      candidate.id,
+      childVersionId,
+      "metadata-split-confirm",
+      0,
+      { id: "admin", displayName: "Admin" },
+    );
+    database.applyAlbumMetadata(
+      parent.id,
+      {
+        requestId: "metadata-split-override",
+        expectedMetadataRevision: 1,
+        commands: [{ action: "SET", field: "title", value: "Primary Curated" }],
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+
+    database.applyLibraryIdentityDecision(
+      parent.id,
+      {
+        type: "SPLIT",
+        requestId: "metadata-split",
+        revision: parent.revision,
+        partitions: [
+          { versionIds: [primaryVersionId] },
+          { versionIds: [childVersionId] },
+        ],
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+
+    const child = database.getAlbum(childVersionId)!;
+    expect(database.getAlbum(parent.id)?.title).toBe("Primary Curated");
+    expect(child.metadata?.album.title).toEqual(
+      expect.objectContaining({
+        userOverride: null,
+        effectiveValue: "Split Governed",
+        effectiveSource: "CONFIRMED_EXTERNAL",
+      }),
+    );
+    expect(child.release).toEqual(
+      expect.objectContaining({
+        label: "Child Label",
+        catalogNumber: "CHILD-001",
+      }),
+    );
+  });
+
+  it("keeps governed values and stable ownership when rescanned observations change", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    const observed = (title: string, artist: string, year: number) => ({
+      id: "rescan-version",
+      rootId: "music",
+      groupKey: "rescan-version",
+      title,
+      albumArtist: artist,
+      year,
+      discCount: 1,
+      fileIds: [],
+      audioSummary: null,
+      mixedAudioSpecs: false,
+      artwork: {
+        source: "NONE" as const,
+        url: null,
+        mimeType: null,
+        width: null,
+        height: null,
+      },
+    });
+    database.replaceAlbumsForRoot("music", [
+      observed("Broken", "Observed Artist", 2000),
+    ]);
+    const libraryId = database.getAlbumSummary("rescan-version")!.id;
+    database.applyAlbumMetadata(
+      libraryId,
+      {
+        requestId: "rescan-override",
+        expectedMetadataRevision: 0,
+        commands: [{ action: "SET", field: "title", value: "Curated Title" }],
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    database.replaceAlbumsForRoot("music", [
+      observed("New Scan Title", "New Scan Artist", 2001),
+    ]);
+    const rescanned = database.getAlbum(libraryId)!;
+    expect(rescanned).toEqual(
+      expect.objectContaining({
+        id: libraryId,
+        title: "Curated Title",
+        albumArtist: "New Scan Artist",
+        year: 2001,
+        metadataRevision: 2,
+      }),
+    );
+    expect(rescanned.metadata?.album.title).toEqual(
+      expect.objectContaining({
+        observed: expect.objectContaining({ value: "New Scan Title" }),
+        effectiveValue: "Curated Title",
+      }),
+    );
+    expect(database.listAlbums({ search: "Curated Title" })).toHaveLength(1);
+    expect(database.listAlbums({ search: "New Scan Title" })).toHaveLength(0);
+    expect(database.getAlbumDeliveryBundle(libraryId)?.title).toBe(
+      "Curated Title",
+    );
+    const frozen = {
+      ...database.getAlbumDeliveryBundle(libraryId)!,
+      files: [],
+      preparedArtwork: null,
+    };
+    createDeliveryTarget(database, "metadata-freeze-target");
+    database.createDeliveryJob(
+      deliveryJobInput(
+        "metadata-freeze-job",
+        "rescan-version",
+        "metadata-freeze-target",
+      ),
+      frozen,
+    );
+    database.applyAlbumMetadata(
+      libraryId,
+      {
+        requestId: "metadata-after-queue",
+        expectedMetadataRevision: 2,
+        commands: [
+          { action: "SET", field: "title", value: "Edited After Queue" },
+        ],
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    expect(database.getAlbumDeliveryBundle(libraryId)?.title).toBe(
+      "Edited After Queue",
+    );
+    expect(
+      database.getDeliveryJobSourceBundle("metadata-freeze-job")?.title,
+    ).toBe("Curated Title");
+  });
+
+  it("keeps governed LocalVersions through temporary disappearance and revisions USER observations", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    const observed = (title: string, label: string | null) => ({
+      ...albumInput("protected-version", []),
+      title,
+      label,
+      catalogNumber: label ? "CAT-1" : null,
+      barcode: label ? "12345678" : null,
+    });
+    database.replaceAlbumsForRoot("music", [observed("Before", "Old Label")]);
+    const group = database.getAlbumSummary("protected-version")!;
+    database.applyLibraryIdentityDecision(
+      group.id,
+      { type: "CONFIRM", requestId: "protect-confirm", revision: 0 },
+      { id: "admin", displayName: "Admin" },
+    );
+    database.applyAlbumMetadata(
+      group.id,
+      {
+        requestId: "protect-version-field",
+        expectedMetadataRevision: 0,
+        commands: [
+          {
+            action: "SET",
+            field: "label",
+            versionId: "protected-version",
+            value: "Curated Label",
+          },
+        ],
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    database.replaceAlbumsForRoot("music", []);
+    expect(database.getAlbum(group.id)).toEqual(
+      expect.objectContaining({ primaryVersionId: "protected-version" }),
+    );
+    database.replaceAlbumsForRoot("music", [observed("After", null)]);
+    const restored = database.getAlbum(group.id)!;
+    expect(restored.title).toBe("After");
+    expect(restored.metadataRevision).toBeGreaterThan(1);
+    expect(restored.metadata?.versions[0]?.fields.label).toEqual(
+      expect.objectContaining({
+        observed: expect.objectContaining({ value: null }),
+        effectiveValue: "Curated Label",
+      }),
+    );
+    expect(
+      database.raw
+        .prepare(
+          "SELECT label,catalog_number,barcode FROM albums WHERE id='protected-version'",
+        )
+        .get(),
+    ).toEqual({ label: null, catalog_number: null, barcode: null });
+  });
+
+  it("replaces external candidate fields, replays after candidate deletion, and undoes release state", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    database.replaceAlbumsForRoot("music", [
+      albumInput("candidate-replace", []),
+    ]);
+    const group = database.getAlbumSummary("candidate-replace")!;
+    const candidate = (id: string, complete: boolean) => ({
+      id,
+      albumId: "candidate-replace",
+      source: "MUSICBRAINZ" as const,
+      sourceId:
+        id === "11111111"
+          ? "11111111-1111-4222-8333-123456789abc"
+          : "22222222-1111-4222-8333-123456789abc",
+      title: `Title ${id}`,
+      artistCredit: "Artist",
+      releaseDate: complete ? "2020-01-02" : null,
+      country: complete ? "GB" : null,
+      status: "Official",
+      barcode: complete ? "1234567890123" : null,
+      labels: complete ? ["First Label"] : [],
+      catalogNumbers: complete ? ["FIRST-1"] : [],
+      mediaFormats: ["CD"],
+      trackCount: 1,
+      coverArtAvailable: false,
+      sourceScore: 90,
+      fetchedAt: "2026-08-12T00:00:00.000Z",
+    });
+    const first = candidate("11111111", true);
+    database.replaceReleaseCandidates(group.id, [first], "candidate-replace");
+    database.confirmReleaseCandidateMetadata(
+      group.id,
+      first.id,
+      "candidate-replace",
+      "candidate-first",
+      0,
+      { id: "admin", displayName: "Admin" },
+    );
+    const second = candidate("22222222", false);
+    database.replaceReleaseCandidates(group.id, [second], "candidate-replace");
+    const confirmed = database.confirmReleaseCandidateMetadata(
+      group.id,
+      second.id,
+      "candidate-replace",
+      "candidate-second",
+      1,
+      { id: "admin", displayName: "Admin" },
+    )!;
+    expect(database.getAlbum(group.id)?.release).toEqual(
+      expect.objectContaining({
+        label: null,
+        catalogNumber: null,
+        barcode: null,
+      }),
+    );
+    database.replaceReleaseCandidates(group.id, [], "candidate-replace");
+    expect(
+      database.confirmReleaseCandidateMetadata(
+        group.id,
+        second.id,
+        "candidate-replace",
+        "candidate-second",
+        1,
+        { id: "admin", displayName: "Admin" },
+      )?.candidate,
+    ).toEqual(second);
+    database.undoAlbumMetadataEvent(
+      group.id,
+      confirmed.result.event.id,
+      "candidate-second-undo",
+      2,
+      { id: "admin", displayName: "Admin" },
+    );
+    expect(database.getAlbum(group.id)?.release).toEqual(
+      expect.objectContaining({
+        label: "First Label",
+        musicBrainzReleaseId: first.sourceId,
+      }),
+    );
+  });
+
+  it("resolves broken and fallback identity issues without deleting evidence and RESET reopens them", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    database.createScanJob(scanJobInput("issue-scan"));
+    database.upsertMediaFile("issue-file", "music", "issue-scan", {
+      ...observedFile("Broken/01.flac", 20),
+      tags: {
+        ...observedFile("Broken/01.flac", 20).tags,
+        album: null,
+        albumArtist: null,
+        artists: [],
+      },
+    });
+    database.replaceAlbumsForRoot("music", [
+      {
+        ...albumInput("issue-album", ["issue-file"]),
+        title: "Bad\uFFFD",
+        albumArtist: "锟斤拷",
+      },
+    ]);
+    const group = database.getAlbumSummary("issue-album")!;
+    expect(database.getLibraryStats().brokenIdentity).toBe(1);
+    database.applyAlbumMetadata(
+      group.id,
+      {
+        requestId: "issue-fix",
+        expectedMetadataRevision: 0,
+        commands: [
+          { action: "SET", field: "title", value: "Good Title" },
+          { action: "SET", field: "albumArtist", value: "Good Artist" },
+        ],
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    expect(database.getAlbum(group.id)?.issues).toEqual(
+      expect.not.arrayContaining([
+        expect.objectContaining({ code: "BROKEN_TEXT" }),
+        expect.objectContaining({ code: "MISSING_IDENTITY" }),
+      ]),
+    );
+    expect(database.listAlbums({ issue: "BROKEN_TEXT" })).toEqual([]);
+    expect(database.getLibraryStats().brokenIdentity).toBe(0);
+    expect(database.getAlbumMetadata(group.id)?.observedIssues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "BROKEN_TEXT",
+          resolutionStatus: "RESOLVED_BY_METADATA",
+        }),
+        expect.objectContaining({
+          code: "MISSING_IDENTITY",
+          resolutionStatus: "RESOLVED_BY_METADATA",
+        }),
+      ]),
+    );
+    database.applyAlbumMetadata(
+      group.id,
+      {
+        requestId: "issue-reset",
+        expectedMetadataRevision: 1,
+        commands: [
+          { action: "RESET", field: "title" },
+          { action: "RESET", field: "albumArtist" },
+        ],
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    expect(database.getLibraryStats().brokenIdentity).toBe(1);
+  });
+
+  it("restores metadata ownership on identity undo without discarding later field events", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    const album = (id: string, title: string) => ({
+      id,
+      rootId: "music",
+      groupKey: id,
+      title,
+      albumArtist: "Observed Artist",
+      year: 2000,
+      discCount: 1,
+      fileIds: [],
+      audioSummary: null,
+      mixedAudioSpecs: false,
+      artwork: {
+        source: "NONE" as const,
+        url: null,
+        mimeType: null,
+        width: null,
+        height: null,
+      },
+    });
+    database.replaceAlbumsForRoot("music", [
+      album("undo-source", "Source"),
+      album("undo-target", "Target"),
+    ]);
+    const source = database.getAlbumSummary("undo-source")!;
+    const target = database.getAlbumSummary("undo-target")!;
+    const actor = { id: "admin", displayName: "Admin" };
+    database.applyAlbumMetadata(
+      source.id,
+      {
+        requestId: "undo-source-title",
+        expectedMetadataRevision: 0,
+        commands: [{ action: "SET", field: "title", value: "Source Curated" }],
+      },
+      actor,
+    );
+    const merged = database.applyLibraryIdentityDecision(
+      source.id,
+      {
+        type: "MERGE",
+        requestId: "undo-merge",
+        revision: source.revision,
+        targetLibraryAlbumId: target.id,
+        targetRevision: target.revision,
+        primaryVersionId: "undo-target",
+      },
+      actor,
+    );
+    const mergedMetadata = database.getAlbumMetadata(target.id)!;
+    expect(mergedMetadata.album.title.effectiveValue).toBe("Source Curated");
+    database.applyAlbumMetadata(
+      target.id,
+      {
+        requestId: "later-target-artist",
+        expectedMetadataRevision: mergedMetadata.metadataRevision,
+        commands: [
+          { action: "SET", field: "albumArtist", value: "Later Artist" },
+        ],
+      },
+      actor,
+    );
+    expect(database.listAlbumMetadataHistory(target.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          requestId: "later-target-artist",
+          canUndo: true,
+        }),
+        expect.objectContaining({
+          requestId: "undo-source-title",
+          canUndo: false,
+        }),
+      ]),
+    );
+    database.undoLibraryIdentityDecision(
+      source.id,
+      merged.decision.id,
+      "undo-merge-request",
+      merged.decision.resultingRevision,
+      actor,
+    );
+    expect(database.getAlbum(source.id)?.title).toBe("Source Curated");
+    expect(database.getAlbum(target.id)?.albumArtist).toBe("Later Artist");
+    expect(database.listAlbumMetadataHistory(source.id)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          requestId: "undo-source-title",
+          canUndo: false,
+        }),
+      ]),
     );
   });
 

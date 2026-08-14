@@ -1,5 +1,6 @@
 import type {
   AlbumDetail,
+  AlbumMetadata,
   DeliveryJob,
   LocalVersionSummary,
 } from "@cocean/contracts";
@@ -11,7 +12,9 @@ import {
   AlbumIdentityHistory,
   AlbumIntegrityIssues,
   AlbumLocalVersions,
+  AlbumMetadataGovernance,
   buildConfirmIdentityCommand,
+  buildMetadataCommands,
   buildMergeIdentityCommand,
   buildSetPrimaryIdentityCommand,
   buildSplitIdentityCommand,
@@ -85,6 +88,87 @@ describe("Album 详情本地版本", () => {
     expect(html).toContain("自动候选 · 待确认");
     expect(html).toContain("曲目不完整");
     expect(html).toContain("/library/music/Artist/Album/01.flac");
+  });
+});
+
+describe("Album 元数据治理", () => {
+  it("构造多字段 SET/CLEAR 命令并绑定版本，纯空白 SET 被拒绝", () => {
+    const rows = [
+      { key: "title", field: "title" as const },
+      { key: "v:label", field: "label" as const, versionId: "v" },
+      { key: "year", field: "year" as const },
+    ];
+    expect(
+      buildMetadataCommands(
+        rows,
+        new Set(["title", "v:label", "year"]),
+        new Set(["v:label"]),
+        { title: "Curated", "v:label": "", year: "2024" },
+      ),
+    ).toEqual([
+      { action: "SET", field: "title", value: "Curated" },
+      { action: "CLEAR", field: "label", versionId: "v" },
+      { action: "SET", field: "year", value: 2024 },
+    ]);
+    expect(() =>
+      buildMetadataCommands(rows, new Set(["v:label"]), new Set(), {
+        "v:label": "   ",
+      }),
+    ).toThrow(/清空有效值/);
+  });
+
+  it("管理员看到分作用域字段、来源、批量保存、清空、恢复和撤销入口", () => {
+    const metadata = metadataFixture();
+    const html = renderToStaticMarkup(
+      <AlbumMetadataGovernance
+        metadata={metadata}
+        history={[
+          {
+            id: "event-1",
+            requestId: "request-1",
+            libraryAlbumId: metadata.libraryAlbumId,
+            type: "UPDATE",
+            actor: { id: "admin", displayName: "管理员" },
+            expectedMetadataRevision: 0,
+            resultingMetadataRevision: 1,
+            commands: [{ action: "SET", field: "title", value: "人工标题" }],
+            compensatesEventId: null,
+            canUndo: true,
+            createdAt: "2026-08-14T00:00:00.000Z",
+          },
+        ]}
+        historyError={null}
+        canManage
+        onReload={async () => true}
+        onToast={() => undefined}
+      />,
+    );
+    expect(html).toContain("唱片级字段");
+    expect(html).toContain("版本级字段");
+    expect(html).toContain("来源：人工覆盖");
+    expect(html).toContain("观察值：扫描标题");
+    expect(html).toContain("保存修改（0 个字段）");
+    expect(html).toContain("清空有效值");
+    expect(html).toContain("移除人工覆盖 / 恢复下一层可信值");
+    expect(html).toContain("撤销");
+    expect(html).toContain("仅修改 COCEAN 数据库");
+  });
+
+  it("成员只看到来源与历史，不出现写入操作", () => {
+    const html = renderToStaticMarkup(
+      <AlbumMetadataGovernance
+        metadata={metadataFixture()}
+        history={[]}
+        historyError={null}
+        canManage={false}
+        onReload={async () => true}
+        onToast={() => undefined}
+      />,
+    );
+    expect(html).toContain("成员与 Demo 可以查看来源和历史");
+    expect(html).not.toContain("保存修改（");
+    expect(html).not.toContain("清空有效值");
+    expect(html).not.toContain(">撤销<");
   });
 });
 
@@ -431,3 +515,51 @@ describe("Album 详情完整性与兼容展示", () => {
     expect(html).toContain("曲目不完整");
   });
 });
+
+function metadataFixture(): AlbumMetadata {
+  const field = (
+    observed: string | number | null,
+    effective = observed,
+    override = false,
+  ) => ({
+    observed: {
+      value: observed,
+      source: "OBSERVED_TAG" as const,
+      versionId: "version-a",
+    },
+    confirmedExternal: null,
+    userOverride: override
+      ? {
+          value: effective,
+          actor: { id: "admin", displayName: "管理员" },
+          updatedAt: "2026-08-14T00:00:00.000Z",
+        }
+      : null,
+    effectiveValue: effective,
+    effectiveSource: override
+      ? ("USER_OVERRIDE" as const)
+      : ("OBSERVED_TAG" as const),
+  });
+  return {
+    libraryAlbumId: "library-a",
+    metadataRevision: 1,
+    album: {
+      title: field("扫描标题", "人工标题", true),
+      albumArtist: field("艺术家"),
+      year: field(2020),
+    },
+    versions: [
+      {
+        versionId: "version-a",
+        fields: {
+          label: field("厂牌"),
+          catalogNumber: field(null),
+          barcode: field(null),
+          country: field("CN"),
+          releaseDate: field("2020-01-01"),
+        },
+      },
+    ],
+    observedIssues: [],
+  };
+}

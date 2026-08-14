@@ -1,6 +1,9 @@
 import type {
   AlbumDetail,
   AlbumIntroduction,
+  AlbumMetadata,
+  AlbumMetadataEvent,
+  AlbumMetadataMutationResult,
   AlbumSummary,
   AuthSession,
   AuthUser,
@@ -14,6 +17,7 @@ import type {
   LibraryIdentityDecision,
   LibraryIdentityDecisionCommand,
   LibraryIdentityDecisionResult,
+  UpdateAlbumMetadataCommand,
   ModelConfiguration,
   ModelVerificationStatus,
   OwnedDevice,
@@ -261,6 +265,45 @@ export const api = {
       { method: "POST", body: JSON.stringify(input) },
     );
   },
+  albumMetadata(albumId: string): Promise<AlbumMetadata> {
+    return request(`/api/v1/albums/${encodeURIComponent(albumId)}/metadata`);
+  },
+  metadataHistory(albumId: string): Promise<AlbumMetadataEvent[]> {
+    return withDemo(
+      () =>
+        request<{ items: AlbumMetadataEvent[] }>(
+          `/api/v1/albums/${encodeURIComponent(albumId)}/metadata-history`,
+        ).then((result) => result.items),
+      () => [],
+    );
+  },
+  updateAlbumMetadata(
+    albumId: string,
+    command: UpdateAlbumMetadataCommand,
+  ): Promise<AlbumMetadataMutationResult> {
+    if (forceDemo)
+      return Promise.reject(
+        new ApiError(409, "DEMO_WRITE_DISABLED", "演示模式不保存元数据修改"),
+      );
+    return request(`/api/v1/albums/${encodeURIComponent(albumId)}/metadata`, {
+      method: "PATCH",
+      body: JSON.stringify(command),
+    });
+  },
+  undoMetadataEvent(
+    albumId: string,
+    eventId: string,
+    input: { requestId: string; expectedMetadataRevision: number },
+  ): Promise<AlbumMetadataMutationResult> {
+    if (forceDemo)
+      return Promise.reject(
+        new ApiError(409, "DEMO_WRITE_DISABLED", "演示模式不保存元数据修改"),
+      );
+    return request(
+      `/api/v1/albums/${encodeURIComponent(albumId)}/metadata-history/${encodeURIComponent(eventId)}/undo`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  },
   todayRecommendation(dayKey?: string): Promise<CatalogRecommendationResponse> {
     const query = dayKey ? `?dayKey=${encodeURIComponent(dayKey)}` : "";
     return request(`/api/v1/recommendations/today${query}`);
@@ -285,34 +328,61 @@ export const api = {
       body: JSON.stringify(input),
     });
   },
-  matchCandidates(albumId: string): Promise<ReleaseCandidate[]> {
+  matchCandidates(
+    albumId: string,
+    localVersionId?: string,
+  ): Promise<ReleaseCandidate[]> {
+    const query = localVersionId
+      ? `?localVersionId=${encodeURIComponent(localVersionId)}`
+      : "";
     return withDemo(
       async () =>
         (
           await request<{ items: ReleaseCandidate[] }>(
-            `/api/v1/albums/${encodeURIComponent(albumId)}/match-candidates`,
+            `/api/v1/albums/${encodeURIComponent(albumId)}/match-candidates${query}`,
           )
         ).items,
       () => [],
     );
   },
-  searchMatchCandidates(albumId: string): Promise<ReleaseCandidate[]> {
+  searchMatchCandidates(
+    albumId: string,
+    localVersionId?: string,
+  ): Promise<ReleaseCandidate[]> {
+    if (forceDemo)
+      return Promise.reject(
+        new ApiError(
+          409,
+          "DEMO_WRITE_DISABLED",
+          "演示模式不查询或保存外部候选",
+        ),
+      );
     return request<{ items: ReleaseCandidate[] }>(
       `/api/v1/albums/${encodeURIComponent(albumId)}/match-candidates`,
       {
         method: "POST",
-        body: JSON.stringify({ limit: 8 }),
+        body: JSON.stringify({ limit: 8, localVersionId }),
       },
     ).then((result) => result.items);
   },
   confirmMatchCandidate(
     albumId: string,
     candidateId: string,
+    input: {
+      requestId: string;
+      expectedMetadataRevision: number;
+      localVersionId: string;
+    },
   ): Promise<{ candidate: ReleaseCandidate; album: AlbumDetail }> {
+    if (forceDemo)
+      return Promise.reject(
+        new ApiError(409, "DEMO_WRITE_DISABLED", "演示模式不确认外部候选"),
+      );
     return request(
       `/api/v1/albums/${encodeURIComponent(albumId)}/match-candidates/${encodeURIComponent(candidateId)}/confirm`,
       {
         method: "POST",
+        body: JSON.stringify(input),
       },
     );
   },

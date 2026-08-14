@@ -44,6 +44,7 @@ export const libraryIssueSchema = z.object({
   code: libraryIssueCodeSchema,
   versionId: z.string().nullable(),
   evidence: z.record(z.string(), z.unknown()),
+  resolutionStatus: z.enum(["PENDING", "RESOLVED_BY_METADATA"]).optional(),
 });
 export type LibraryIssue = z.infer<typeof libraryIssueSchema>;
 
@@ -138,11 +139,161 @@ export type LibraryIdentityDecisionResult = z.infer<
   typeof libraryIdentityDecisionResultSchema
 >;
 
+export const metadataValueSourceSchema = z.enum([
+  "USER_OVERRIDE",
+  "CONFIRMED_EXTERNAL",
+  "OBSERVED_TAG",
+  "PATH_FALLBACK",
+]);
+export type MetadataValueSource = z.infer<typeof metadataValueSourceSchema>;
+
+export const albumMetadataFieldSchema = z.enum([
+  "title",
+  "albumArtist",
+  "year",
+]);
+export type AlbumMetadataField = z.infer<typeof albumMetadataFieldSchema>;
+export const versionMetadataFieldSchema = z.enum([
+  "label",
+  "catalogNumber",
+  "barcode",
+  "country",
+  "releaseDate",
+]);
+export type VersionMetadataField = z.infer<typeof versionMetadataFieldSchema>;
+export const metadataFieldSchema = z.union([
+  albumMetadataFieldSchema,
+  versionMetadataFieldSchema,
+]);
+export type MetadataField = z.infer<typeof metadataFieldSchema>;
+
+export const metadataFieldValueSchema = z.union([
+  z.string(),
+  z.number().int(),
+  z.null(),
+]);
+export type MetadataFieldValue = z.infer<typeof metadataFieldValueSchema>;
+
+export const metadataFieldStateSchema = z.object({
+  observed: z.object({
+    value: metadataFieldValueSchema,
+    source: z.enum(["OBSERVED_TAG", "PATH_FALLBACK"]),
+    versionId: z.string(),
+  }),
+  confirmedExternal: z
+    .object({
+      value: metadataFieldValueSchema,
+      provider: z.string(),
+      candidateId: z.string(),
+      confirmedAt: z.string(),
+    })
+    .nullable(),
+  userOverride: z
+    .object({
+      value: metadataFieldValueSchema,
+      actor: z.object({ id: z.string(), displayName: z.string() }),
+      updatedAt: z.string(),
+    })
+    .nullable(),
+  effectiveValue: metadataFieldValueSchema,
+  effectiveSource: metadataValueSourceSchema,
+});
+export type MetadataFieldState = z.infer<typeof metadataFieldStateSchema>;
+
+export const albumMetadataSchema = z.object({
+  libraryAlbumId: z.string(),
+  metadataRevision: z.number().int().nonnegative(),
+  album: z.object({
+    title: metadataFieldStateSchema,
+    albumArtist: metadataFieldStateSchema,
+    year: metadataFieldStateSchema,
+  }),
+  versions: z.array(
+    z.object({
+      versionId: z.string(),
+      fields: z.object({
+        label: metadataFieldStateSchema,
+        catalogNumber: metadataFieldStateSchema,
+        barcode: metadataFieldStateSchema,
+        country: metadataFieldStateSchema,
+        releaseDate: metadataFieldStateSchema,
+      }),
+    }),
+  ),
+  observedIssues: z.array(libraryIssueSchema),
+});
+export type AlbumMetadata = z.infer<typeof albumMetadataSchema>;
+
+const metadataCommandBaseSchema = z.object({
+  field: metadataFieldSchema,
+  versionId: z.string().min(1).optional(),
+});
+export const metadataCommandSchema = z.discriminatedUnion("action", [
+  metadataCommandBaseSchema.extend({
+    action: z.literal("SET"),
+    value: z.union([z.string(), z.number().int()]),
+  }),
+  metadataCommandBaseSchema.extend({ action: z.literal("CLEAR") }),
+  metadataCommandBaseSchema.extend({ action: z.literal("RESET") }),
+]);
+export type MetadataCommand = z.infer<typeof metadataCommandSchema>;
+
+export const updateAlbumMetadataCommandSchema = z.object({
+  requestId: z.string().trim().min(1).max(200),
+  expectedMetadataRevision: z.number().int().nonnegative(),
+  commands: z.array(metadataCommandSchema).min(1).max(8),
+});
+export type UpdateAlbumMetadataCommand = z.infer<
+  typeof updateAlbumMetadataCommandSchema
+>;
+
+export const undoAlbumMetadataCommandSchema = z.object({
+  requestId: z.string().trim().min(1).max(200),
+  expectedMetadataRevision: z.number().int().nonnegative(),
+});
+export type UndoAlbumMetadataCommand = z.infer<
+  typeof undoAlbumMetadataCommandSchema
+>;
+
+export const confirmReleaseCandidateCommandSchema = z.object({
+  requestId: z.string().trim().min(1).max(200),
+  expectedMetadataRevision: z.number().int().nonnegative(),
+  localVersionId: z.string().min(1),
+});
+export type ConfirmReleaseCandidateCommand = z.infer<
+  typeof confirmReleaseCandidateCommandSchema
+>;
+
+export const albumMetadataEventSchema = z.object({
+  id: z.string(),
+  requestId: z.string(),
+  libraryAlbumId: z.string(),
+  type: z.enum(["UPDATE", "CONFIRM_EXTERNAL", "UNDO"]),
+  actor: z.object({ id: z.string(), displayName: z.string() }),
+  expectedMetadataRevision: z.number().int().nonnegative(),
+  resultingMetadataRevision: z.number().int().nonnegative(),
+  commands: z.array(metadataCommandSchema),
+  compensatesEventId: z.string().nullable(),
+  canUndo: z.boolean(),
+  createdAt: z.string(),
+});
+export type AlbumMetadataEvent = z.infer<typeof albumMetadataEventSchema>;
+
+export const albumMetadataMutationResultSchema = z.object({
+  metadata: albumMetadataSchema,
+  event: albumMetadataEventSchema,
+});
+export type AlbumMetadataMutationResult = z.infer<
+  typeof albumMetadataMutationResultSchema
+>;
+
 export const localVersionSummarySchema = z.object({
   id: z.string(),
   title: z.string(),
   albumArtist: z.string(),
   year: z.number().int().nullable(),
+  matchStatus: matchStatusSchema.optional(),
+  musicBrainzReleaseId: z.string().nullable().optional(),
   isPrimary: z.boolean(),
   relationshipStatus: z.enum([
     "AUTO_CANDIDATE",
@@ -205,6 +356,7 @@ export const albumSummarySchema = z.object({
   primaryVersionId: z.string().optional(),
   primaryVersionSource: libraryAlbumPrimaryVersionSourceSchema,
   revision: z.number().int().nonnegative(),
+  metadataRevision: z.number().int().nonnegative().optional(),
   versionCount: z.number().int().positive().optional(),
   issues: z.array(libraryIssueSchema).optional(),
 });
@@ -261,6 +413,7 @@ export const albumDetailSchema = albumSummarySchema.extend({
     })
     .nullable(),
   localVersions: z.array(localVersionSummarySchema).optional(),
+  metadata: albumMetadataSchema.optional(),
 });
 export type AlbumDetail = z.infer<typeof albumDetailSchema>;
 

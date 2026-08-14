@@ -1,4 +1,4 @@
-import type { ReleaseCandidate } from "@cocean/contracts";
+import type { AlbumDetail, ReleaseCandidate } from "@cocean/contracts";
 import {
   Check,
   CircleHelp,
@@ -8,7 +8,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { api } from "../api.js";
+import { ApiError, api } from "../api.js";
 import {
   AlbumArtwork,
   Button,
@@ -21,8 +21,12 @@ import { releaseMatchEvidence } from "../media-ui.js";
 
 export function InformationMatchPage({ canManage }: { canManage: boolean }) {
   const { id = "" } = useParams();
+  const [localVersionId, setLocalVersionId] = useState<string>("");
   const album = useAsync(() => api.album(id), [id]);
-  const candidates = useAsync(() => api.matchCandidates(id), [id]);
+  const candidates = useAsync(
+    () => api.matchCandidates(id, localVersionId || undefined),
+    [id, localVersionId],
+  );
   const capabilities = useAsync(() => api.capabilities(), []);
   const [working, setWorking] = useState<string | null>(null);
   const toast = useToast();
@@ -43,17 +47,25 @@ export function InformationMatchPage({ canManage }: { canManage: boolean }) {
       </div>
     );
   const item = album.data;
+  const selectedLocalVersionId =
+    localVersionId ||
+    item.primaryVersionId ||
+    item.localVersions?.[0]?.id ||
+    "";
+  const selected = informationMatchVersion(item, selectedLocalVersionId);
   const musicBrainz = capabilities.data?.catalogSources.musicBrainz;
   const musicBrainzReady = musicBrainz?.configured === true;
   const releaseEvidence = releaseMatchEvidence(
-    item.matchStatus,
-    item.release.musicBrainzReleaseId,
+    selected.matchStatus,
+    selected.musicBrainzReleaseId,
   );
   const userConfirmed = releaseEvidence.kind === "USER_CONFIRMED";
   const pending = [
-    item.release.catalogNumber,
-    item.release.barcode,
-    item.release.releaseDate,
+    selected.label,
+    selected.catalogNumber,
+    selected.barcode,
+    selected.country,
+    selected.releaseDate,
   ].filter((value) => !value).length;
   const searchExternal = async () => {
     if (!musicBrainzReady) {
@@ -66,7 +78,10 @@ export function InformationMatchPage({ canManage }: { canManage: boolean }) {
     }
     setWorking("search");
     try {
-      const results = await api.searchMatchCandidates(item.id);
+      const results = await api.searchMatchCandidates(
+        item.id,
+        selectedLocalVersionId,
+      );
       await candidates.reload();
       toast.show(
         results.length
@@ -82,10 +97,20 @@ export function InformationMatchPage({ canManage }: { canManage: boolean }) {
   const confirmCandidate = async (candidate: ReleaseCandidate) => {
     setWorking(candidate.id);
     try {
-      await api.confirmMatchCandidate(item.id, candidate.id);
+      await api.confirmMatchCandidate(item.id, candidate.id, {
+        requestId: createBrowserUuid(),
+        expectedMetadataRevision: item.metadataRevision ?? 0,
+        localVersionId: selectedLocalVersionId,
+      });
       await Promise.all([album.reload(), candidates.reload()]);
       toast.show("发行版证据已确认；源音乐文件没有被修改");
     } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        await album.reload();
+        await candidates.reload();
+        toast.show("唱片字段已更新；已保留所选版本，请按最新值再次确认");
+        return;
+      }
       toast.show(error instanceof Error ? error.message : "发行版确认失败");
     } finally {
       setWorking(null);
@@ -103,9 +128,9 @@ export function InformationMatchPage({ canManage }: { canManage: boolean }) {
           <section className="surface-card source-file-card">
             <AlbumArtwork album={item} size="small" />
             <div>
-              <h2>{item.title}</h2>
+              <h2>{selected.title}</h2>
               <p>
-                {item.albumArtist} · {item.year}
+                {selected.albumArtist} · {selected.year}
               </p>
               <code>
                 {item.sourceRoot
@@ -134,15 +159,15 @@ export function InformationMatchPage({ canManage }: { canManage: boolean }) {
             <h2>字段核对</h2>
             <DiffRow
               field="专辑标题"
-              current={item.title}
-              proposed={item.title}
+              current={selected.title}
+              proposed={selected.title}
               evidence={item.hasDigital ? "本地 Album 标签" : "实体收藏记录"}
               decision="保持原值"
             />
             <DiffRow
               field="发行日期"
-              current={item.year ? String(item.year) : "空"}
-              proposed={item.release.releaseDate ?? "等待精确发行来源"}
+              current={selected.year ? String(selected.year) : "空"}
+              proposed={selected.releaseDate ?? "等待精确发行来源"}
               evidence={
                 userConfirmed
                   ? "用户已确认 MusicBrainz Release"
@@ -162,6 +187,22 @@ export function InformationMatchPage({ canManage }: { canManage: boolean }) {
               </div>
               <span>{candidates.data?.length ?? 0} 个</span>
             </div>
+            <label>
+              <span>确认到本地版本</span>
+              <select
+                value={selectedLocalVersionId}
+                disabled={!canManage || working !== null}
+                onChange={(event) => setLocalVersionId(event.target.value)}
+              >
+                {(item.localVersions ?? []).map((version) => (
+                  <option key={version.id} value={version.id}>
+                    {version.isPrimary ? "主版本" : "本地版本"} ·{" "}
+                    {version.title}
+                  </option>
+                ))}
+              </select>
+              {!canManage ? <small>成员与 Demo 仅可查看候选</small> : null}
+            </label>
             {candidates.loading ? (
               <p className="candidate-note">正在读取已有候选…</p>
             ) : candidates.error ? (
@@ -174,7 +215,7 @@ export function InformationMatchPage({ canManage }: { canManage: boolean }) {
                     candidate={candidate}
                     confirmed={
                       userConfirmed &&
-                      item.release.musicBrainzReleaseId === candidate.sourceId
+                      selected.musicBrainzReleaseId === candidate.sourceId
                     }
                     working={working === candidate.id}
                     canManage={canManage}
@@ -321,6 +362,39 @@ export function InformationMatchPage({ canManage }: { canManage: boolean }) {
       <Toast message={toast.message} />
     </div>
   );
+}
+
+export function informationMatchVersion(item: AlbumDetail, versionId: string) {
+  const version =
+    item.localVersions?.find((candidate) => candidate.id === versionId) ??
+    item.localVersions?.find((candidate) => candidate.isPrimary);
+  const metadata = item.metadata?.versions.find(
+    (candidate) => candidate.versionId === version?.id,
+  );
+  const value = (field: keyof NonNullable<typeof metadata>["fields"]) => {
+    const current = metadata?.fields[field].effectiveValue;
+    return typeof current === "string" ? current : null;
+  };
+  return {
+    id: version?.id ?? item.primaryVersionId ?? item.id,
+    title: version?.title ?? item.title,
+    albumArtist: version?.albumArtist ?? item.albumArtist,
+    year: version?.year ?? item.year,
+    matchStatus: version?.matchStatus ?? item.matchStatus,
+    musicBrainzReleaseId:
+      version?.musicBrainzReleaseId ??
+      (version?.isPrimary ? item.release.musicBrainzReleaseId : null),
+    label: value("label"),
+    catalogNumber: value("catalogNumber"),
+    barcode: value("barcode"),
+    country: value("country"),
+    releaseDate: value("releaseDate"),
+  };
+}
+
+function createBrowserUuid(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function CandidateRow({
