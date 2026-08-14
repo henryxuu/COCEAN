@@ -16,7 +16,7 @@ import {
   type AlbumIdentityHint,
   type AlbumRecordInput,
 } from "@cocean/database";
-import { cachePreferredArtwork } from "./artwork-cache.js";
+import { cacheArtworkCandidates } from "./artwork-cache.js";
 import { groupAlbums, stableFileId, type IndexedFile } from "./albums.js";
 import type { WorkerConfig } from "./config.js";
 import { collectAudioInventory } from "./discover.js";
@@ -151,20 +151,19 @@ export async function processNextJob(
       );
 
     const requiresAlbumStability = database.scanRequiresAlbumStability(job.id);
-    const stability =
-      requiresAlbumStability
-        ? database.observeAlbumDirectories(
-            root.id,
-            albumDirectoryFingerprints(root.containerPath, inventory.fileFacts),
-            clock(),
-          )
-        : {
-            stableDirectories: albumDirectoryFingerprints(
-              root.containerPath,
-              inventory.fileFacts,
-            ).map((candidate) => candidate.relativeDirectory),
-            deferredDirectories: [],
-          };
+    const stability = requiresAlbumStability
+      ? database.observeAlbumDirectories(
+          root.id,
+          albumDirectoryFingerprints(root.containerPath, inventory.fileFacts),
+          clock(),
+        )
+      : {
+          stableDirectories: albumDirectoryFingerprints(
+            root.containerPath,
+            inventory.fileFacts,
+          ).map((candidate) => candidate.relativeDirectory),
+          deferredDirectories: [],
+        };
     database.updateScanStability(
       job.id,
       stability.stableDirectories.length,
@@ -272,11 +271,37 @@ export async function processNextJob(
           scanPaths.push(absolutePath);
           continue;
         }
+        const cached = await cacheArtworkCandidates(
+          existing.file,
+          config.cacheRoot,
+        ).catch(() => ({
+          artwork: emptyArtwork(),
+          candidates: [],
+          failed: Math.max(existing.file.artwork.length, 1),
+        }));
+        const reusedWarnings = [
+          ...existing.file.warnings.filter(
+            (warning) => warning.code !== "ARTWORK_CACHE_FAILED",
+          ),
+          ...(cached.failed
+            ? [
+                {
+                  code: "ARTWORK_CACHE_FAILED",
+                  message:
+                    "部分封面候选无法写入 COCEAN 缓存；源音乐文件未被修改",
+                },
+              ]
+            : []),
+        ];
         parsedObservations.push({
-          file: existing.file,
-          artwork: existingArtwork(existing.file),
+          file: {
+            ...existing.file,
+            artwork: cached.candidates,
+            warnings: reusedWarnings,
+          },
+          artwork: cached.artwork,
           warningCodes: [
-            ...new Set(existing.file.warnings.map((warning) => warning.code)),
+            ...new Set(reusedWarnings.map((warning) => warning.code)),
           ],
         });
         processedFiles += 1;
@@ -304,25 +329,28 @@ export async function processNextJob(
     })) {
       processedFiles += 1;
       if (outcome.ok) {
-        let artworkCacheFailed = false;
-        const artwork = await cachePreferredArtwork(
+        const cached = await cacheArtworkCandidates(
           outcome.value,
           config.cacheRoot,
         ).catch(() => {
-          artworkCacheFailed = true;
           logger.warn(
             { relativePath: outcome.value.relativePath },
             "failed to cache artwork",
           );
-          return emptyArtwork();
+          return {
+            artwork: emptyArtwork(),
+            candidates: [],
+            failed: Math.max(outcome.value.artwork.length, 1),
+          };
         });
         const warnings = [
           ...outcome.value.warnings,
-          ...(artworkCacheFailed
+          ...(cached.failed
             ? [
                 {
                   code: "ARTWORK_CACHE_FAILED",
-                  message: "首选封面无法写入 COCEAN 缓存；源音乐文件未被修改",
+                  message:
+                    "部分封面候选无法写入 COCEAN 缓存；源音乐文件未被修改",
                 },
               ]
             : []),
@@ -333,8 +361,8 @@ export async function processNextJob(
           ...new Set(warnings.map((warning) => warning.code)),
         ];
         parsedObservations.push({
-          file: { ...outcome.value, warnings },
-          artwork,
+          file: { ...outcome.value, artwork: cached.candidates, warnings },
+          artwork: cached.artwork,
           warningCodes,
         });
         successfulWarnings += warningCodes.length;
@@ -459,6 +487,7 @@ export async function processNextJob(
         ) ||
         albumIssueCount > 0,
     });
+    database.syncObservedArtworkCandidates();
     logger.info(
       {
         jobId: job.id,

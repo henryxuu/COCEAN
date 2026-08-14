@@ -237,4 +237,44 @@ describe("web API client", () => {
       localVersionId: "version-one",
     });
   });
+
+  it("binds artwork revision across JSON decisions and multipart upload without forcing JSON content type", async () => {
+    const requests: Array<{ input: string; init: RequestInit | undefined }> =
+      [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        requests.push({ input: String(input), init });
+        return new Response(JSON.stringify({ artwork: {}, event: {} }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+    await api.selectAlbumArtwork("album/a", {
+      action: "HIDE",
+      requestId: "art-hide",
+      expectedArtworkRevision: 3,
+    });
+    const file = new File(["png"], "cover.png", { type: "image/png" });
+    await api.uploadAlbumArtwork("album/a", file, {
+      requestId: "art-upload",
+      expectedArtworkRevision: 4,
+    });
+    expect(requests[0]?.input).toBe("/api/v1/albums/album%2Fa/artwork/select");
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
+      action: "HIDE",
+      requestId: "art-hide",
+      expectedArtworkRevision: 3,
+    });
+    expect(requests[1]?.input).toBe("/api/v1/albums/album%2Fa/artwork/upload");
+    expect(requests[1]?.init?.body).toBeInstanceOf(FormData);
+    expect(
+      (requests[1]?.init?.headers as Record<string, string>)["content-type"],
+    ).toBeUndefined();
+    const body = requests[1]?.init?.body as FormData;
+    expect(body.get("requestId")).toBe("art-upload");
+    expect(body.get("expectedArtworkRevision")).toBe("4");
+    expect((body.get("file") as File).name).toBe("cover.png");
+  });
 });

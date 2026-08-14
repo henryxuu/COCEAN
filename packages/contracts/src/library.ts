@@ -44,7 +44,9 @@ export const libraryIssueSchema = z.object({
   code: libraryIssueCodeSchema,
   versionId: z.string().nullable(),
   evidence: z.record(z.string(), z.unknown()),
-  resolutionStatus: z.enum(["PENDING", "RESOLVED_BY_METADATA"]).optional(),
+  resolutionStatus: z
+    .enum(["PENDING", "RESOLVED_BY_METADATA", "RESOLVED_BY_ARTWORK"])
+    .optional(),
 });
 export type LibraryIssue = z.infer<typeof libraryIssueSchema>;
 
@@ -327,6 +329,8 @@ export const artworkSchema = z.object({
     "SIDECAR",
     "EXACT_RELEASE",
     "REPRESENTATIVE",
+    "USER_UPLOAD",
+    "MUSICBRAINZ_CAA",
     "NONE",
   ]),
   url: z.string().nullable(),
@@ -335,6 +339,123 @@ export const artworkSchema = z.object({
   height: z.number().int().positive().nullable(),
 });
 export type Artwork = z.infer<typeof artworkSchema>;
+
+export const artworkSelectionSourceSchema = z.enum([
+  "USER_SELECTED",
+  "USER_HIDDEN",
+  "AUTOMATIC_PRIMARY",
+  "AUTOMATIC_REPRESENTATIVE",
+  "NONE",
+]);
+export type ArtworkSelectionSource = z.infer<
+  typeof artworkSelectionSourceSchema
+>;
+
+export const artworkCandidateSourceSchema = z.enum([
+  "OBSERVED_EMBEDDED",
+  "OBSERVED_SIDECAR",
+  "USER_UPLOAD",
+  "MUSICBRAINZ_CAA",
+]);
+export type ArtworkCandidateSource = z.infer<
+  typeof artworkCandidateSourceSchema
+>;
+
+export const governedArtworkCandidateSchema = z.object({
+  id: z.string(),
+  assetSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  source: artworkCandidateSourceSchema,
+  localVersionId: z.string().nullable(),
+  relativePath: z.string().nullable(),
+  kind: z.string().nullable(),
+  mimeType: z.enum(["image/jpeg", "image/png", "image/webp"]),
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
+  sizeBytes: z.number().int().nonnegative(),
+  url: z.string(),
+  current: z.boolean(),
+  selected: z.boolean(),
+  lowResolution: z.boolean(),
+  evidence: z.record(z.string(), z.unknown()),
+});
+export type GovernedArtworkCandidate = z.infer<
+  typeof governedArtworkCandidateSchema
+>;
+
+export const albumArtworkGovernanceSchema = z.object({
+  libraryAlbumId: z.string(),
+  artworkRevision: z.number().int().nonnegative(),
+  effectiveArtwork: artworkSchema,
+  selectionSource: artworkSelectionSourceSchema,
+  selectedAssetSha256: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .nullable(),
+  selectedCandidateId: z.string().nullable(),
+  candidates: z.array(governedArtworkCandidateSchema).max(100),
+  truncated: z.boolean(),
+});
+export type AlbumArtworkGovernance = z.infer<
+  typeof albumArtworkGovernanceSchema
+>;
+
+const artworkDecisionBaseSchema = z.object({
+  requestId: z.string().trim().min(1).max(200),
+  expectedArtworkRevision: z.number().int().nonnegative(),
+});
+
+export const artworkDecisionCommandSchema = z.discriminatedUnion("action", [
+  artworkDecisionBaseSchema.extend({
+    action: z.literal("SELECT"),
+    candidateId: z.string().min(1),
+  }),
+  artworkDecisionBaseSchema.extend({ action: z.literal("HIDE") }),
+  artworkDecisionBaseSchema.extend({ action: z.literal("RESET") }),
+]);
+export type ArtworkDecisionCommand = z.infer<
+  typeof artworkDecisionCommandSchema
+>;
+
+export const importMusicBrainzArtworkCommandSchema =
+  artworkDecisionBaseSchema.extend({ localVersionId: z.string().min(1) });
+export type ImportMusicBrainzArtworkCommand = z.infer<
+  typeof importMusicBrainzArtworkCommandSchema
+>;
+
+export const undoAlbumArtworkCommandSchema = artworkDecisionBaseSchema.pick({
+  requestId: true,
+  expectedArtworkRevision: true,
+});
+export type UndoAlbumArtworkCommand = z.infer<
+  typeof undoAlbumArtworkCommandSchema
+>;
+
+export const albumArtworkEventSchema = z.object({
+  id: z.string(),
+  requestId: z.string(),
+  libraryAlbumId: z.string(),
+  type: z.enum(["SELECT", "HIDE", "RESET", "UPLOAD", "IMPORT", "UNDO"]),
+  actor: z.object({ id: z.string(), displayName: z.string() }),
+  expectedArtworkRevision: z.number().int().nonnegative(),
+  resultingArtworkRevision: z.number().int().nonnegative(),
+  assetSha256: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .nullable(),
+  candidateId: z.string().nullable(),
+  compensatesEventId: z.string().nullable(),
+  canUndo: z.boolean(),
+  createdAt: z.string(),
+});
+export type AlbumArtworkEvent = z.infer<typeof albumArtworkEventSchema>;
+
+export const albumArtworkMutationResultSchema = z.object({
+  artwork: albumArtworkGovernanceSchema,
+  event: albumArtworkEventSchema,
+});
+export type AlbumArtworkMutationResult = z.infer<
+  typeof albumArtworkMutationResultSchema
+>;
 
 export const albumSummarySchema = z.object({
   id: z.string(),
@@ -414,6 +535,7 @@ export const albumDetailSchema = albumSummarySchema.extend({
     .nullable(),
   localVersions: z.array(localVersionSummarySchema).optional(),
   metadata: albumMetadataSchema.optional(),
+  artworkGovernance: albumArtworkGovernanceSchema.optional(),
 });
 export type AlbumDetail = z.infer<typeof albumDetailSchema>;
 

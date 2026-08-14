@@ -37,12 +37,16 @@ vi.mock("@cocean/media-scanner", async () => {
 });
 
 vi.mock("./artwork-cache.js", () => ({
-  cachePreferredArtwork: async () => ({
-    source: "NONE" as const,
-    url: null,
-    mimeType: null,
-    width: null,
-    height: null,
+  cacheArtworkCandidates: async (file: ObservedMediaFile) => ({
+    artwork: {
+      source: "NONE" as const,
+      url: null,
+      mimeType: null,
+      width: null,
+      height: null,
+    },
+    candidates: file.artwork,
+    failed: 0,
   }),
 }));
 

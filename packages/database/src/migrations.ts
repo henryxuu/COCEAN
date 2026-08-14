@@ -991,4 +991,132 @@ export const migrations = [
       FROM albums WHERE match_status='USER_CONFIRMED' AND release_date IS NOT NULL;
     `,
   },
+  {
+    version: 19,
+    name: "album_artwork_governance",
+    sql: `
+      ALTER TABLE library_albums ADD COLUMN artwork_revision INTEGER NOT NULL DEFAULT 0
+        CHECK(artwork_revision >= 0);
+      ALTER TABLE library_albums ADD COLUMN effective_artwork_json TEXT;
+      ALTER TABLE library_albums ADD COLUMN effective_artwork_source TEXT NOT NULL DEFAULT 'NONE'
+        CHECK(effective_artwork_source IN (
+          'USER_SELECTED','USER_HIDDEN','AUTOMATIC_PRIMARY','AUTOMATIC_REPRESENTATIVE','NONE'
+        ));
+
+      DROP INDEX library_issues_code_idx;
+      DROP INDEX library_issues_identity_idx;
+      ALTER TABLE library_issues RENAME TO library_issues_v18;
+      CREATE TABLE library_issues (
+        library_album_id TEXT NOT NULL REFERENCES library_albums(id) ON DELETE CASCADE,
+        album_id TEXT REFERENCES albums(id) ON DELETE CASCADE,
+        code TEXT NOT NULL CHECK(code IN (
+          'IDENTITY_OVERLAP','INCOMPLETE_TRACKS','MISSING_ARTWORK',
+          'LOW_RES_ARTWORK','MIXED_AUDIO_SPECS','BROKEN_TEXT','MISSING_IDENTITY'
+        )),
+        evidence_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        resolution_status TEXT NOT NULL DEFAULT 'PENDING'
+          CHECK(resolution_status IN ('PENDING','RESOLVED_BY_METADATA','RESOLVED_BY_ARTWORK')),
+        PRIMARY KEY(library_album_id, code, album_id)
+      );
+      INSERT INTO library_issues
+        (library_album_id,album_id,code,evidence_json,created_at,updated_at,resolution_status)
+      SELECT library_album_id,album_id,code,evidence_json,created_at,updated_at,resolution_status
+      FROM library_issues_v18;
+      DROP TABLE library_issues_v18;
+      CREATE INDEX library_issues_code_idx
+        ON library_issues(code, library_album_id);
+      CREATE UNIQUE INDEX library_issues_identity_idx
+        ON library_issues(library_album_id, code, COALESCE(album_id, char(0)));
+
+      CREATE TABLE library_artwork_assets (
+        sha256 TEXT PRIMARY KEY CHECK(length(sha256)=64),
+        mime_type TEXT NOT NULL CHECK(mime_type IN ('image/jpeg','image/png','image/webp')),
+        width INTEGER NOT NULL CHECK(width > 0),
+        height INTEGER NOT NULL CHECK(height > 0),
+        size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+        extension TEXT NOT NULL CHECK(extension IN ('.jpg','.png','.webp')),
+        created_at TEXT NOT NULL
+      );
+      CREATE TRIGGER library_artwork_assets_no_update BEFORE UPDATE ON library_artwork_assets
+        BEGIN SELECT RAISE(ABORT, 'library artwork asset is immutable'); END;
+      CREATE TRIGGER library_artwork_assets_no_delete BEFORE DELETE ON library_artwork_assets
+        BEGIN SELECT RAISE(ABORT, 'library artwork asset is immutable'); END;
+
+      CREATE TABLE library_artwork_candidates (
+        id TEXT PRIMARY KEY,
+        library_album_id TEXT NOT NULL REFERENCES library_albums(id) ON DELETE CASCADE,
+        local_version_id TEXT,
+        asset_sha256 TEXT NOT NULL REFERENCES library_artwork_assets(sha256),
+        source_type TEXT NOT NULL CHECK(source_type IN (
+          'OBSERVED_EMBEDDED','OBSERVED_SIDECAR','USER_UPLOAD','MUSICBRAINZ_CAA'
+        )),
+        relative_path TEXT,
+        kind TEXT,
+        evidence_json TEXT NOT NULL DEFAULT '{}',
+        is_current INTEGER NOT NULL DEFAULT 1 CHECK(is_current IN (0,1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX library_artwork_candidates_album_idx
+        ON library_artwork_candidates(library_album_id,is_current,source_type,id);
+      CREATE INDEX library_artwork_candidates_asset_idx
+        ON library_artwork_candidates(asset_sha256,library_album_id);
+
+      CREATE TABLE library_artwork_selections (
+        library_album_id TEXT PRIMARY KEY REFERENCES library_albums(id) ON DELETE CASCADE,
+        state TEXT NOT NULL CHECK(state IN ('SELECTED','HIDDEN')),
+        asset_sha256 TEXT REFERENCES library_artwork_assets(sha256),
+        candidate_id TEXT REFERENCES library_artwork_candidates(id) ON DELETE SET NULL,
+        actor_id TEXT NOT NULL,
+        actor_display_name TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK((state='SELECTED' AND asset_sha256 IS NOT NULL) OR
+              (state='HIDDEN' AND asset_sha256 IS NULL AND candidate_id IS NULL))
+      );
+
+      CREATE TABLE library_artwork_events (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        library_album_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK(event_type IN (
+          'SELECT','HIDE','RESET','UPLOAD','IMPORT','UNDO'
+        )),
+        actor_id TEXT NOT NULL,
+        actor_display_name TEXT NOT NULL,
+        expected_artwork_revision INTEGER NOT NULL CHECK(expected_artwork_revision >= 0),
+        resulting_artwork_revision INTEGER NOT NULL CHECK(resulting_artwork_revision >= 0),
+        input_json TEXT NOT NULL,
+        before_state_json TEXT NOT NULL,
+        after_state_json TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        asset_sha256 TEXT,
+        candidate_id TEXT,
+        compensates_event_id TEXT REFERENCES library_artwork_events(id),
+        created_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX library_artwork_events_compensation_idx
+        ON library_artwork_events(compensates_event_id)
+        WHERE compensates_event_id IS NOT NULL;
+      CREATE INDEX library_artwork_events_album_idx
+        ON library_artwork_events(library_album_id,created_at DESC,id DESC);
+      CREATE TABLE library_artwork_event_groups (
+        event_id TEXT NOT NULL REFERENCES library_artwork_events(id),
+        library_album_id TEXT NOT NULL,
+        PRIMARY KEY(event_id,library_album_id)
+      );
+      CREATE INDEX library_artwork_event_groups_album_idx
+        ON library_artwork_event_groups(library_album_id,event_id);
+      CREATE TRIGGER library_artwork_events_no_update BEFORE UPDATE ON library_artwork_events
+        BEGIN SELECT RAISE(ABORT, 'library artwork event ledger is append-only'); END;
+      CREATE TRIGGER library_artwork_events_no_delete BEFORE DELETE ON library_artwork_events
+        BEGIN SELECT RAISE(ABORT, 'library artwork event ledger is append-only'); END;
+      CREATE TRIGGER library_artwork_event_groups_no_update BEFORE UPDATE ON library_artwork_event_groups
+        BEGIN SELECT RAISE(ABORT, 'library artwork event group ledger is append-only'); END;
+      CREATE TRIGGER library_artwork_event_groups_no_delete BEFORE DELETE ON library_artwork_event_groups
+        BEGIN SELECT RAISE(ABORT, 'library artwork event group ledger is append-only'); END;
+    `,
+  },
 ] as const;

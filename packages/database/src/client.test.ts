@@ -3,7 +3,11 @@ import { appendFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import BetterSqlite3 from "better-sqlite3";
-import { AlbumMetadataDecisionError, CoceanDatabase } from "./client.js";
+import {
+  AlbumArtworkDecisionError,
+  AlbumMetadataDecisionError,
+  CoceanDatabase,
+} from "./client.js";
 import {
   createVerifiedDatabaseBackup,
   verifyDatabaseBackup,
@@ -126,6 +130,105 @@ describe("CoceanDatabase", () => {
     ).rejects.toThrow(/newer/);
   });
 
+  it("migrates schema 18 integrity rows to schema 19 without changing prior governance", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "cocean-artwork-migration-"),
+    );
+    temporaryDirectories.push(directory);
+    const path = join(directory, "cocean.sqlite");
+    const legacy = new BetterSqlite3(path);
+    for (const migration of migrations.slice(0, 18)) {
+      legacy.exec(migration.sql);
+      legacy
+        .prepare(
+          "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+        )
+        .run(migration.version, migration.name, "2026-08-14T00:00:00.000Z");
+    }
+    legacy
+      .prepare(
+        `INSERT INTO albums
+         (id,root_id,group_key,title,album_artist,disc_count,track_count,
+          artwork_json,match_status,created_at,updated_at)
+         VALUES ('legacy-version','physical','legacy-version','Broken �','Artist',1,0,
+                 '{"source":"NONE","url":null,"mimeType":null,"width":null,"height":null}',
+                 'UNMATCHED',?,?)`,
+      )
+      .run("2026-08-14T00:00:00.000Z", "2026-08-14T00:00:00.000Z");
+    legacy
+      .prepare(
+        `INSERT INTO library_albums
+         (id,identity_key,title,album_artist,primary_version_id,decision_source,
+          primary_version_source,revision,metadata_revision,created_at,updated_at)
+         VALUES ('legacy-art',?,'Broken �','Artist','legacy-version','USER',
+                 'AUTOMATIC',7,4,?,?)`,
+      )
+      .run(
+        "artist\0album",
+        "2026-08-14T00:00:00.000Z",
+        "2026-08-14T00:00:00.000Z",
+      );
+    legacy
+      .prepare(
+        `INSERT INTO library_album_members
+         (library_album_id,album_id,relationship_status,created_at,updated_at)
+         VALUES ('legacy-art','legacy-version','USER_CONFIRMED',?,?)`,
+      )
+      .run("2026-08-14T00:00:00.000Z", "2026-08-14T00:00:00.000Z");
+    legacy
+      .prepare(
+        `INSERT INTO library_metadata_values
+         (scope_type,owner_id,field_name,source_type,value_json,evidence_json,
+          actor_id,actor_display_name,created_at,updated_at)
+         VALUES ('ALBUM','legacy-art','title','USER_OVERRIDE','"Curated"','{}',
+                 'admin','Admin',?,?)`,
+      )
+      .run("2026-08-14T00:00:00.000Z", "2026-08-14T00:00:00.000Z");
+    legacy
+      .prepare(
+        `INSERT INTO library_issues
+         (library_album_id,album_id,code,evidence_json,created_at,updated_at,resolution_status)
+         VALUES ('legacy-art',NULL,'BROKEN_TEXT','{"legacy":true}',?,?,
+                 'RESOLVED_BY_METADATA')`,
+      )
+      .run("2026-08-14T00:00:00.000Z", "2026-08-14T00:00:00.000Z");
+    legacy.close();
+
+    const database = new CoceanDatabase(path);
+    open.push(database);
+    expect(
+      database.raw
+        .prepare(
+          `SELECT revision,metadata_revision,artwork_revision,effective_artwork_source
+           FROM library_albums WHERE id='legacy-art'`,
+        )
+        .get(),
+    ).toEqual({
+      revision: 7,
+      metadata_revision: 4,
+      artwork_revision: 1,
+      effective_artwork_source: "NONE",
+    });
+    expect(
+      database.raw
+        .prepare(
+          `SELECT evidence_json,resolution_status FROM library_issues
+           WHERE library_album_id='legacy-art'`,
+        )
+        .get(),
+    ).toEqual({
+      evidence_json: expect.any(String),
+      resolution_status: "RESOLVED_BY_METADATA",
+    });
+    expect(
+      database.raw
+        .prepare(
+          "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1",
+        )
+        .get(),
+    ).toEqual({ version: 19 });
+  });
+
   it("creates and independently verifies an online SQLite backup", async () => {
     const directory = await mkdtemp(join(tmpdir(), "cocean-backup-test-"));
     temporaryDirectories.push(directory);
@@ -164,8 +267,8 @@ describe("CoceanDatabase", () => {
       expect.objectContaining({
         schema: "cocean.database-backup/v1",
         releaseVersion: "0.1.0",
-        schemaVersion: 18,
-        migrationCount: 18,
+        schemaVersion: 19,
+        migrationCount: 19,
         sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       }),
     );
@@ -401,8 +504,8 @@ describe("CoceanDatabase", () => {
         )
         .get(),
     ).toEqual({
-      version: 18,
-      name: "album_metadata_governance",
+      version: 19,
+      name: "album_artwork_governance",
     });
   });
 
@@ -3725,6 +3828,330 @@ describe("CoceanDatabase", () => {
       }),
     ]);
     expect(database.getScanJob("interrupted-scan")?.status).toBe("FAILED");
+  });
+
+  it("governs content-addressed artwork with independent revision, idempotency and undo", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    database.replaceAlbumsForRoot("music", [albumInput("artwork-version", [])]);
+    const group = database.getAlbumSummary("artwork-version")!;
+    const sha256 = "a".repeat(64);
+    const candidateId = database.upsertArtworkCandidate(group.id, {
+      sha256,
+      mimeType: "image/jpeg",
+      width: 1200,
+      height: 1200,
+      sizeBytes: 32_000,
+      extension: ".jpg",
+      source: "OBSERVED_EMBEDDED",
+      localVersionId: "artwork-version",
+      relativePath: "Artist/Album/01 Track.flac",
+      kind: "Front Cover",
+      evidence: { test: true },
+    });
+    expect(() =>
+      database.upsertArtworkCandidate(group.id, {
+        sha256,
+        mimeType: "image/png",
+        width: 800,
+        height: 800,
+        sizeBytes: 31_000,
+        extension: ".png",
+        source: "USER_UPLOAD",
+        localVersionId: null,
+        relativePath: null,
+        kind: "FRONT",
+        evidence: {},
+      }),
+    ).toThrow(/资产事实不一致/);
+    expect(database.getAlbumArtworkGovernance(group.id)).toEqual(
+      expect.objectContaining({
+        artworkRevision: 1,
+        selectionSource: "AUTOMATIC_PRIMARY",
+        effectiveArtwork: expect.objectContaining({
+          source: "EMBEDDED",
+          url: `/api/v1/artwork/${sha256}`,
+        }),
+      }),
+    );
+    expect(
+      database.raw
+        .prepare(
+          "SELECT resolution_status FROM library_issues WHERE library_album_id=? AND code='MISSING_ARTWORK'",
+        )
+        .get(group.id),
+    ).toEqual({ resolution_status: "RESOLVED_BY_ARTWORK" });
+
+    const select = {
+      action: "SELECT" as const,
+      requestId: "artwork-select",
+      expectedArtworkRevision: 1,
+      candidateId,
+    };
+    const selected = database.applyAlbumArtworkDecision(group.id, select, {
+      id: "admin",
+      displayName: "Admin",
+    });
+    expect(selected.artwork).toEqual(
+      expect.objectContaining({
+        artworkRevision: 2,
+        selectionSource: "USER_SELECTED",
+        selectedAssetSha256: sha256,
+      }),
+    );
+    expect(database.getAlbumDeliveryBundle(group.id)?.artwork.url).toBe(
+      `/api/v1/artwork/${sha256}`,
+    );
+    expect(
+      database.applyAlbumArtworkDecision(group.id, select, {
+        id: "admin",
+        displayName: "Admin",
+      }).event.id,
+    ).toBe(selected.event.id);
+    expect(() =>
+      database.applyAlbumArtworkDecision(
+        group.id,
+        {
+          action: "HIDE",
+          requestId: "artwork-select",
+          expectedArtworkRevision: 2,
+        },
+        { id: "admin", displayName: "Admin" },
+      ),
+    ).toThrow(AlbumArtworkDecisionError);
+
+    const hidden = database.applyAlbumArtworkDecision(
+      group.id,
+      {
+        action: "HIDE",
+        requestId: "artwork-hide",
+        expectedArtworkRevision: 2,
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    expect(hidden.artwork.selectionSource).toBe("USER_HIDDEN");
+    expect(hidden.artwork.effectiveArtwork.source).toBe("NONE");
+    expect(database.getAlbumDeliveryBundle(group.id)?.artwork.source).toBe(
+      "NONE",
+    );
+    const reset = database.applyAlbumArtworkDecision(
+      group.id,
+      {
+        action: "RESET",
+        requestId: "artwork-reset",
+        expectedArtworkRevision: 3,
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    expect(reset.artwork.selectionSource).toBe("AUTOMATIC_PRIMARY");
+    const undone = database.undoAlbumArtworkEvent(
+      group.id,
+      reset.event.id,
+      "artwork-reset-undo",
+      4,
+      { id: "admin", displayName: "Admin" },
+    );
+    expect(undone.artwork.selectionSource).toBe("USER_HIDDEN");
+    expect(database.listAlbumArtworkHistory(group.id)).toHaveLength(4);
+
+    database.replaceAlbumsForRoot("music", [
+      { ...albumInput("artwork-version", []), title: "Rescanned" },
+    ]);
+    expect(database.getAlbumArtworkGovernance(group.id)).toEqual(
+      expect.objectContaining({
+        artworkRevision: 5,
+        selectionSource: "USER_HIDDEN",
+      }),
+    );
+    expect(() =>
+      database.raw
+        .prepare("UPDATE library_artwork_events SET event_type='RESET'")
+        .run(),
+    ).toThrow(/append-only/);
+  });
+
+  it("detects merge artwork conflicts, inherits one human choice and restores it on identity undo", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    database.replaceAlbumsForRoot("music", [
+      { ...albumInput("art-merge-source", []), title: "Source" },
+      { ...albumInput("art-merge-target", []), title: "Target" },
+    ]);
+    const sourceId = database.getAlbumSummary("art-merge-source")!.id;
+    const targetId = database.getAlbumSummary("art-merge-target")!.id;
+    const actor = { id: "admin", displayName: "Admin" };
+    const sourceCandidate = database.upsertArtworkCandidate(sourceId, {
+      sha256: "b".repeat(64),
+      mimeType: "image/jpeg",
+      width: 1000,
+      height: 1000,
+      sizeBytes: 10,
+      extension: ".jpg",
+      source: "USER_UPLOAD",
+      localVersionId: null,
+      relativePath: null,
+      kind: "FRONT",
+      evidence: {},
+    });
+    const targetCandidate = database.upsertArtworkCandidate(targetId, {
+      sha256: "c".repeat(64),
+      mimeType: "image/png",
+      width: 900,
+      height: 900,
+      sizeBytes: 11,
+      extension: ".png",
+      source: "USER_UPLOAD",
+      localVersionId: null,
+      relativePath: null,
+      kind: "FRONT",
+      evidence: {},
+    });
+    database.applyAlbumArtworkDecision(
+      sourceId,
+      {
+        action: "SELECT",
+        candidateId: sourceCandidate,
+        requestId: "merge-source-art",
+        expectedArtworkRevision: 0,
+      },
+      actor,
+    );
+    database.applyAlbumArtworkDecision(
+      targetId,
+      {
+        action: "SELECT",
+        candidateId: targetCandidate,
+        requestId: "merge-target-art",
+        expectedArtworkRevision: 0,
+      },
+      actor,
+    );
+    expect(() =>
+      database.applyLibraryIdentityDecision(
+        sourceId,
+        {
+          type: "MERGE",
+          requestId: "merge-art-conflict",
+          revision: 0,
+          targetLibraryAlbumId: targetId,
+          targetRevision: 0,
+          primaryVersionId: "art-merge-target",
+        },
+        actor,
+      ),
+    ).toThrow(/封面决定冲突/);
+    database.applyAlbumArtworkDecision(
+      targetId,
+      {
+        action: "RESET",
+        requestId: "merge-target-reset",
+        expectedArtworkRevision: 1,
+      },
+      actor,
+    );
+    const merged = database.applyLibraryIdentityDecision(
+      sourceId,
+      {
+        type: "MERGE",
+        requestId: "merge-art-success",
+        revision: 0,
+        targetLibraryAlbumId: targetId,
+        targetRevision: 0,
+        primaryVersionId: "art-merge-target",
+      },
+      actor,
+    );
+    expect(database.getAlbumArtworkGovernance(targetId)).toEqual(
+      expect.objectContaining({
+        selectionSource: "USER_SELECTED",
+        selectedAssetSha256: "b".repeat(64),
+      }),
+    );
+    expect(
+      database.listAlbumArtworkHistory(targetId).map((event) => event.type),
+    ).toContain("SELECT");
+    database.undoLibraryIdentityDecision(
+      targetId,
+      merged.decision.id,
+      "merge-art-undo",
+      1,
+      actor,
+    );
+    expect(database.getAlbumArtworkGovernance(sourceId)).toEqual(
+      expect.objectContaining({
+        selectionSource: "USER_SELECTED",
+        selectedAssetSha256: "b".repeat(64),
+      }),
+    );
+    expect(
+      database.getAlbumArtworkGovernance(targetId)?.selectionSource,
+    ).not.toBe("USER_SELECTED");
+  });
+
+  it("keeps a split human artwork choice only on the old-primary partition", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    database.replaceAlbumsForRoot("music", [
+      {
+        ...albumInput("art-split-a", []),
+        title: "Split",
+        albumArtist: "Artist",
+      },
+      {
+        ...albumInput("art-split-b", []),
+        title: "Split",
+        albumArtist: "Artist",
+      },
+    ]);
+    const sourceId = database.getAlbumSummary("art-split-a")!.id;
+    const actor = { id: "admin", displayName: "Admin" };
+    const candidate = database.upsertArtworkCandidate(sourceId, {
+      sha256: "d".repeat(64),
+      mimeType: "image/webp",
+      width: 800,
+      height: 800,
+      sizeBytes: 12,
+      extension: ".webp",
+      source: "OBSERVED_EMBEDDED",
+      localVersionId: "art-split-b",
+      relativePath: "Split B/01.flac",
+      kind: "Front Cover",
+      evidence: {},
+    });
+    database.applyAlbumArtworkDecision(
+      sourceId,
+      {
+        action: "SELECT",
+        candidateId: candidate,
+        requestId: "split-select-art",
+        expectedArtworkRevision: 1,
+      },
+      actor,
+    );
+    database.applyLibraryIdentityDecision(
+      sourceId,
+      {
+        type: "SPLIT",
+        requestId: "split-art",
+        revision: 0,
+        partitions: [
+          { versionIds: ["art-split-a"] },
+          { versionIds: ["art-split-b"] },
+        ],
+      },
+      actor,
+    );
+    const childId = database.getAlbumSummary("art-split-b")!.id;
+    expect(database.getAlbumArtworkGovernance(sourceId)).toEqual(
+      expect.objectContaining({
+        selectionSource: "USER_SELECTED",
+        selectedAssetSha256: "d".repeat(64),
+      }),
+    );
+    expect(database.getAlbumArtworkGovernance(childId)).toEqual(
+      expect.objectContaining({ selectionSource: "AUTOMATIC_PRIMARY" }),
+    );
+    expect(database.listAlbumArtworkHistory(childId)).toEqual([]);
   });
 });
 
