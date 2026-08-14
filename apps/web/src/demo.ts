@@ -101,6 +101,8 @@ export const demoAlbums: AlbumSummary[] = baseAlbums.map((album, index) => ({
   mixedAudioSpecs: false,
   hasDigital: true,
   matchStatus: album.status ?? "SOURCE_MATCHED",
+  primaryVersionSource: "AUTOMATIC",
+  revision: 0,
   trackCount: index === 7 ? 32 : 10 + (index % 4),
   discCount: index === 7 ? 2 : 1,
   issues:

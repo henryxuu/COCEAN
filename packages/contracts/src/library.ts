@@ -47,6 +47,97 @@ export const libraryIssueSchema = z.object({
 });
 export type LibraryIssue = z.infer<typeof libraryIssueSchema>;
 
+export const libraryAlbumPrimaryVersionSourceSchema = z.enum([
+  "AUTOMATIC",
+  "USER",
+]);
+export type LibraryAlbumPrimaryVersionSource = z.infer<
+  typeof libraryAlbumPrimaryVersionSourceSchema
+>;
+
+const identityDecisionBaseSchema = z.object({
+  requestId: z.string().trim().min(1).max(200),
+  revision: z.number().int().nonnegative(),
+});
+
+export const libraryIdentityDecisionCommandSchema = z.discriminatedUnion(
+  "type",
+  [
+    identityDecisionBaseSchema.extend({
+      type: z.literal("CONFIRM"),
+      primaryVersionId: z.string().min(1).optional(),
+    }),
+    identityDecisionBaseSchema.extend({
+      type: z.literal("MERGE"),
+      targetLibraryAlbumId: z.string().min(1),
+      targetRevision: z.number().int().nonnegative(),
+      primaryVersionId: z.string().min(1),
+    }),
+    identityDecisionBaseSchema.extend({
+      type: z.literal("SPLIT"),
+      partitions: z
+        .array(
+          z.object({
+            versionIds: z.array(z.string().min(1)).min(1).max(100),
+            primaryVersionId: z.string().min(1).optional(),
+          }),
+        )
+        .min(2)
+        .max(100),
+    }),
+    identityDecisionBaseSchema.extend({
+      type: z.literal("SET_PRIMARY"),
+      primaryVersionId: z.string().min(1),
+    }),
+  ],
+);
+export type LibraryIdentityDecisionCommand = z.infer<
+  typeof libraryIdentityDecisionCommandSchema
+>;
+
+export const undoLibraryIdentityDecisionCommandSchema =
+  identityDecisionBaseSchema;
+export type UndoLibraryIdentityDecisionCommand = z.infer<
+  typeof undoLibraryIdentityDecisionCommandSchema
+>;
+
+export const libraryIdentityDecisionSchema = z.object({
+  id: z.string(),
+  requestId: z.string(),
+  libraryAlbumId: z.string(),
+  type: z.enum(["CONFIRM", "MERGE", "SPLIT", "SET_PRIMARY", "UNDO"]),
+  actor: z.object({ id: z.string(), displayName: z.string() }),
+  expectedRevision: z.number().int().nonnegative(),
+  resultingRevision: z.number().int().nonnegative(),
+  details: z.object({
+    targetLibraryAlbumId: z.string().nullable(),
+    primaryVersionId: z.string().nullable(),
+    partitions: z.array(
+      z.object({
+        versionIds: z.array(z.string()),
+        primaryVersionId: z.string().nullable(),
+      }),
+    ),
+    compensatedDecisionId: z.string().nullable(),
+  }),
+  affectedLibraryAlbumIds: z.array(z.string()),
+  compensatesDecisionId: z.string().nullable(),
+  canUndo: z.boolean(),
+  createdAt: z.string(),
+});
+export type LibraryIdentityDecision = z.infer<
+  typeof libraryIdentityDecisionSchema
+>;
+
+export const libraryIdentityDecisionResultSchema = z.object({
+  decision: libraryIdentityDecisionSchema,
+  currentLibraryAlbumId: z.string(),
+  affectedLibraryAlbumIds: z.array(z.string()),
+});
+export type LibraryIdentityDecisionResult = z.infer<
+  typeof libraryIdentityDecisionResultSchema
+>;
+
 export const localVersionSummarySchema = z.object({
   id: z.string(),
   title: z.string(),
@@ -112,6 +203,8 @@ export const albumSummarySchema = z.object({
   duplicateFileCount: z.number().int().nonnegative().optional(),
   aggregationIssues: z.array(albumAggregationIssueSchema).optional(),
   primaryVersionId: z.string().optional(),
+  primaryVersionSource: libraryAlbumPrimaryVersionSourceSchema,
+  revision: z.number().int().nonnegative(),
   versionCount: z.number().int().positive().optional(),
   issues: z.array(libraryIssueSchema).optional(),
 });

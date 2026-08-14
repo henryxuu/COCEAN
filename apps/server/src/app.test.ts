@@ -134,6 +134,200 @@ describe("COCEAN HTTP API", () => {
     expect(legacyDetail.json()).toEqual(groupedDetail.json());
   });
 
+  it("exposes admin-only, idempotent identity governance with stable 400/409 contracts and member-readable history", async () => {
+    const database = new CoceanDatabase(":memory:");
+    database.replaceAlbumsForRoot("music", [
+      {
+        id: "govern-a",
+        rootId: "music",
+        groupKey: "govern-a",
+        title: "Governed",
+        albumArtist: "Artist",
+        year: 2026,
+        discCount: 1,
+        fileIds: [],
+        audioSummary: null,
+        mixedAudioSpecs: false,
+        artwork: {
+          source: "NONE",
+          url: null,
+          mimeType: null,
+          width: null,
+          height: null,
+        },
+      },
+      {
+        id: "govern-b",
+        rootId: "music",
+        groupKey: "govern-b",
+        title: "Governed",
+        albumArtist: "Artist",
+        year: 2026,
+        discCount: 1,
+        fileIds: [],
+        audioSummary: null,
+        mixedAudioSpecs: false,
+        artwork: {
+          source: "NONE",
+          url: null,
+          mimeType: null,
+          width: null,
+          height: null,
+        },
+      },
+    ]);
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const albumId = database.getAlbumSummary("govern-a")!.id;
+    const memberCookie = sessionCookieFor(database, "MEMBER");
+    const admin = adminCookie(database);
+    const payload = {
+      type: "CONFIRM",
+      requestId: "server-confirm",
+      revision: 0,
+      primaryVersionId: "govern-a",
+    };
+    const memberWrite = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/identity-decisions`,
+      headers: { cookie: memberCookie },
+      payload,
+    });
+    expect(memberWrite.statusCode).toBe(403);
+    expect(database.getAlbumSummary(albumId)!.revision).toBe(0);
+    const anonymousHistory = await app.inject({
+      method: "GET",
+      url: `/api/v1/albums/${albumId}/identity-decisions`,
+    });
+    expect(anonymousHistory.statusCode).toBe(401);
+
+    const confirmed = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/identity-decisions`,
+      headers: { cookie: admin },
+      payload,
+    });
+    expect(confirmed.statusCode, confirmed.body).toBe(200);
+    expect(confirmed.json().decision).toEqual(
+      expect.objectContaining({
+        type: "CONFIRM",
+        actor: expect.objectContaining({ displayName: "Test Admin" }),
+      }),
+    );
+    const replay = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/identity-decisions`,
+      headers: { cookie: admin },
+      payload,
+    });
+    expect(replay.json().decision.id).toBe(confirmed.json().decision.id);
+    const requestIdCollision = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/identity-decisions`,
+      headers: { cookie: admin },
+      payload: {
+        ...payload,
+        primaryVersionId: "govern-b",
+      },
+    });
+    expect(requestIdCollision.statusCode).toBe(409);
+    expect(requestIdCollision.json()).toEqual(
+      expect.objectContaining({
+        error: "IDENTITY_DECISION_CONFLICT",
+        message: expect.stringContaining("requestId"),
+      }),
+    );
+    const crossEntrypointCollision = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/identity-decisions/${confirmed.json().decision.id}/undo`,
+      headers: { cookie: admin },
+      payload: { requestId: payload.requestId, revision: 1 },
+    });
+    expect(crossEntrypointCollision.statusCode).toBe(409);
+    expect(crossEntrypointCollision.json().message).toContain("requestId");
+
+    const stale = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/identity-decisions`,
+      headers: { cookie: admin },
+      payload: {
+        type: "SET_PRIMARY",
+        requestId: "server-stale",
+        revision: 0,
+        primaryVersionId: "govern-b",
+      },
+    });
+    expect(stale.statusCode).toBe(409);
+    expect(stale.json().error).toBe("IDENTITY_DECISION_CONFLICT");
+    const invalid = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/identity-decisions`,
+      headers: { cookie: admin },
+      payload: {
+        type: "SPLIT",
+        requestId: "server-invalid-split",
+        revision: 1,
+        partitions: [
+          { versionIds: ["govern-a"] },
+          { versionIds: ["govern-a"] },
+        ],
+      },
+    });
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json().error).toBe("INVALID_IDENTITY_DECISION");
+    const oversized = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/identity-decisions`,
+      headers: { cookie: admin },
+      payload: {
+        type: "SPLIT",
+        requestId: "server-oversized-split",
+        revision: 1,
+        partitions: [
+          {
+            versionIds: Array.from({ length: 101 }, (_, index) => `v-${index}`),
+          },
+          { versionIds: ["govern-a"] },
+        ],
+      },
+    });
+    expect(oversized.statusCode).toBe(400);
+
+    const history = await app.inject({
+      method: "GET",
+      url: `/api/v1/albums/${albumId}/identity-decisions`,
+      headers: { cookie: memberCookie },
+    });
+    expect(history.statusCode, history.body).toBe(200);
+    expect(history.json().items).toEqual([
+      expect.objectContaining({
+        id: confirmed.json().decision.id,
+        canUndo: true,
+      }),
+    ]);
+    const undone = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/identity-decisions/${confirmed.json().decision.id}/undo`,
+      headers: { cookie: admin },
+      payload: { requestId: "server-undo", revision: 1 },
+    });
+    expect(undone.statusCode, undone.body).toBe(200);
+    expect(undone.json().decision.type).toBe("UNDO");
+    const repeatedUndo = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/identity-decisions/${confirmed.json().decision.id}/undo`,
+      headers: { cookie: admin },
+      payload: {
+        requestId: "server-undo-again",
+        revision: undone.json().decision.resultingRevision,
+      },
+    });
+    expect(repeatedUndo.statusCode).toBe(409);
+  });
+
   it("queues a read-only library scan", async () => {
     const database = new CoceanDatabase(":memory:");
     const app = await buildApp({ config: testConfig(), database });
@@ -1536,6 +1730,27 @@ function adminCookie(database: CoceanDatabase): string {
         lastLoginAt: null,
       };
   if (!existing) database.createUser(user, "unused-test-password-hash");
+  const { token } = createSession(database, user, 1);
+  return `cocean_session=${token}`;
+}
+
+function sessionCookieFor(
+  database: CoceanDatabase,
+  role: "ADMIN" | "MEMBER",
+): string {
+  const id = `test-${role.toLowerCase()}-${Date.now()}-${Math.random()}`;
+  const now = new Date().toISOString();
+  const user = {
+    id,
+    username: id,
+    displayName: role === "ADMIN" ? "Test Admin" : "Test Member",
+    role,
+    enabled: true,
+    createdAt: now,
+    updatedAt: now,
+    lastLoginAt: null,
+  };
+  database.createUser(user, "unused-test-password-hash");
   const { token } = createSession(database, user, 1);
   return `cocean_session=${token}`;
 }

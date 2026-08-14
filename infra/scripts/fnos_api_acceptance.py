@@ -552,23 +552,49 @@ class AcceptanceRun:
             detail_tracks = sum(len(require_list(item.get("tracks"), "Album tracks")) for item in details)
             if stats_counts["tracks"] != detail_tracks:
                 raise AcceptanceError("library tracks does not equal detail track count")
-            duplicate_files = sum(
-                require_count(
-                    item.get("duplicateFileCount", 0),
-                    "Album duplicateFileCount",
+            represented_local_versions = 0
+            represented_local_files = 0
+            for album, detail in zip(albums, details):
+                if album.get("hasDigital") is not True:
+                    continue
+                local_versions = detail.get("localVersions")
+                if local_versions is None:
+                    # Backward compatibility for pre-governance Album details, where
+                    # one digital Album always represented exactly one local version.
+                    represented_local_versions += 1
+                    represented_local_files += len(
+                        require_list(detail.get("tracks"), "Album tracks")
+                    ) + require_count(
+                        detail.get("duplicateFileCount", 0),
+                        "Album duplicateFileCount",
+                    )
+                    continue
+                versions = require_list(local_versions, "Album localVersions")
+                if not versions:
+                    raise AcceptanceError(
+                        "digital Album does not expose a represented local version"
+                    )
+                represented_local_versions += len(versions)
+                represented_local_files += sum(
+                    require_count(
+                        require_object(version, "Album localVersion").get("fileCount"),
+                        "Album localVersion fileCount",
+                    )
+                    for version in versions
                 )
-                for item in details
-            )
-            digital_albums = sum(1 for item in albums if item.get("hasDigital") is True)
-            if evidence["albumCount"] != digital_albums:
-                raise AcceptanceError("scan report albumCount does not equal digital Albums")
+            if evidence["albumCount"] != represented_local_versions:
+                raise AcceptanceError(
+                    "scan report albumCount does not equal represented local versions"
+                )
             album_issues = sum(
                 len(require_list(item.get("aggregationIssues", []), "Album aggregationIssues"))
                 for item in details
             )
-            if evidence["albumIssueCount"] != album_issues:
-                raise AcceptanceError("scan report albumIssueCount does not equal Album details")
-            if album_issues > self.arguments.max_album_issues:
+            if album_issues > evidence["albumIssueCount"]:
+                raise AcceptanceError(
+                    "primary Album issues exceed the full scan issue ledger"
+                )
+            if evidence["albumIssueCount"] > self.arguments.max_album_issues:
                 raise AcceptanceError("Album aggregation issues exceed the configured limit")
             if stats_counts["missingArtwork"] > self.arguments.max_missing_artworks:
                 raise AcceptanceError("Albums without artwork exceed the configured limit")
@@ -576,9 +602,9 @@ class AcceptanceRun:
                 raise AcceptanceError(
                     "Album detail Track ids are not a subset of parsed media ids"
                 )
-            if len(self.parsed_media_ids - self.detail_track_ids) != duplicate_files:
+            if len(self.parsed_media_ids) != represented_local_files:
                 raise AcceptanceError(
-                    "collapsed duplicate files do not reconcile with parsed media ids"
+                    "represented local-version files do not reconcile with parsed media ids"
                 )
             expected_detail_warnings = {
                 media_id: self.parsed_warning_codes_by_media_id[media_id]

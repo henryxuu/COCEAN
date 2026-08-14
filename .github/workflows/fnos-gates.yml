@@ -38,6 +38,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Install media tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
       - uses: pnpm/action-setup@v4
         with:
           version: 11.0.0

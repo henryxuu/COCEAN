@@ -803,4 +803,88 @@ export const migrations = [
         ON library_issues(library_album_id, code, COALESCE(album_id, char(0)));
     `,
   },
+  {
+    version: 17,
+    name: "manual_library_album_identity_governance",
+    sql: `
+      ALTER TABLE library_albums ADD COLUMN primary_version_source TEXT NOT NULL DEFAULT 'AUTOMATIC'
+        CHECK(primary_version_source IN ('AUTOMATIC','USER'));
+      ALTER TABLE library_albums ADD COLUMN revision INTEGER NOT NULL DEFAULT 0
+        CHECK(revision >= 0);
+
+      CREATE TABLE library_album_aliases (
+        alias_id TEXT PRIMARY KEY,
+        library_album_id TEXT NOT NULL REFERENCES library_albums(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        CHECK(alias_id <> library_album_id)
+      );
+      CREATE INDEX library_album_aliases_target_idx
+        ON library_album_aliases(library_album_id, alias_id);
+
+      CREATE TABLE library_identity_decisions (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        library_album_id TEXT NOT NULL,
+        decision_type TEXT NOT NULL CHECK(decision_type IN (
+          'CONFIRM','MERGE','SPLIT','SET_PRIMARY','UNDO'
+        )),
+        actor_id TEXT NOT NULL,
+        actor_display_name TEXT NOT NULL,
+        expected_revision INTEGER NOT NULL CHECK(expected_revision >= 0),
+        resulting_revision INTEGER NOT NULL CHECK(resulting_revision >= 0),
+        input_json TEXT NOT NULL,
+        details_json TEXT NOT NULL,
+        before_state_json TEXT NOT NULL,
+        after_state_json TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        compensates_decision_id TEXT REFERENCES library_identity_decisions(id),
+        created_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX library_identity_decisions_compensation_idx
+        ON library_identity_decisions(compensates_decision_id)
+        WHERE compensates_decision_id IS NOT NULL;
+      CREATE INDEX library_identity_decisions_album_created_idx
+        ON library_identity_decisions(library_album_id, created_at DESC, id DESC);
+
+      CREATE TABLE library_identity_decision_groups (
+        decision_id TEXT NOT NULL REFERENCES library_identity_decisions(id),
+        library_album_id TEXT NOT NULL,
+        association_kind TEXT NOT NULL DEFAULT 'AFFECTED'
+          CHECK(association_kind IN ('AFFECTED','HISTORY')),
+        PRIMARY KEY(decision_id, library_album_id)
+      );
+      CREATE INDEX library_identity_decision_groups_album_idx
+        ON library_identity_decision_groups(library_album_id, decision_id);
+
+      CREATE TRIGGER library_identity_decisions_no_update
+        BEFORE UPDATE ON library_identity_decisions
+        BEGIN SELECT RAISE(ABORT, 'library identity decision ledger is append-only'); END;
+      CREATE TRIGGER library_identity_decisions_no_delete
+        BEFORE DELETE ON library_identity_decisions
+        BEGIN SELECT RAISE(ABORT, 'library identity decision ledger is append-only'); END;
+      CREATE TRIGGER library_identity_decision_groups_no_update
+        BEFORE UPDATE ON library_identity_decision_groups
+        BEGIN SELECT RAISE(ABORT, 'library identity decision group ledger is append-only'); END;
+      CREATE TRIGGER library_identity_decision_groups_no_delete
+        BEFORE DELETE ON library_identity_decision_groups
+        BEGIN SELECT RAISE(ABORT, 'library identity decision group ledger is append-only'); END;
+
+      CREATE TRIGGER library_album_aliases_current_id_conflict_insert
+        BEFORE INSERT ON library_album_aliases
+        WHEN EXISTS (SELECT 1 FROM library_albums WHERE id=NEW.alias_id)
+        BEGIN SELECT RAISE(ABORT, 'library album alias conflicts with a current id'); END;
+      CREATE TRIGGER library_album_aliases_current_id_conflict_update
+        BEFORE UPDATE OF alias_id ON library_album_aliases
+        WHEN EXISTS (SELECT 1 FROM library_albums WHERE id=NEW.alias_id)
+        BEGIN SELECT RAISE(ABORT, 'library album alias conflicts with a current id'); END;
+      CREATE TRIGGER library_albums_alias_id_conflict_insert
+        BEFORE INSERT ON library_albums
+        WHEN EXISTS (SELECT 1 FROM library_album_aliases WHERE alias_id=NEW.id)
+        BEGIN SELECT RAISE(ABORT, 'library album current id conflicts with an alias'); END;
+      CREATE TRIGGER library_albums_alias_id_conflict_update
+        BEFORE UPDATE OF id ON library_albums
+        WHEN EXISTS (SELECT 1 FROM library_album_aliases WHERE alias_id=NEW.id)
+        BEGIN SELECT RAISE(ABORT, 'library album current id conflicts with an alias'); END;
+    `,
+  },
 ] as const;

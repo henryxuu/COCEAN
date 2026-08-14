@@ -119,6 +119,8 @@ const album: AlbumSummary = {
   hasDigital: true,
   physicalMedia: [],
   matchStatus: "NEEDS_REVIEW",
+  primaryVersionSource: "AUTOMATIC",
+  revision: 0,
   trackCount: 8,
   discCount: 1,
   versionCount: 2,

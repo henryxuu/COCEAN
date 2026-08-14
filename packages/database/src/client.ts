@@ -15,6 +15,9 @@ import type {
   LibraryRoot,
   LibraryIssue,
   LibraryIssueCode,
+  LibraryIdentityDecision,
+  LibraryIdentityDecisionCommand,
+  LibraryIdentityDecisionResult,
   LibraryStats,
   ModelConfiguration,
   ModelVerificationStatus,
@@ -95,6 +98,75 @@ export interface AlbumIdentityHint {
   id: string;
   groupKey: string;
   fileIds: string[];
+}
+
+export interface LibraryIdentityActor {
+  id: string;
+  displayName: string;
+}
+
+export class LibraryIdentityDecisionError extends Error {
+  constructor(
+    public readonly code:
+      "INVALID_IDENTITY_DECISION" | "IDENTITY_DECISION_CONFLICT",
+    message: string,
+  ) {
+    super(message);
+    this.name = "LibraryIdentityDecisionError";
+  }
+}
+
+interface LibraryIdentitySnapshot {
+  groups: Array<{
+    id: string;
+    identityKey: string;
+    title: string;
+    albumArtist: string;
+    primaryVersionId: string;
+    decisionSource: "AUTOMATIC" | "USER";
+    primaryVersionSource: "AUTOMATIC" | "USER";
+    revision: number;
+    createdAt: string;
+    updatedAt: string;
+    members: Array<{
+      albumId: string;
+      relationshipStatus: "AUTO_CANDIDATE" | "USER_CONFIRMED" | "USER_SEPARATE";
+      createdAt: string;
+      updatedAt: string;
+    }>;
+    issues: Array<{
+      albumId: string | null;
+      code: LibraryIssueCode;
+      evidenceJson: string;
+      createdAt: string;
+      updatedAt: string;
+    }>;
+  }>;
+  aliases: Array<{
+    aliasId: string;
+    libraryAlbumId: string;
+    createdAt: string;
+  }>;
+}
+
+interface AutomaticIdentityBaseline {
+  members: Map<string, string[]>;
+  primaryVersions: Map<string, string | null>;
+}
+
+interface LibraryIdentityGovernanceState {
+  groups: Array<{
+    id: string;
+    primaryVersionId: string;
+    decisionSource: "AUTOMATIC" | "USER";
+    primaryVersionSource: "AUTOMATIC" | "USER";
+    revision: number;
+    members: Array<{
+      albumId: string;
+      relationshipStatus: "AUTO_CANDIDATE" | "USER_CONFIRMED" | "USER_SEPARATE";
+    }>;
+  }>;
+  aliases: Array<{ aliasId: string; libraryAlbumId: string }>;
 }
 
 interface StoredScanDiscovery {
@@ -1432,6 +1504,7 @@ export class CoceanDatabase {
     albums: AlbumRecordInput[],
   ): void {
     const now = new Date().toISOString();
+    const automaticIdentityBaseline = this.captureAutomaticIdentityBaseline();
     const previousMembership = this.raw
       .prepare(
         `SELECT album_files.album_id, album_files.media_file_id
@@ -1529,6 +1602,13 @@ export class CoceanDatabase {
         `DELETE FROM albums
          WHERE root_id = ?
            AND id NOT IN (SELECT id FROM cocean_current_album_ids)
+           AND NOT EXISTS (
+             SELECT 1 FROM library_album_members lm
+             JOIN library_albums la ON la.id=lm.library_album_id
+             WHERE lm.album_id=albums.id
+               AND (lm.relationship_status<>'AUTO_CANDIDATE'
+                 OR (la.primary_version_id=albums.id AND la.primary_version_source='USER'))
+           )
            AND NOT EXISTS (SELECT 1 FROM physical_copies WHERE physical_copies.album_id = albums.id)
            AND NOT EXISTS (SELECT 1 FROM release_match_candidates WHERE release_match_candidates.album_id = albums.id)
            AND NOT EXISTS (SELECT 1 FROM delivery_records WHERE delivery_records.album_id = albums.id)
@@ -1544,7 +1624,7 @@ export class CoceanDatabase {
          WHERE root_id=? AND id NOT IN (SELECT id FROM cocean_current_album_ids)`,
       )
       .run(now, rootId);
-    this.rebuildAutomaticLibraryAlbums();
+    this.rebuildAutomaticLibraryAlbums(automaticIdentityBaseline);
   }
 
   private remapMergedAlbumDependencies(
@@ -1854,27 +1934,71 @@ export class CoceanDatabase {
     return hash.digest("hex");
   }
 
-  private rebuildAutomaticLibraryAlbums(): void {
+  private rebuildAutomaticLibraryAlbums(
+    baseline = this.captureAutomaticIdentityBaseline(),
+  ): void {
     this.raw.transaction(() =>
-      this.rebuildAutomaticLibraryAlbumsInTransaction(),
+      this.rebuildAutomaticLibraryAlbumsInTransaction(baseline),
     )();
   }
 
-  private rebuildAutomaticLibraryAlbumsInTransaction(): void {
+  private captureAutomaticIdentityBaseline(): AutomaticIdentityBaseline {
+    const groups = this.raw
+      .prepare(
+        "SELECT id,primary_version_id FROM library_albums WHERE decision_source='AUTOMATIC'",
+      )
+      .all() as Array<{ id: string; primary_version_id: string | null }>;
+    return {
+      members: new Map(
+        groups.map((group) => [
+          group.id,
+          this.libraryIdentityMemberIds([group.id]),
+        ]),
+      ),
+      primaryVersions: new Map(
+        groups.map((group) => [group.id, group.primary_version_id]),
+      ),
+    };
+  }
+
+  private rebuildAutomaticLibraryAlbumsInTransaction(
+    baseline: AutomaticIdentityBaseline,
+  ): void {
     const now = new Date().toISOString();
     const albums = this.raw
       .prepare(
         `SELECT a.*,
       (SELECT MIN(mf.relative_path) FROM album_files af JOIN media_files mf ON mf.id=af.media_file_id WHERE af.album_id=a.id) AS stable_path
-      FROM albums a
-      WHERE NOT EXISTS (
-        SELECT 1 FROM library_album_members lm JOIN library_albums la ON la.id=lm.library_album_id
-        WHERE lm.album_id=a.id AND la.decision_source='USER'
-      )`,
+      FROM albums a`,
       )
       .all() as Record<string, unknown>[];
+    const albumById = new Map(albums.map((album) => [String(album.id), album]));
+    const protectedGroups = this.raw
+      .prepare(
+        `SELECT * FROM library_albums
+         WHERE decision_source='USER' OR primary_version_source='USER'`,
+      )
+      .all() as Record<string, unknown>[];
+    const protectedGroupIds = new Set(
+      protectedGroups.map((group) => String(group.id)),
+    );
+    const protectedAlbumIds = new Set(
+      (
+        this.raw
+          .prepare(
+            `SELECT album_id FROM library_album_members
+             WHERE library_album_id IN (
+               SELECT id FROM library_albums
+               WHERE decision_source='USER' OR primary_version_source='USER'
+             )`,
+          )
+          .all() as Array<{ album_id: string }>
+      ).map((row) => row.album_id),
+    );
     const groups = new Map<string, Record<string, unknown>[]>();
-    for (const album of albums) {
+    for (const album of albums.filter(
+      (candidate) => !protectedAlbumIds.has(String(candidate.id)),
+    )) {
       const key = normalizeLibraryIdentity(
         String(album.album_artist),
         String(album.title),
@@ -1883,44 +2007,185 @@ export class CoceanDatabase {
       members.push(album);
       groups.set(key, members);
     }
-    const upsertGroup = this.raw.prepare(`INSERT INTO library_albums
-      (id, identity_key, title, album_artist, primary_version_id, decision_source, created_at, updated_at)
-      VALUES (@id,@key,@title,@artist,@primary,'AUTOMATIC',@createdAt,@now)
-      ON CONFLICT(identity_key) WHERE decision_source='AUTOMATIC' DO UPDATE SET
-        title=excluded.title, album_artist=excluded.album_artist,
-        primary_version_id=excluded.primary_version_id,
-        updated_at=excluded.updated_at`);
-    const groupIdForKey = this.raw.prepare(
-      "SELECT id FROM library_albums WHERE identity_key=? AND decision_source='AUTOMATIC'",
+    const existingAutomaticGroups = this.raw
+      .prepare("SELECT * FROM library_albums WHERE decision_source='AUTOMATIC'")
+      .all() as Record<string, unknown>[];
+    const existingByKey = new Map(
+      existingAutomaticGroups.map((group) => [
+        String(group.identity_key),
+        group,
+      ]),
     );
+    const previousMembers = baseline.members;
     const addMember = this.raw.prepare(`INSERT INTO library_album_members
       (library_album_id,album_id,relationship_status,created_at,updated_at)
       VALUES (?,?,'AUTO_CANDIDATE',?,?)
       ON CONFLICT(album_id) DO UPDATE SET
         library_album_id=CASE WHEN library_album_members.relationship_status='AUTO_CANDIDATE' THEN excluded.library_album_id ELSE library_album_members.library_album_id END,
         updated_at=excluded.updated_at`);
-    const previousIssueCreatedAt = new Map<string, string>(
+    this.raw
+      .prepare(
+        `DELETE FROM library_album_members
+         WHERE relationship_status='AUTO_CANDIDATE'
+           AND library_album_id NOT IN (
+             SELECT id FROM library_albums WHERE primary_version_source='USER'
+           )`,
+      )
+      .run();
+    for (const protectedGroup of protectedGroups.filter(
+      (group) => group.decision_source === "AUTOMATIC",
+    )) {
+      const key = String(protectedGroup.identity_key);
+      const additions = groups.get(key) ?? [];
+      if (!additions.length) continue;
+      const groupId = String(protectedGroup.id);
+      for (const member of additions)
+        addMember.run(groupId, member.id, now, now);
+      groups.delete(key);
+    }
+    for (const [key, members] of groups) {
+      const ranked = [...members].sort(comparePrimaryVersions);
+      const primary = ranked[0]!;
+      const existing = existingByKey.get(key);
+      const groupId = existing
+        ? String(existing.id)
+        : this.collisionSafeAutomaticLibraryAlbumId(key);
+      const nextMemberIds = members.map((member) => String(member.id)).sort();
+      const oldMemberIds = previousMembers.get(groupId) ?? [];
+      const oldPrimary = existing
+        ? (baseline.primaryVersions.get(groupId) ??
+          nullableString(existing.primary_version_id))
+        : null;
+      const primaryId = String(primary.id);
+      const changed =
+        Boolean(existing) &&
+        (oldPrimary !== primaryId ||
+          oldMemberIds.length !== nextMemberIds.length ||
+          oldMemberIds.some((id, index) => id !== nextMemberIds[index]));
+      const createdAt =
+        members.map((member) => String(member.created_at)).sort()[0] ?? now;
+      if (existing)
+        this.raw
+          .prepare(
+            `UPDATE library_albums SET title=?,album_artist=?,primary_version_id=?,
+               primary_version_source='AUTOMATIC',revision=revision+?,updated_at=?
+             WHERE id=?`,
+          )
+          .run(
+            primary.title,
+            primary.album_artist,
+            primaryId,
+            changed ? 1 : 0,
+            now,
+            groupId,
+          );
+      else
+        this.raw
+          .prepare(
+            `INSERT INTO library_albums
+               (id,identity_key,title,album_artist,primary_version_id,decision_source,
+                primary_version_source,revision,created_at,updated_at)
+             VALUES (?,?,?,?,?,'AUTOMATIC','AUTOMATIC',0,?,?)`,
+          )
+          .run(
+            groupId,
+            key,
+            primary.title,
+            primary.album_artist,
+            primaryId,
+            createdAt,
+            now,
+          );
+      for (const member of members) addMember.run(groupId, member.id, now, now);
+      this.rebuildLibraryIssuesForGroup(groupId, members, true, now);
+    }
+    for (const group of protectedGroups) {
+      const groupId = String(group.id);
+      const memberIds = this.libraryIdentityMemberIds([groupId]);
+      const members = memberIds
+        .map((id) => albumById.get(id))
+        .filter((album): album is Record<string, unknown> => Boolean(album));
+      const primaryId = String(group.primary_version_id);
+      if (!memberIds.includes(primaryId))
+        throw new LibraryIdentityDecisionError(
+          "IDENTITY_DECISION_CONFLICT",
+          "人工主版本必须始终属于其稳定唱片",
+        );
+      const oldMemberIds = baseline.members.get(groupId) ?? memberIds;
+      if (
+        oldMemberIds.length !== memberIds.length ||
+        oldMemberIds.some((id, index) => id !== memberIds[index])
+      )
+        this.raw
+          .prepare(
+            `UPDATE library_albums SET revision=revision+1,updated_at=? WHERE id=?`,
+          )
+          .run(now, groupId);
+      this.rebuildLibraryIssuesForGroup(
+        groupId,
+        members,
+        group.decision_source === "AUTOMATIC" && members.length > 1,
+        now,
+      );
+    }
+    this.raw
+      .prepare(
+        `DELETE FROM library_albums WHERE decision_source='AUTOMATIC'
+      AND primary_version_source='AUTOMATIC'
+      AND NOT EXISTS (SELECT 1 FROM library_album_members lm WHERE lm.library_album_id=library_albums.id)`,
+      )
+      .run();
+  }
+
+  private collisionSafeAutomaticLibraryAlbumId(identityKey: string): string {
+    const digest = createHash("sha256").update(identityKey).digest("hex");
+    for (let attempt = 0; ; attempt += 1) {
+      const suffix =
+        attempt === 0
+          ? digest.slice(0, 24)
+          : `${digest.slice(0, 15)}-${createHash("sha256")
+              .update(`${identityKey}\0${attempt}`)
+              .digest("hex")
+              .slice(0, 8)}`;
+      const id = `library-${suffix}`;
+      const collision = this.raw
+        .prepare(
+          `SELECT 1 FROM library_albums WHERE id=?
+           UNION ALL SELECT 1 FROM library_album_aliases WHERE alias_id=? LIMIT 1`,
+        )
+        .get(id, id);
+      if (!collision) return id;
+    }
+  }
+
+  private rebuildLibraryIssuesForGroup(
+    groupId: string,
+    members: Record<string, unknown>[],
+    includeIdentityOverlap: boolean,
+    now: string,
+  ): void {
+    const previousCreatedAt = new Map<string, string>(
       (
         this.raw
           .prepare(
-            `SELECT library_album_id, album_id, code, created_at
-        FROM library_issues WHERE library_album_id IN
-        (SELECT id FROM library_albums WHERE decision_source='AUTOMATIC')`,
+            `SELECT album_id,code,created_at FROM library_issues
+             WHERE library_album_id=?`,
           )
-          .all() as Record<string, unknown>[]
+          .all(groupId) as Record<string, unknown>[]
       ).map((row) => [
-        issueIdentity(
-          String(row.library_album_id),
-          nullableString(row.album_id),
-          String(row.code),
-        ),
+        issueIdentity(groupId, nullableString(row.album_id), String(row.code)),
         String(row.created_at),
       ]),
     );
-    const addIssue = this.raw.prepare(`INSERT INTO library_issues
-      (library_album_id,album_id,code,evidence_json,created_at,updated_at) VALUES (?,?,?,?,?,?)`);
+    this.raw
+      .prepare("DELETE FROM library_issues WHERE library_album_id=?")
+      .run(groupId);
+    const addIssue = this.raw.prepare(
+      `INSERT INTO library_issues
+       (library_album_id,album_id,code,evidence_json,created_at,updated_at)
+       VALUES (?,?,?,?,?,?)`,
+    );
     const insertIssue = (
-      groupId: string,
       albumId: string | null,
       code: LibraryIssueCode,
       evidence: Record<string, unknown>,
@@ -1930,100 +2195,55 @@ export class CoceanDatabase {
         albumId,
         code,
         JSON.stringify(evidence),
-        previousIssueCreatedAt.get(issueIdentity(groupId, albumId, code)) ??
-          now,
+        previousCreatedAt.get(issueIdentity(groupId, albumId, code)) ?? now,
         now,
       );
-    this.raw
-      .prepare(
-        `DELETE FROM library_issues WHERE library_album_id IN
-      (SELECT id FROM library_albums WHERE decision_source='AUTOMATIC')`,
-      )
-      .run();
-    this.raw
-      .prepare(
-        `DELETE FROM library_album_members WHERE relationship_status='AUTO_CANDIDATE'`,
-      )
-      .run();
-    for (const [key, members] of groups) {
-      const ranked = [...members].sort(comparePrimaryVersions);
-      const primary = ranked[0]!;
-      const proposedId = `library-${createHash("sha256").update(key).digest("hex").slice(0, 24)}`;
-      const createdAt =
-        members.map((member) => String(member.created_at)).sort()[0] ?? now;
-      upsertGroup.run({
-        id: proposedId,
-        key,
-        title: primary.title,
-        artist: primary.album_artist,
-        primary: primary.id,
-        createdAt,
-        now,
+    if (includeIdentityOverlap && members.length > 1)
+      insertIssue(null, "IDENTITY_OVERLAP", {
+        versionCount: members.length,
+        basis: "NORMALIZED_TITLE_ARTIST",
       });
-      const groupId = String((groupIdForKey.get(key) as { id: string }).id);
-      for (const member of members) addMember.run(groupId, member.id, now, now);
-      if (members.length > 1)
-        insertIssue(groupId, null, "IDENTITY_OVERLAP", {
-          versionCount: members.length,
-          basis: "NORMALIZED_TITLE_ARTIST",
+    for (const member of members) {
+      const memberId = String(member.id);
+      const aggregation = parseJson<AlbumAggregationIssue[]>(
+        member.aggregation_issues_json,
+        [],
+      );
+      if (aggregation.length || member.match_status === "TRACKS_INCOMPLETE")
+        insertIssue(memberId, "INCOMPLETE_TRACKS", {
+          trackCount: Number(member.track_count),
+          aggregationIssues: aggregation,
+          legacyMatchStatus: member.match_status === "TRACKS_INCOMPLETE",
         });
-      for (const member of members) {
-        const memberId = String(member.id);
-        const aggregation = parseJson<AlbumAggregationIssue[]>(
-          member.aggregation_issues_json,
-          [],
-        );
-        if (aggregation.length || member.match_status === "TRACKS_INCOMPLETE")
-          insertIssue(groupId, memberId, "INCOMPLETE_TRACKS", {
-            trackCount: Number(member.track_count),
-            aggregationIssues: aggregation,
-            legacyMatchStatus: member.match_status === "TRACKS_INCOMPLETE",
-          });
-        const artwork = parseJson<AlbumSummary["artwork"]>(
-          member.artwork_json,
-          {
-            source: "NONE",
-            url: null,
-            mimeType: null,
-            width: null,
-            height: null,
-          },
-        );
-        if (artwork.source === "NONE")
-          insertIssue(groupId, memberId, "MISSING_ARTWORK", { source: "NONE" });
-        else if (
-          (artwork.width != null && artwork.width < 600) ||
-          (artwork.height != null && artwork.height < 600)
-        )
-          insertIssue(groupId, memberId, "LOW_RES_ARTWORK", {
-            width: artwork.width,
-            height: artwork.height,
-            minimum: 600,
-          });
-        if (Boolean(member.mixed_audio_specs))
-          insertIssue(groupId, memberId, "MIXED_AUDIO_SPECS", { mixed: true });
-        const brokenFields = [
-          ...(hasBrokenText(String(member.title)) ? ["title"] : []),
-          ...(hasBrokenText(String(member.album_artist))
-            ? ["albumArtist"]
-            : []),
-        ];
-        if (brokenFields.length)
-          insertIssue(groupId, memberId, "BROKEN_TEXT", {
-            fields: brokenFields,
-          });
-        if (this.versionUsesFallbackIdentity(memberId))
-          insertIssue(groupId, memberId, "MISSING_IDENTITY", {
-            fallback: true,
-          });
-      }
-    }
-    this.raw
-      .prepare(
-        `DELETE FROM library_albums WHERE decision_source='AUTOMATIC'
-      AND NOT EXISTS (SELECT 1 FROM library_album_members lm WHERE lm.library_album_id=library_albums.id)`,
+      const artwork = parseJson<AlbumSummary["artwork"]>(member.artwork_json, {
+        source: "NONE",
+        url: null,
+        mimeType: null,
+        width: null,
+        height: null,
+      });
+      if (artwork.source === "NONE")
+        insertIssue(memberId, "MISSING_ARTWORK", { source: "NONE" });
+      else if (
+        (artwork.width != null && artwork.width < 600) ||
+        (artwork.height != null && artwork.height < 600)
       )
-      .run();
+        insertIssue(memberId, "LOW_RES_ARTWORK", {
+          width: artwork.width,
+          height: artwork.height,
+          minimum: 600,
+        });
+      if (Boolean(member.mixed_audio_specs))
+        insertIssue(memberId, "MIXED_AUDIO_SPECS", { mixed: true });
+      const brokenFields = [
+        ...(hasBrokenText(String(member.title)) ? ["title"] : []),
+        ...(hasBrokenText(String(member.album_artist)) ? ["albumArtist"] : []),
+      ];
+      if (brokenFields.length)
+        insertIssue(memberId, "BROKEN_TEXT", { fields: brokenFields });
+      if (this.versionUsesFallbackIdentity(memberId))
+        insertIssue(memberId, "MISSING_IDENTITY", { fallback: true });
+    }
   }
 
   private versionUsesFallbackIdentity(albumId: string): boolean {
@@ -2046,6 +2266,938 @@ export class CoceanDatabase {
       fileCount > 0 &&
       (Number(row.album_tags) === 0 || Number(row.artist_tags) === 0)
     );
+  }
+
+  applyLibraryIdentityDecision(
+    albumId: string,
+    command: LibraryIdentityDecisionCommand,
+    actor: LibraryIdentityActor,
+  ): LibraryIdentityDecisionResult {
+    return this.raw.transaction(() => {
+      const inputJson = canonicalLibraryIdentityDecisionInput(albumId, command);
+      const replay = this.identityDecisionResultByRequestId(
+        command.requestId,
+        inputJson,
+      );
+      if (replay) return replay;
+      const sourceId = this.resolveLibraryAlbumId(albumId);
+      if (!sourceId)
+        throw new LibraryIdentityDecisionError(
+          "IDENTITY_DECISION_CONFLICT",
+          "唱片身份已经不存在或无法解析",
+        );
+      const source = this.libraryIdentityGroup(sourceId);
+      this.assertIdentityRevision(source, command.revision);
+      const now = new Date().toISOString();
+      let scope = [sourceId];
+      let before = this.captureLibraryIdentitySnapshot(scope);
+      let currentLibraryAlbumId = sourceId;
+      let inheritedDecisionIds: string[] = [];
+      let inheritedHistoryTargets: string[] = [];
+
+      if (command.type === "CONFIRM") {
+        if (command.primaryVersionId)
+          this.assertVersionMember(sourceId, command.primaryVersionId);
+        this.raw
+          .prepare(
+            `UPDATE library_albums SET
+               decision_source='USER',
+               primary_version_id=COALESCE(?, primary_version_id),
+               primary_version_source=CASE WHEN ? IS NULL THEN primary_version_source ELSE 'USER' END,
+               revision=revision+1, updated_at=?
+             WHERE id=?`,
+          )
+          .run(
+            command.primaryVersionId ?? null,
+            command.primaryVersionId ?? null,
+            now,
+            sourceId,
+          );
+        this.raw
+          .prepare(
+            `UPDATE library_album_members SET relationship_status='USER_CONFIRMED', updated_at=?
+             WHERE library_album_id=?`,
+          )
+          .run(now, sourceId);
+        this.raw
+          .prepare(
+            "DELETE FROM library_issues WHERE library_album_id=? AND code='IDENTITY_OVERLAP'",
+          )
+          .run(sourceId);
+      } else if (command.type === "SET_PRIMARY") {
+        this.assertVersionMember(sourceId, command.primaryVersionId);
+        this.raw
+          .prepare(
+            `UPDATE library_albums SET primary_version_id=?, primary_version_source='USER',
+               revision=revision+1, updated_at=? WHERE id=?`,
+          )
+          .run(command.primaryVersionId, now, sourceId);
+      } else if (command.type === "MERGE") {
+        const targetId = this.resolveLibraryAlbumId(
+          command.targetLibraryAlbumId,
+        );
+        if (!targetId || targetId === sourceId)
+          throw new LibraryIdentityDecisionError(
+            "INVALID_IDENTITY_DECISION",
+            "请选择另一个稳定唱片作为合并目标",
+          );
+        const target = this.libraryIdentityGroup(targetId);
+        this.assertIdentityRevision(target, command.targetRevision);
+        const mergedVersionIds = this.libraryIdentityMemberIds([
+          sourceId,
+          targetId,
+        ]);
+        if (!mergedVersionIds.includes(command.primaryVersionId))
+          throw new LibraryIdentityDecisionError(
+            "IDENTITY_DECISION_CONFLICT",
+            "主版本必须属于待合并的唱片",
+          );
+        const activeConflict = this.raw
+          .prepare(
+            `SELECT target_id FROM delivery_jobs
+             WHERE status IN ('QUEUED','RUNNING')
+               AND album_id IN (
+                 SELECT album_id FROM library_album_members
+                 WHERE library_album_id IN (?, ?)
+               )
+             GROUP BY target_id HAVING COUNT(DISTINCT album_id)>1 LIMIT 1`,
+          )
+          .get(sourceId, targetId);
+        if (activeConflict)
+          throw new LibraryIdentityDecisionError(
+            "IDENTITY_DECISION_CONFLICT",
+            "合并会让同一投送目标出现重复活动任务，请等待任务结束",
+          );
+        scope = [sourceId, targetId];
+        before = this.captureLibraryIdentitySnapshot(scope);
+        inheritedDecisionIds =
+          this.libraryIdentityDecisionIdsForGroup(sourceId);
+        inheritedHistoryTargets = [targetId];
+        this.raw
+          .prepare(
+            `INSERT OR IGNORE INTO library_issues
+               (library_album_id,album_id,code,evidence_json,created_at,updated_at)
+             SELECT ?,album_id,code,evidence_json,created_at,updated_at
+             FROM library_issues WHERE library_album_id=? AND album_id IS NOT NULL`,
+          )
+          .run(targetId, sourceId);
+        this.raw
+          .prepare(
+            `UPDATE library_album_members SET library_album_id=?,
+               relationship_status='USER_CONFIRMED', updated_at=?
+             WHERE library_album_id=?`,
+          )
+          .run(targetId, now, sourceId);
+        this.raw
+          .prepare(
+            `UPDATE library_album_members SET relationship_status='USER_CONFIRMED', updated_at=?
+             WHERE library_album_id=?`,
+          )
+          .run(now, targetId);
+        this.raw
+          .prepare(
+            "UPDATE library_album_aliases SET library_album_id=? WHERE library_album_id=?",
+          )
+          .run(targetId, sourceId);
+        this.raw.prepare("DELETE FROM library_albums WHERE id=?").run(sourceId);
+        this.raw
+          .prepare(
+            `INSERT INTO library_album_aliases(alias_id,library_album_id,created_at)
+             VALUES (?,?,?) ON CONFLICT(alias_id) DO UPDATE SET library_album_id=excluded.library_album_id`,
+          )
+          .run(sourceId, targetId, now);
+        this.raw
+          .prepare(
+            `UPDATE library_albums SET decision_source='USER', primary_version_id=?,
+               primary_version_source='USER', revision=revision+1, updated_at=? WHERE id=?`,
+          )
+          .run(command.primaryVersionId, now, targetId);
+        this.raw
+          .prepare(
+            "DELETE FROM library_issues WHERE library_album_id=? AND code='IDENTITY_OVERLAP'",
+          )
+          .run(targetId);
+        currentLibraryAlbumId = targetId;
+      } else {
+        const memberIds = this.libraryIdentityMemberIds([sourceId]);
+        inheritedDecisionIds =
+          this.libraryIdentityDecisionIdsForGroup(sourceId);
+        const partitionIds = command.partitions.flatMap(
+          (partition) => partition.versionIds,
+        );
+        if (
+          new Set(partitionIds).size !== partitionIds.length ||
+          memberIds.length !== partitionIds.length ||
+          memberIds.some((id) => !partitionIds.includes(id))
+        )
+          throw new LibraryIdentityDecisionError(
+            "INVALID_IDENTITY_DECISION",
+            "拆分分区必须无重复、无遗漏地覆盖全部本地版本",
+          );
+        for (const partition of command.partitions)
+          if (
+            partition.primaryVersionId &&
+            !partition.versionIds.includes(partition.primaryVersionId)
+          )
+            throw new LibraryIdentityDecisionError(
+              "INVALID_IDENTITY_DECISION",
+              "每个分区的主版本必须属于该分区",
+            );
+        const primaryPartitionIndex = command.partitions.findIndex(
+          (partition) => partition.versionIds.includes(source.primaryVersionId),
+        );
+        const existingIssues = before.groups[0]?.issues ?? [];
+        this.raw
+          .prepare("DELETE FROM library_issues WHERE library_album_id=?")
+          .run(sourceId);
+        this.raw
+          .prepare("DELETE FROM library_album_members WHERE library_album_id=?")
+          .run(sourceId);
+        const createdIds: string[] = [];
+        for (const [index, partition] of command.partitions.entries()) {
+          const groupId: string =
+            index === primaryPartitionIndex
+              ? sourceId
+              : `library-${randomUUID()}`;
+          const primaryVersionId =
+            partition.primaryVersionId ??
+            (partition.versionIds.includes(source.primaryVersionId)
+              ? source.primaryVersionId
+              : this.preferredPrimaryVersion(partition.versionIds));
+          const primary = this.raw
+            .prepare("SELECT title, album_artist FROM albums WHERE id=?")
+            .get(primaryVersionId) as
+            { title: string; album_artist: string } | undefined;
+          if (!primary)
+            throw new LibraryIdentityDecisionError(
+              "IDENTITY_DECISION_CONFLICT",
+              "拆分分区包含已不存在的本地版本",
+            );
+          if (groupId === sourceId) {
+            this.raw
+              .prepare(
+                `UPDATE library_albums SET title=?, album_artist=?, primary_version_id=?,
+                   decision_source='USER', primary_version_source=?, revision=revision+1,
+                   updated_at=? WHERE id=?`,
+              )
+              .run(
+                primary.title,
+                primary.album_artist,
+                primaryVersionId,
+                partition.primaryVersionId ? "USER" : "AUTOMATIC",
+                now,
+                groupId,
+              );
+          } else {
+            this.raw
+              .prepare(
+                `INSERT INTO library_albums
+                   (id,identity_key,title,album_artist,primary_version_id,decision_source,
+                    primary_version_source,revision,created_at,updated_at)
+                 VALUES (?,?,?,?,?,'USER',?,1,?,?)`,
+              )
+              .run(
+                groupId,
+                source.identityKey,
+                primary.title,
+                primary.album_artist,
+                primaryVersionId,
+                partition.primaryVersionId ? "USER" : "AUTOMATIC",
+                now,
+                now,
+              );
+          }
+          for (const versionId of partition.versionIds) {
+            this.raw
+              .prepare(
+                `INSERT INTO library_album_members
+                   (library_album_id,album_id,relationship_status,created_at,updated_at)
+                 VALUES (?,?,'USER_SEPARATE',?,?)`,
+              )
+              .run(groupId, versionId, now, now);
+            for (const issue of existingIssues.filter(
+              (item) => item.albumId === versionId,
+            ))
+              this.raw
+                .prepare(
+                  `INSERT INTO library_issues
+                     (library_album_id,album_id,code,evidence_json,created_at,updated_at)
+                   VALUES (?,?,?,?,?,?)`,
+                )
+                .run(
+                  groupId,
+                  issue.albumId,
+                  issue.code,
+                  issue.evidenceJson,
+                  issue.createdAt,
+                  issue.updatedAt,
+                );
+          }
+          createdIds.push(groupId);
+        }
+        scope = [...new Set([...scope, ...createdIds])];
+        inheritedHistoryTargets = createdIds.filter((id) => id !== sourceId);
+      }
+
+      const after = this.captureLibraryIdentitySnapshot(scope);
+      this.linkLibraryIdentityDecisionHistory(
+        inheritedDecisionIds,
+        inheritedHistoryTargets,
+      );
+      const result = this.recordLibraryIdentityDecision({
+        requestId: command.requestId,
+        inputJson,
+        libraryAlbumId: currentLibraryAlbumId,
+        type: command.type,
+        actor,
+        expectedRevision: command.revision,
+        resultingRevision: this.libraryIdentityGroup(currentLibraryAlbumId)
+          .revision,
+        before,
+        after,
+        scope,
+        currentLibraryAlbumId,
+        details: libraryIdentityDecisionDetails(command),
+        compensatesDecisionId: null,
+        createdAt: now,
+      });
+      return result;
+    })();
+  }
+
+  listLibraryIdentityDecisionHistory(
+    albumId: string,
+  ): LibraryIdentityDecision[] {
+    const currentId = this.resolveLibraryAlbumId(albumId);
+    if (!currentId) return [];
+    return (
+      this.raw
+        .prepare(
+          `SELECT d.* FROM library_identity_decisions d
+           WHERE EXISTS (
+             SELECT 1 FROM library_identity_decision_groups g
+             WHERE g.decision_id=d.id AND g.library_album_id=?
+           )
+           ORDER BY d.rowid DESC LIMIT 100`,
+        )
+        .all(currentId) as Record<string, unknown>[]
+    ).map((row) => this.mapLibraryIdentityDecision(row));
+  }
+
+  undoLibraryIdentityDecision(
+    albumId: string,
+    decisionId: string,
+    requestId: string,
+    revision: number,
+    actor: LibraryIdentityActor,
+  ): LibraryIdentityDecisionResult {
+    return this.raw.transaction(() => {
+      const inputJson = canonicalLibraryIdentityDecisionInput(albumId, {
+        type: "UNDO",
+        decisionId,
+        requestId,
+        revision,
+      });
+      const replay = this.identityDecisionResultByRequestId(
+        requestId,
+        inputJson,
+      );
+      if (replay) return replay;
+      const currentId = this.resolveLibraryAlbumId(albumId);
+      if (!currentId)
+        throw new LibraryIdentityDecisionError(
+          "IDENTITY_DECISION_CONFLICT",
+          "唱片身份已经不存在或无法解析",
+        );
+      this.assertIdentityRevision(
+        this.libraryIdentityGroup(currentId),
+        revision,
+      );
+      const row = this.raw
+        .prepare("SELECT * FROM library_identity_decisions WHERE id=?")
+        .get(decisionId) as Record<string, unknown> | undefined;
+      if (!row || row.decision_type === "UNDO")
+        throw new LibraryIdentityDecisionError(
+          "IDENTITY_DECISION_CONFLICT",
+          "只能撤销仍有效的身份治理决定",
+        );
+      const scope = (
+        this.raw
+          .prepare(
+            `SELECT library_album_id FROM library_identity_decision_groups
+             WHERE decision_id=? AND association_kind='AFFECTED'
+             ORDER BY library_album_id`,
+          )
+          .all(decisionId) as Array<{ library_album_id: string }>
+      ).map((item) => item.library_album_id);
+      if (!scope.includes(currentId))
+        throw new LibraryIdentityDecisionError(
+          "IDENTITY_DECISION_CONFLICT",
+          "该决定不属于当前唱片",
+        );
+      if (
+        this.raw
+          .prepare(
+            "SELECT 1 FROM library_identity_decisions WHERE compensates_decision_id=?",
+          )
+          .get(decisionId)
+      )
+        throw new LibraryIdentityDecisionError(
+          "IDENTITY_DECISION_CONFLICT",
+          "该决定已经撤销",
+        );
+      const expectedAfter = parseJson<LibraryIdentitySnapshot>(
+        row.after_state_json,
+        { groups: [], aliases: [] },
+      );
+      const beforeUndo = this.captureLibraryIdentitySnapshot(scope);
+      if (!sameLibraryIdentityGovernance(beforeUndo, expectedAfter))
+        throw new LibraryIdentityDecisionError(
+          "IDENTITY_DECISION_CONFLICT",
+          "唱片身份状态已被后续决定覆盖，不能静默撤销",
+        );
+      const restore = parseJson<LibraryIdentitySnapshot>(
+        row.before_state_json,
+        { groups: [], aliases: [] },
+      );
+      const now = new Date().toISOString();
+      const nextRevision =
+        Math.max(
+          revision,
+          ...beforeUndo.groups.map((group) => group.revision),
+          Number(row.resulting_revision),
+        ) + 1;
+      this.restoreLibraryIdentitySnapshot(
+        restore,
+        scope,
+        nextRevision,
+        now,
+        beforeUndo,
+      );
+      const restoredFallbackId =
+        this.resolveLibraryAlbumId(albumId) ?? restore.groups[0]?.id ?? null;
+      if (restoredFallbackId) {
+        for (const historicalId of scope) {
+          const exists = this.raw
+            .prepare(
+              `SELECT 1 FROM library_albums WHERE id=?
+               UNION ALL SELECT 1 FROM library_album_aliases WHERE alias_id=? LIMIT 1`,
+            )
+            .get(historicalId, historicalId);
+          if (!exists && historicalId !== restoredFallbackId)
+            this.raw
+              .prepare(
+                `INSERT INTO library_album_aliases(alias_id,library_album_id,created_at)
+                 VALUES (?,?,?)`,
+              )
+              .run(historicalId, restoredFallbackId, now);
+        }
+      }
+      const afterUndo = this.captureLibraryIdentitySnapshot(scope);
+      const restoredCurrentId = this.resolveLibraryAlbumId(albumId);
+      if (!restoredCurrentId)
+        throw new LibraryIdentityDecisionError(
+          "IDENTITY_DECISION_CONFLICT",
+          "撤销后无法恢复稳定唱片入口",
+        );
+      return this.recordLibraryIdentityDecision({
+        requestId,
+        inputJson,
+        libraryAlbumId: restoredCurrentId,
+        type: "UNDO",
+        actor,
+        expectedRevision: revision,
+        resultingRevision:
+          this.libraryIdentityGroup(restoredCurrentId).revision,
+        before: beforeUndo,
+        after: afterUndo,
+        scope,
+        currentLibraryAlbumId: restoredCurrentId,
+        details: {
+          targetLibraryAlbumId: null,
+          primaryVersionId: null,
+          partitions: [],
+          compensatedDecisionId: decisionId,
+        },
+        compensatesDecisionId: decisionId,
+        createdAt: now,
+      });
+    })();
+  }
+
+  private libraryIdentityGroup(id: string): {
+    id: string;
+    identityKey: string;
+    primaryVersionId: string;
+    revision: number;
+  } {
+    const row = this.raw
+      .prepare(
+        "SELECT id,identity_key,primary_version_id,revision FROM library_albums WHERE id=?",
+      )
+      .get(id) as Record<string, unknown> | undefined;
+    if (!row || !row.primary_version_id)
+      throw new LibraryIdentityDecisionError(
+        "IDENTITY_DECISION_CONFLICT",
+        "稳定唱片缺少有效主版本",
+      );
+    return {
+      id: String(row.id),
+      identityKey: String(row.identity_key),
+      primaryVersionId: String(row.primary_version_id),
+      revision: Number(row.revision),
+    };
+  }
+
+  private assertIdentityRevision(
+    group: { revision: number },
+    expectedRevision: number,
+  ): void {
+    if (group.revision !== expectedRevision)
+      throw new LibraryIdentityDecisionError(
+        "IDENTITY_DECISION_CONFLICT",
+        "唱片身份已被其他操作更新，请刷新后重试",
+      );
+  }
+
+  private assertVersionMember(groupId: string, versionId: string): void {
+    if (
+      !this.raw
+        .prepare(
+          "SELECT 1 FROM library_album_members WHERE library_album_id=? AND album_id=?",
+        )
+        .get(groupId, versionId)
+    )
+      throw new LibraryIdentityDecisionError(
+        "IDENTITY_DECISION_CONFLICT",
+        "主版本必须属于当前唱片",
+      );
+  }
+
+  private libraryIdentityMemberIds(groupIds: string[]): string[] {
+    if (!groupIds.length) return [];
+    const placeholders = groupIds.map(() => "?").join(",");
+    return (
+      this.raw
+        .prepare(
+          `SELECT album_id FROM library_album_members
+           WHERE library_album_id IN (${placeholders}) ORDER BY album_id`,
+        )
+        .all(...groupIds) as Array<{ album_id: string }>
+    ).map((row) => row.album_id);
+  }
+
+  private libraryIdentityDecisionIdsForGroup(groupId: string): string[] {
+    return (
+      this.raw
+        .prepare(
+          `SELECT decision_id FROM library_identity_decision_groups
+           WHERE library_album_id=? ORDER BY rowid`,
+        )
+        .all(groupId) as Array<{ decision_id: string }>
+    ).map((row) => row.decision_id);
+  }
+
+  private linkLibraryIdentityDecisionHistory(
+    decisionIds: string[],
+    groupIds: string[],
+  ): void {
+    const insert = this.raw.prepare(
+      `INSERT OR IGNORE INTO library_identity_decision_groups
+       (decision_id,library_album_id,association_kind) VALUES (?,?,'HISTORY')`,
+    );
+    for (const decisionId of decisionIds)
+      for (const groupId of groupIds) insert.run(decisionId, groupId);
+  }
+
+  private preferredPrimaryVersion(versionIds: string[]): string {
+    const placeholders = versionIds.map(() => "?").join(",");
+    const rows = this.raw
+      .prepare(
+        `SELECT a.*,
+          (SELECT MIN(mf.relative_path) FROM album_files af
+           JOIN media_files mf ON mf.id=af.media_file_id WHERE af.album_id=a.id) AS stable_path
+         FROM albums a WHERE a.id IN (${placeholders})`,
+      )
+      .all(...versionIds) as Record<string, unknown>[];
+    if (rows.length !== versionIds.length)
+      throw new LibraryIdentityDecisionError(
+        "IDENTITY_DECISION_CONFLICT",
+        "本地版本已变化，请刷新后重试",
+      );
+    return String([...rows].sort(comparePrimaryVersions)[0]!.id);
+  }
+
+  private captureLibraryIdentitySnapshot(
+    scope: string[],
+  ): LibraryIdentitySnapshot {
+    if (!scope.length) return { groups: [], aliases: [] };
+    const placeholders = scope.map(() => "?").join(",");
+    const groupRows = this.raw
+      .prepare(
+        `SELECT DISTINCT la.* FROM library_albums la
+         LEFT JOIN library_album_aliases alias ON alias.library_album_id=la.id
+         WHERE la.id IN (${placeholders}) OR alias.alias_id IN (${placeholders})
+         ORDER BY la.id`,
+      )
+      .all(...scope, ...scope) as Record<string, unknown>[];
+    const groupIds = groupRows.map((row) => String(row.id));
+    const groups = groupRows.map((row) => {
+      const members = (
+        this.raw
+          .prepare(
+            `SELECT * FROM library_album_members WHERE library_album_id=?
+             ORDER BY album_id`,
+          )
+          .all(String(row.id)) as Record<string, unknown>[]
+      ).map((member) => ({
+        albumId: String(member.album_id),
+        relationshipStatus: member.relationship_status as
+          "AUTO_CANDIDATE" | "USER_CONFIRMED" | "USER_SEPARATE",
+        createdAt: String(member.created_at),
+        updatedAt: String(member.updated_at),
+      }));
+      const issues = (
+        this.raw
+          .prepare(
+            `SELECT * FROM library_issues WHERE library_album_id=?
+             ORDER BY code, album_id`,
+          )
+          .all(String(row.id)) as Record<string, unknown>[]
+      ).map((issue) => ({
+        albumId: nullableString(issue.album_id),
+        code: issue.code as LibraryIssueCode,
+        evidenceJson: String(issue.evidence_json),
+        createdAt: String(issue.created_at),
+        updatedAt: String(issue.updated_at),
+      }));
+      return {
+        id: String(row.id),
+        identityKey: String(row.identity_key),
+        title: String(row.title),
+        albumArtist: String(row.album_artist),
+        primaryVersionId: String(row.primary_version_id),
+        decisionSource: row.decision_source as "AUTOMATIC" | "USER",
+        primaryVersionSource: row.primary_version_source as
+          "AUTOMATIC" | "USER",
+        revision: Number(row.revision),
+        createdAt: String(row.created_at),
+        updatedAt: String(row.updated_at),
+        members,
+        issues,
+      };
+    });
+    const aliasScope = [...new Set([...scope, ...groupIds])];
+    const aliasPlaceholders = aliasScope.map(() => "?").join(",");
+    const aliases = (
+      this.raw
+        .prepare(
+          `SELECT * FROM library_album_aliases
+           WHERE alias_id IN (${aliasPlaceholders})
+              OR library_album_id IN (${aliasPlaceholders})
+           ORDER BY alias_id`,
+        )
+        .all(...aliasScope, ...aliasScope) as Record<string, unknown>[]
+    ).map((alias) => ({
+      aliasId: String(alias.alias_id),
+      libraryAlbumId: String(alias.library_album_id),
+      createdAt: String(alias.created_at),
+    }));
+    return { groups, aliases };
+  }
+
+  private restoreLibraryIdentitySnapshot(
+    snapshot: LibraryIdentitySnapshot,
+    scope: string[],
+    revision: number,
+    now: string,
+    currentFacts: LibraryIdentitySnapshot,
+  ): void {
+    const current = this.captureLibraryIdentitySnapshot(scope);
+    const groupIds = current.groups.map((group) => group.id);
+    if (groupIds.length) {
+      const placeholders = groupIds.map(() => "?").join(",");
+      this.raw
+        .prepare(
+          `DELETE FROM library_album_aliases WHERE library_album_id IN (${placeholders})`,
+        )
+        .run(...groupIds);
+      this.raw
+        .prepare(`DELETE FROM library_albums WHERE id IN (${placeholders})`)
+        .run(...groupIds);
+    }
+    if (scope.length) {
+      const placeholders = scope.map(() => "?").join(",");
+      this.raw
+        .prepare(
+          `DELETE FROM library_album_aliases WHERE alias_id IN (${placeholders})`,
+        )
+        .run(...scope);
+    }
+    for (const group of snapshot.groups) {
+      const currentGroup = current.groups.find(
+        (candidate) => candidate.id === group.id,
+      );
+      this.raw
+        .prepare(
+          `INSERT INTO library_albums
+             (id,identity_key,title,album_artist,primary_version_id,decision_source,
+              primary_version_source,revision,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        )
+        .run(
+          group.id,
+          currentGroup?.identityKey ?? group.identityKey,
+          currentGroup?.title ?? group.title,
+          currentGroup?.albumArtist ?? group.albumArtist,
+          group.primaryVersionId,
+          group.decisionSource,
+          group.primaryVersionSource,
+          revision,
+          currentGroup?.createdAt ?? group.createdAt,
+          now,
+        );
+      for (const member of group.members)
+        this.raw
+          .prepare(
+            `INSERT INTO library_album_members
+               (library_album_id,album_id,relationship_status,created_at,updated_at)
+             VALUES (?,?,?,?,?)`,
+          )
+          .run(
+            group.id,
+            member.albumId,
+            member.relationshipStatus,
+            member.createdAt,
+            now,
+          );
+      const currentVersionIssues = currentFacts.groups.flatMap((currentGroup) =>
+        currentGroup.issues.filter((issue) => issue.albumId !== null),
+      );
+      for (const issue of currentVersionIssues.filter(
+        (issue) =>
+          issue.albumId !== null &&
+          group.members.some((member) => member.albumId === issue.albumId),
+      ))
+        this.raw
+          .prepare(
+            `INSERT INTO library_issues
+               (library_album_id,album_id,code,evidence_json,created_at,updated_at)
+             VALUES (?,?,?,?,?,?)`,
+          )
+          .run(
+            group.id,
+            issue.albumId,
+            issue.code,
+            issue.evidenceJson,
+            issue.createdAt,
+            issue.updatedAt,
+          );
+      const currentGroupIssues =
+        currentFacts.groups
+          .find((currentGroup) => currentGroup.id === group.id)
+          ?.issues.filter(
+            (issue) =>
+              issue.albumId === null && issue.code !== "IDENTITY_OVERLAP",
+          ) ?? [];
+      for (const issue of currentGroupIssues)
+        this.raw
+          .prepare(
+            `INSERT INTO library_issues
+               (library_album_id,album_id,code,evidence_json,created_at,updated_at)
+             VALUES (?,NULL,?,?,?,?)`,
+          )
+          .run(
+            group.id,
+            issue.code,
+            issue.evidenceJson,
+            issue.createdAt,
+            issue.updatedAt,
+          );
+      if (
+        group.members.length > 1 &&
+        group.members.some(
+          (member) => member.relationshipStatus === "AUTO_CANDIDATE",
+        )
+      ) {
+        const currentOverlap = currentFacts.groups
+          .find((currentGroup) => currentGroup.id === group.id)
+          ?.issues.find(
+            (issue) =>
+              issue.albumId === null && issue.code === "IDENTITY_OVERLAP",
+          );
+        this.raw
+          .prepare(
+            `INSERT INTO library_issues
+               (library_album_id,album_id,code,evidence_json,created_at,updated_at)
+             VALUES (?,NULL,'IDENTITY_OVERLAP',?,?,?)`,
+          )
+          .run(
+            group.id,
+            currentOverlap?.evidenceJson ??
+              JSON.stringify({
+                versionCount: group.members.length,
+                basis: "NORMALIZED_TITLE_ARTIST",
+              }),
+            currentOverlap?.createdAt ?? now,
+            currentOverlap?.updatedAt ?? now,
+          );
+      }
+    }
+    for (const alias of snapshot.aliases)
+      this.raw
+        .prepare(
+          `INSERT INTO library_album_aliases(alias_id,library_album_id,created_at)
+           VALUES (?,?,?)`,
+        )
+        .run(alias.aliasId, alias.libraryAlbumId, alias.createdAt);
+  }
+
+  private recordLibraryIdentityDecision(input: {
+    requestId: string;
+    inputJson: string;
+    libraryAlbumId: string;
+    type: LibraryIdentityDecision["type"];
+    actor: LibraryIdentityActor;
+    expectedRevision: number;
+    resultingRevision: number;
+    before: LibraryIdentitySnapshot;
+    after: LibraryIdentitySnapshot;
+    scope: string[];
+    currentLibraryAlbumId: string;
+    details: LibraryIdentityDecision["details"];
+    compensatesDecisionId: string | null;
+    createdAt: string;
+  }): LibraryIdentityDecisionResult {
+    const id = randomUUID();
+    const scope = [
+      ...new Set([
+        ...input.scope,
+        ...input.before.groups.map((group) => group.id),
+        ...input.after.groups.map((group) => group.id),
+      ]),
+    ].sort();
+    const affectedLibraryAlbumIds = scope;
+    this.raw
+      .prepare(
+        `INSERT INTO library_identity_decisions
+           (id,request_id,library_album_id,decision_type,actor_id,actor_display_name,
+            expected_revision,resulting_revision,input_json,before_state_json,
+            details_json,after_state_json,result_json,compensates_decision_id,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        id,
+        input.requestId,
+        input.libraryAlbumId,
+        input.type,
+        input.actor.id,
+        input.actor.displayName,
+        input.expectedRevision,
+        input.resultingRevision,
+        input.inputJson,
+        JSON.stringify(input.before),
+        JSON.stringify(input.details),
+        JSON.stringify(input.after),
+        JSON.stringify({
+          currentLibraryAlbumId: input.currentLibraryAlbumId,
+          affectedLibraryAlbumIds,
+        }),
+        input.compensatesDecisionId,
+        input.createdAt,
+      );
+    for (const groupId of scope)
+      this.raw
+        .prepare(
+          `INSERT INTO library_identity_decision_groups(decision_id,library_album_id)
+           VALUES (?,?)`,
+        )
+        .run(id, groupId);
+    return this.identityDecisionResultByRequestId(
+      input.requestId,
+      input.inputJson,
+    )!;
+  }
+
+  private identityDecisionResultByRequestId(
+    requestId: string,
+    inputJson: string,
+  ): LibraryIdentityDecisionResult | null {
+    const row = this.raw
+      .prepare("SELECT * FROM library_identity_decisions WHERE request_id=?")
+      .get(requestId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    if (String(row.input_json) !== inputJson)
+      throw new LibraryIdentityDecisionError(
+        "IDENTITY_DECISION_CONFLICT",
+        "requestId 已用于不同的身份治理请求",
+      );
+    const stored = parseJson<{
+      currentLibraryAlbumId: string;
+      affectedLibraryAlbumIds: string[];
+    }>(row.result_json, {
+      currentLibraryAlbumId: String(row.library_album_id),
+      affectedLibraryAlbumIds: [String(row.library_album_id)],
+    });
+    return {
+      decision: this.mapLibraryIdentityDecision(row),
+      currentLibraryAlbumId: stored.currentLibraryAlbumId,
+      affectedLibraryAlbumIds: stored.affectedLibraryAlbumIds,
+    };
+  }
+
+  private mapLibraryIdentityDecision(
+    row: Record<string, unknown>,
+  ): LibraryIdentityDecision {
+    const affectedLibraryAlbumIds = (
+      this.raw
+        .prepare(
+          `SELECT library_album_id FROM library_identity_decision_groups
+           WHERE decision_id=? AND association_kind='AFFECTED'
+           ORDER BY library_album_id`,
+        )
+        .all(String(row.id)) as Array<{ library_album_id: string }>
+    ).map((item) => item.library_album_id);
+    const compensated = Boolean(
+      this.raw
+        .prepare(
+          "SELECT 1 FROM library_identity_decisions WHERE compensates_decision_id=?",
+        )
+        .get(String(row.id)),
+    );
+    let canUndo = false;
+    if (!compensated && row.decision_type !== "UNDO") {
+      const expected = parseJson<LibraryIdentitySnapshot>(
+        row.after_state_json,
+        { groups: [], aliases: [] },
+      );
+      canUndo = sameLibraryIdentityGovernance(
+        this.captureLibraryIdentitySnapshot(affectedLibraryAlbumIds),
+        expected,
+      );
+    }
+    return {
+      id: String(row.id),
+      requestId: String(row.request_id),
+      libraryAlbumId: String(row.library_album_id),
+      type: row.decision_type as LibraryIdentityDecision["type"],
+      actor: {
+        id: String(row.actor_id),
+        displayName: String(row.actor_display_name),
+      },
+      expectedRevision: Number(row.expected_revision),
+      resultingRevision: Number(row.resulting_revision),
+      details: parseJson<LibraryIdentityDecision["details"]>(row.details_json, {
+        targetLibraryAlbumId: null,
+        primaryVersionId: null,
+        partitions: [],
+        compensatedDecisionId: nullableString(row.compensates_decision_id),
+      }),
+      affectedLibraryAlbumIds,
+      compensatesDecisionId: nullableString(row.compensates_decision_id),
+      canUndo,
+      createdAt: String(row.created_at),
+    };
   }
 
   listAlbums(
@@ -2098,6 +3250,7 @@ export class CoceanDatabase {
     const rows = this.raw
       .prepare(
         `SELECT a.*, la.id AS library_album_id, la.primary_version_id,
+                la.primary_version_source, la.revision,
                 (SELECT COUNT(*) FROM library_album_members WHERE library_album_id=la.id) AS version_count
          FROM library_albums la JOIN albums a ON a.id=la.primary_version_id
          ${where} ORDER BY ${order}, la.id LIMIT @limit OFFSET @offset`,
@@ -2155,12 +3308,34 @@ export class CoceanDatabase {
     const row = this.raw
       .prepare(
         `SELECT a.*, la.id AS library_album_id, la.primary_version_id,
+        la.primary_version_source, la.revision,
         (SELECT COUNT(*) FROM library_album_members WHERE library_album_id=la.id) AS version_count
         FROM library_albums la JOIN albums a ON a.id=la.primary_version_id
-        WHERE la.id=? OR EXISTS (SELECT 1 FROM library_album_members lm WHERE lm.library_album_id=la.id AND lm.album_id=?)`,
+        WHERE la.id=COALESCE(
+          (SELECT library_album_id FROM library_album_aliases WHERE alias_id=?), ?
+        ) OR EXISTS (
+          SELECT 1 FROM library_album_members lm
+          WHERE lm.library_album_id=la.id AND lm.album_id=?
+        )`,
       )
-      .get(id, id) as Record<string, unknown> | undefined;
+      .get(id, id, id) as Record<string, unknown> | undefined;
     return row ? this.mapLibraryAlbumSummary(row) : null;
+  }
+
+  resolveLibraryAlbumId(id: string): string | null {
+    const row = this.raw
+      .prepare(
+        `SELECT la.id FROM library_albums la
+         WHERE la.id=COALESCE(
+           (SELECT library_album_id FROM library_album_aliases WHERE alias_id=?), ?
+         ) OR EXISTS (
+           SELECT 1 FROM library_album_members lm
+           WHERE lm.library_album_id=la.id AND lm.album_id=?
+         )
+         LIMIT 1`,
+      )
+      .get(id, id, id) as { id: string } | undefined;
+    return row?.id ?? null;
   }
 
   resolveLocalVersionId(id: string): string | null {
@@ -2168,14 +3343,16 @@ export class CoceanDatabase {
       .prepare(
         `SELECT library_albums.primary_version_id
          FROM library_albums
-         WHERE library_albums.id=? OR EXISTS (
+         WHERE library_albums.id=COALESCE(
+           (SELECT library_album_id FROM library_album_aliases WHERE alias_id=?), ?
+         ) OR EXISTS (
            SELECT 1 FROM library_album_members
            WHERE library_album_members.library_album_id=library_albums.id
              AND library_album_members.album_id=?
          )
          LIMIT 1`,
       )
-      .get(id, id) as { primary_version_id: string | null } | undefined;
+      .get(id, id, id) as { primary_version_id: string | null } | undefined;
     if (row?.primary_version_id) return row.primary_version_id;
     return this.raw.prepare("SELECT id FROM albums WHERE id=?").get(id)
       ? id
@@ -3205,7 +4382,10 @@ export class CoceanDatabase {
       .prepare(
         `SELECT
           (SELECT COUNT(*) FROM library_albums WHERE primary_version_id IS NOT NULL) AS albums,
-          (SELECT COUNT(*) FROM album_files WHERE is_primary = 1) AS tracks,
+          (SELECT COUNT(*)
+           FROM library_albums la
+           JOIN album_files af ON af.album_id=la.primary_version_id
+           WHERE af.is_primary=1) AS tracks,
           (SELECT COUNT(*) FROM media_files) AS files,
           (SELECT COUNT(DISTINCT library_album_id) FROM library_issues) AS needs_review,
           (SELECT COUNT(DISTINCT library_album_id) FROM library_issues WHERE code='MISSING_ARTWORK') AS missing_artwork,
@@ -3264,6 +4444,8 @@ export class CoceanDatabase {
       hasDigital,
       physicalMedia,
       primaryVersionId: String(row.primary_version_id),
+      primaryVersionSource: row.primary_version_source as "AUTOMATIC" | "USER",
+      revision: Number(row.revision),
       versionCount: Number(row.version_count),
       issues: this.listLibraryIssues(id),
     };
@@ -3303,6 +4485,8 @@ export class CoceanDatabase {
       hasDigital,
       physicalMedia: media,
       matchStatus: row.match_status as AlbumSummary["matchStatus"],
+      primaryVersionSource: "AUTOMATIC",
+      revision: 0,
       trackCount: Number(row.track_count),
       discCount: Number(row.disc_count),
       sourceVersionCount: Number(row.source_version_count ?? 1),
@@ -3313,6 +4497,85 @@ export class CoceanDatabase {
       ),
     };
   }
+}
+
+function canonicalLibraryIdentityDecisionInput(
+  albumId: string,
+  command: Record<string, unknown> | LibraryIdentityDecisionCommand,
+): string {
+  return JSON.stringify(sortJsonValue({ albumId, command }));
+}
+
+function libraryIdentityDecisionDetails(
+  command: LibraryIdentityDecisionCommand,
+): LibraryIdentityDecision["details"] {
+  return {
+    targetLibraryAlbumId:
+      command.type === "MERGE" ? command.targetLibraryAlbumId : null,
+    primaryVersionId:
+      command.type === "SPLIT"
+        ? null
+        : "primaryVersionId" in command
+          ? (command.primaryVersionId ?? null)
+          : null,
+    partitions:
+      command.type === "SPLIT"
+        ? command.partitions.map((partition) => ({
+            versionIds: [...partition.versionIds],
+            primaryVersionId: partition.primaryVersionId ?? null,
+          }))
+        : [],
+    compensatedDecisionId: null,
+  };
+}
+
+function sortJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortJsonValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right, "en-US"))
+      .map(([key, item]) => [key, sortJsonValue(item)]),
+  );
+}
+
+function libraryIdentityGovernanceState(
+  snapshot: LibraryIdentitySnapshot,
+): LibraryIdentityGovernanceState {
+  return {
+    groups: snapshot.groups
+      .map((group) => ({
+        id: group.id,
+        primaryVersionId: group.primaryVersionId,
+        decisionSource: group.decisionSource,
+        primaryVersionSource: group.primaryVersionSource,
+        revision: group.revision,
+        members: group.members
+          .map((member) => ({
+            albumId: member.albumId,
+            relationshipStatus: member.relationshipStatus,
+          }))
+          .sort((left, right) => left.albumId.localeCompare(right.albumId)),
+      }))
+      .sort((left, right) => left.id.localeCompare(right.id)),
+    aliases: snapshot.aliases
+      .map((alias) => ({
+        aliasId: alias.aliasId,
+        libraryAlbumId: alias.libraryAlbumId,
+      }))
+      .sort((left, right) => left.aliasId.localeCompare(right.aliasId)),
+  };
+}
+
+function sameLibraryIdentityGovernance(
+  left: LibraryIdentitySnapshot,
+  right: LibraryIdentitySnapshot,
+): boolean {
+  return (
+    JSON.stringify(libraryIdentityGovernanceState(left)) ===
+    JSON.stringify(libraryIdentityGovernanceState(right))
+  );
 }
 
 function normalizeLibraryIdentity(artist: string, title: string): string {

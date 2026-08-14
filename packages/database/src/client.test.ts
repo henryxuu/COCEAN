@@ -164,8 +164,8 @@ describe("CoceanDatabase", () => {
       expect.objectContaining({
         schema: "cocean.database-backup/v1",
         releaseVersion: "0.1.0",
-        schemaVersion: 16,
-        migrationCount: 16,
+        schemaVersion: 17,
+        migrationCount: 17,
         sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       }),
     );
@@ -372,8 +372,8 @@ describe("CoceanDatabase", () => {
         )
         .get(),
     ).toEqual({
-      version: 16,
-      name: "library_album_identity_and_integrity",
+      version: 17,
+      name: "manual_library_album_identity_governance",
     });
   });
 
@@ -1403,6 +1403,7 @@ describe("CoceanDatabase", () => {
     );
     const stableId = grouped[0]!.id;
     expect(database.resolveLocalVersionId(stableId)).toBe("complete-version");
+    expect(database.getLibraryStats().tracks).toBe(21);
     expect(database.getAlbumDeliveryBundle(stableId)?.albumId).toBe(
       "complete-version",
     );
@@ -1467,6 +1468,1029 @@ describe("CoceanDatabase", () => {
     expect(database.listAlbums({ search: "Shared Album" })[0]?.id).toBe(
       stableId,
     );
+  });
+
+  it("applies, replays, splits and safely undoes manual identity decisions without moving version dependencies", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    const versions = [
+      {
+        ...albumInput("manual-short", []),
+        title: "Manual",
+        albumArtist: "Artist",
+        trackCount: 2,
+      },
+      {
+        ...albumInput("manual-complete", []),
+        title: "Manual",
+        albumArtist: "Artist",
+        trackCount: 21,
+      },
+    ];
+    database.replaceAlbumsForRoot("music", versions);
+    database.raw
+      .prepare(
+        `INSERT INTO physical_copies
+           (id,album_id,medium,quantity,created_at,updated_at)
+         VALUES ('manual-copy','manual-short','CD',1,?,?)`,
+      )
+      .run("2026-08-13T00:00:00.000Z", "2026-08-13T00:00:00.000Z");
+    const stableId = database.getAlbumSummary("manual-short")!.id;
+    const actor = { id: "admin", displayName: "Admin" };
+    const confirm = {
+      type: "CONFIRM" as const,
+      requestId: "confirm-manual",
+      revision: 0,
+      primaryVersionId: "manual-complete",
+    };
+    const confirmed = database.applyLibraryIdentityDecision(
+      stableId,
+      confirm,
+      actor,
+    );
+    expect(
+      database.applyLibraryIdentityDecision(stableId, confirm, actor),
+    ).toEqual(confirmed);
+    expect(database.getAlbum(stableId)).toEqual(
+      expect.objectContaining({
+        revision: 1,
+        primaryVersionId: "manual-complete",
+        primaryVersionSource: "USER",
+        localVersions: expect.arrayContaining([
+          expect.objectContaining({ relationshipStatus: "USER_CONFIRMED" }),
+        ]),
+      }),
+    );
+    database.replaceAlbumsForRoot("music", [versions[1]!]);
+    expect(
+      database.getAlbum(stableId)?.localVersions?.map((version) => version.id),
+    ).toEqual(["manual-complete", "manual-short"]);
+    database.replaceAlbumsForRoot("music", versions);
+    expect(database.getAlbum(stableId)?.primaryVersionId).toBe(
+      "manual-complete",
+    );
+
+    const split = database.applyLibraryIdentityDecision(
+      stableId,
+      {
+        type: "SPLIT",
+        requestId: "split-manual",
+        revision: 1,
+        partitions: [
+          { versionIds: ["manual-short"] },
+          { versionIds: ["manual-complete"] },
+        ],
+      },
+      actor,
+    );
+    const shortGroupId = database.getAlbumSummary("manual-short")!.id;
+    expect(shortGroupId).not.toBe(stableId);
+    expect(database.getAlbumSummary("manual-complete")!.id).toBe(stableId);
+    expect(database.listPhysicalCopies(shortGroupId)).toEqual([
+      expect.objectContaining({ id: "manual-copy" }),
+    ]);
+    expect(database.listPhysicalCopies(stableId)).toEqual([]);
+    database.replaceAlbumsForRoot("music", versions);
+    expect(database.getAlbumSummary("manual-short")!.id).toBe(shortGroupId);
+
+    const undone = database.undoLibraryIdentityDecision(
+      stableId,
+      split.decision.id,
+      "undo-split-manual",
+      2,
+      actor,
+    );
+    expect(undone.decision.type).toBe("UNDO");
+    expect(database.getAlbumSummary("manual-complete")!.id).toBe(stableId);
+    expect(database.getAlbumSummary(shortGroupId)!.id).toBe(stableId);
+    expect(() =>
+      database.undoLibraryIdentityDecision(
+        stableId,
+        split.decision.id,
+        "undo-split-again",
+        database.getAlbumSummary(stableId)!.revision,
+        actor,
+      ),
+    ).toThrow(/已经撤销/);
+  });
+
+  it("keeps merge aliases and local-version dependencies while rejecting stale or conflicting changes atomically", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    database.replaceAlbumsForRoot("music", [
+      {
+        ...albumInput("merge-source", []),
+        title: "Source",
+        albumArtist: "Artist",
+      },
+      {
+        ...albumInput("merge-target", []),
+        title: "Target",
+        albumArtist: "Artist",
+      },
+    ]);
+    const sourceId = database.getAlbumSummary("merge-source")!.id;
+    const targetId = database.getAlbumSummary("merge-target")!.id;
+    const actor = { id: "admin", displayName: "Admin" };
+    expect(() =>
+      database.applyLibraryIdentityDecision(
+        sourceId,
+        {
+          type: "SET_PRIMARY",
+          requestId: "bad-member",
+          revision: 0,
+          primaryVersionId: "merge-target",
+        },
+        actor,
+      ),
+    ).toThrow(/主版本必须属于当前唱片/);
+    expect(database.getAlbumSummary(sourceId)!.revision).toBe(0);
+    const now = "2026-08-13T00:00:00.000Z";
+    database.createDeliveryTarget({
+      id: "merge-target-device",
+      deviceId: null,
+      name: "Merge target",
+      kind: "MOUNTED_VOLUME",
+      transport: "USB_MOUNT",
+      location: "/delivery/usb/merge",
+      username: null,
+      credentialConfigured: false,
+      enabled: true,
+      verifiedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    for (const [index, localVersionId] of [
+      "merge-source",
+      "merge-target",
+    ].entries())
+      database.createDeliveryJob({
+        id: `merge-active-${index}`,
+        albumId: localVersionId,
+        targetId: "merge-target-device",
+        targetName: "Merge target",
+        transport: "USB_MOUNT",
+        status: "QUEUED",
+        fileCount: 0,
+        completedFileCount: 0,
+        totalBytes: 0,
+        transferredBytes: 0,
+        verified: false,
+        error: null,
+        createdAt: now,
+        startedAt: null,
+        finishedAt: null,
+        planId: null,
+      });
+    expect(() =>
+      database.applyLibraryIdentityDecision(
+        sourceId,
+        {
+          type: "MERGE",
+          requestId: "merge-active-conflict",
+          revision: 0,
+          targetLibraryAlbumId: targetId,
+          targetRevision: 0,
+          primaryVersionId: "merge-target",
+        },
+        actor,
+      ),
+    ).toThrow(/重复活动任务/);
+    expect(database.getAlbumSummary(sourceId)!.id).toBe(sourceId);
+    database.raw
+      .prepare(
+        "UPDATE delivery_jobs SET status='COMPLETED', finished_at=? WHERE id LIKE 'merge-active-%'",
+      )
+      .run(now);
+    const merged = database.applyLibraryIdentityDecision(
+      sourceId,
+      {
+        type: "MERGE",
+        requestId: "merge-two",
+        revision: 0,
+        targetLibraryAlbumId: targetId,
+        targetRevision: 0,
+        primaryVersionId: "merge-target",
+      },
+      actor,
+    );
+    expect(merged.currentLibraryAlbumId).toBe(targetId);
+    expect(database.getAlbumSummary(sourceId)!.id).toBe(targetId);
+    expect(database.getAlbumSummary("merge-source")!.id).toBe(targetId);
+    expect(() =>
+      database.applyLibraryIdentityDecision(
+        targetId,
+        {
+          type: "SET_PRIMARY",
+          requestId: "stale-primary",
+          revision: 0,
+          primaryVersionId: "merge-source",
+        },
+        actor,
+      ),
+    ).toThrow(/刷新后重试/);
+    expect(database.getAlbumSummary(targetId)!.primaryVersionId).toBe(
+      "merge-target",
+    );
+
+    database.applyLibraryIdentityDecision(
+      targetId,
+      {
+        type: "SET_PRIMARY",
+        requestId: "later-primary",
+        revision: 1,
+        primaryVersionId: "merge-source",
+      },
+      actor,
+    );
+    expect(() =>
+      database.undoLibraryIdentityDecision(
+        targetId,
+        merged.decision.id,
+        "conflicting-undo",
+        2,
+        actor,
+      ),
+    ).toThrow(/后续决定覆盖/);
+  });
+
+  it("sets an explicit primary without silently confirming automatic candidates and rejects incomplete split partitions", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    database.replaceAlbumsForRoot("music", [
+      {
+        ...albumInput("primary-a", []),
+        title: "Primary",
+        albumArtist: "Artist",
+      },
+      {
+        ...albumInput("primary-b", []),
+        title: "Primary",
+        albumArtist: "Artist",
+      },
+      {
+        ...albumInput("primary-c", []),
+        title: "Primary",
+        albumArtist: "Artist",
+      },
+    ]);
+    const groupId = database.getAlbumSummary("primary-a")!.id;
+    database.applyLibraryIdentityDecision(
+      groupId,
+      {
+        type: "SET_PRIMARY",
+        requestId: "set-primary-only",
+        revision: 0,
+        primaryVersionId: "primary-b",
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    expect(database.getAlbum(groupId)).toEqual(
+      expect.objectContaining({
+        primaryVersionId: "primary-b",
+        primaryVersionSource: "USER",
+        issues: expect.arrayContaining([
+          expect.objectContaining({ code: "IDENTITY_OVERLAP" }),
+        ]),
+        localVersions: expect.arrayContaining([
+          expect.objectContaining({ relationshipStatus: "AUTO_CANDIDATE" }),
+        ]),
+      }),
+    );
+    expect(() =>
+      database.applyLibraryIdentityDecision(
+        groupId,
+        {
+          type: "SPLIT",
+          requestId: "split-with-omission",
+          revision: 1,
+          partitions: [
+            { versionIds: ["primary-a"] },
+            { versionIds: ["primary-b"] },
+          ],
+        },
+        { id: "admin", displayName: "Admin" },
+      ),
+    ).toThrow(/覆盖全部本地版本/);
+    expect(database.getAlbumSummary(groupId)!.revision).toBe(1);
+  });
+
+  it("keeps the identity decision ledger append-only at the database boundary", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    database.replaceAlbumsForRoot("music", [
+      {
+        ...albumInput("ledger-album", []),
+        title: "Ledger",
+        albumArtist: "Artist",
+      },
+    ]);
+    const groupId = database.getAlbumSummary("ledger-album")!.id;
+    const result = database.applyLibraryIdentityDecision(
+      groupId,
+      {
+        type: "SET_PRIMARY",
+        requestId: "ledger-request",
+        revision: 0,
+        primaryVersionId: "ledger-album",
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    expect(() =>
+      database.raw
+        .prepare(
+          "UPDATE library_identity_decisions SET actor_display_name='tampered' WHERE id=?",
+        )
+        .run(result.decision.id),
+    ).toThrow(/append-only/);
+    expect(() =>
+      database.raw
+        .prepare("DELETE FROM library_identity_decisions WHERE id=?")
+        .run(result.decision.id),
+    ).toThrow(/append-only/);
+    expect(() =>
+      database.raw
+        .prepare(
+          "UPDATE library_identity_decision_groups SET library_album_id='tampered' WHERE decision_id=?",
+        )
+        .run(result.decision.id),
+    ).toThrow(/append-only/);
+    expect(() =>
+      database.raw
+        .prepare(
+          "DELETE FROM library_identity_decision_groups WHERE decision_id=?",
+        )
+        .run(result.decision.id),
+    ).toThrow(/append-only/);
+    expect(database.listLibraryIdentityDecisionHistory(groupId)).toEqual([
+      expect.objectContaining({ id: result.decision.id }),
+    ]);
+  });
+
+  it("binds requestId replay to the exact album, command payload and apply-or-undo entrypoint", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    database.replaceAlbumsForRoot("music", [
+      {
+        ...albumInput("idempotent-a", []),
+        title: "Idempotent A",
+        albumArtist: "Artist",
+      },
+      {
+        ...albumInput("idempotent-b", []),
+        title: "Idempotent B",
+        albumArtist: "Artist",
+      },
+    ]);
+    const groupA = database.getAlbumSummary("idempotent-a")!.id;
+    const groupB = database.getAlbumSummary("idempotent-b")!.id;
+    const actor = { id: "admin", displayName: "Admin" };
+    const command = {
+      type: "SET_PRIMARY" as const,
+      requestId: "bound-request",
+      revision: 0,
+      primaryVersionId: "idempotent-a",
+    };
+    const first = database.applyLibraryIdentityDecision(groupA, command, actor);
+    expect(
+      database.applyLibraryIdentityDecision(groupA, command, actor),
+    ).toEqual(first);
+    expect(() =>
+      database.applyLibraryIdentityDecision(
+        groupA,
+        { ...command, primaryVersionId: "different-version" },
+        actor,
+      ),
+    ).toThrow(/requestId 已用于不同/);
+    expect(() =>
+      database.applyLibraryIdentityDecision(groupB, command, actor),
+    ).toThrow(/requestId 已用于不同/);
+    expect(() =>
+      database.undoLibraryIdentityDecision(
+        groupA,
+        first.decision.id,
+        command.requestId,
+        1,
+        actor,
+      ),
+    ).toThrow(/requestId 已用于不同/);
+
+    const undo = database.undoLibraryIdentityDecision(
+      groupA,
+      first.decision.id,
+      "bound-undo-request",
+      1,
+      actor,
+    );
+    expect(
+      database.undoLibraryIdentityDecision(
+        groupA,
+        first.decision.id,
+        "bound-undo-request",
+        1,
+        actor,
+      ),
+    ).toEqual(undo);
+    expect(() =>
+      database.applyLibraryIdentityDecision(
+        groupA,
+        {
+          type: "SET_PRIMARY",
+          requestId: "bound-undo-request",
+          revision: undo.decision.resultingRevision,
+          primaryVersionId: "idempotent-a",
+        },
+        actor,
+      ),
+    ).toThrow(/requestId 已用于不同/);
+  });
+
+  it("undoes SET_PRIMARY after an automatic rebuild without rolling scan issue facts back", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    const initial = [
+      {
+        ...albumInput("rescan-incomplete", []),
+        title: "Rescan",
+        albumArtist: "Artist",
+        aggregationIssues: [
+          {
+            code: "MISSING_TRACK" as const,
+            discNumber: 1,
+            trackNumber: 2,
+            expected: 2,
+            actual: 1,
+          },
+        ],
+      },
+      {
+        ...albumInput("rescan-complete", []),
+        title: "Rescan",
+        albumArtist: "Artist",
+      },
+    ];
+    database.replaceAlbumsForRoot("music", initial);
+    const groupId = database.getAlbumSummary("rescan-incomplete")!.id;
+    expect(database.getAlbumSummary(groupId)!.primaryVersionId).toBe(
+      "rescan-complete",
+    );
+    const decision = database.applyLibraryIdentityDecision(
+      groupId,
+      {
+        type: "SET_PRIMARY",
+        requestId: "rescan-primary",
+        revision: 0,
+        primaryVersionId: "rescan-incomplete",
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    const rescanned = [
+      {
+        ...initial[0]!,
+        aggregationIssues: [
+          {
+            code: "MISSING_TRACK" as const,
+            discNumber: 1,
+            trackNumber: 2,
+            expected: 9,
+            actual: 1,
+          },
+        ],
+      },
+      initial[1]!,
+    ];
+    database.replaceAlbumsForRoot("music", rescanned);
+    const scannedEvidence = database.raw
+      .prepare(
+        `SELECT evidence_json FROM library_issues
+         WHERE library_album_id=? AND album_id='rescan-incomplete'
+           AND code='INCOMPLETE_TRACKS'`,
+      )
+      .get(groupId) as { evidence_json: string };
+    expect(scannedEvidence.evidence_json).toContain('"expected":9');
+    expect(database.listLibraryIdentityDecisionHistory(groupId)[0]).toEqual(
+      expect.objectContaining({ id: decision.decision.id, canUndo: true }),
+    );
+
+    database.undoLibraryIdentityDecision(
+      groupId,
+      decision.decision.id,
+      "undo-rescan-primary",
+      1,
+      { id: "admin", displayName: "Admin" },
+    );
+    expect(database.getAlbumSummary(groupId)).toEqual(
+      expect.objectContaining({
+        primaryVersionId: "rescan-complete",
+        primaryVersionSource: "AUTOMATIC",
+        revision: 2,
+      }),
+    );
+    expect(
+      (
+        database.raw
+          .prepare(
+            `SELECT evidence_json FROM library_issues
+             WHERE library_album_id=? AND album_id='rescan-incomplete'
+               AND code='INCOMPLETE_TRACKS'`,
+          )
+          .get(groupId) as { evidence_json: string }
+      ).evidence_json,
+    ).toBe(scannedEvidence.evidence_json);
+  });
+
+  it("refreshes scan-derived issues for CONFIRM, SPLIT and MERGE user groups without changing governance", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    const actor = { id: "admin", displayName: "Admin" };
+    const a = {
+      ...albumInput("facts-a", []),
+      title: "Facts",
+      albumArtist: "Artist",
+    };
+    const b = {
+      ...albumInput("facts-b", []),
+      title: "Facts",
+      albumArtist: "Artist",
+    };
+    const target = {
+      ...albumInput("facts-target", []),
+      title: "Target",
+      albumArtist: "Artist",
+    };
+    database.replaceAlbumsForRoot("music", [a, b, target]);
+    const groupId = database.getAlbumSummary("facts-a")!.id;
+    database.applyLibraryIdentityDecision(
+      groupId,
+      { type: "CONFIRM", requestId: "facts-confirm", revision: 0 },
+      actor,
+    );
+    database.replaceAlbumsForRoot("music", [
+      {
+        ...a,
+        artwork: {
+          source: "SIDECAR" as const,
+          url: "/new-cover.jpg",
+          mimeType: "image/jpeg",
+          width: 1200,
+          height: 1200,
+        },
+      },
+      b,
+      target,
+    ]);
+    expect(database.getAlbum(groupId)?.localVersions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "facts-a",
+          relationshipStatus: "USER_CONFIRMED",
+        }),
+        expect.objectContaining({
+          id: "facts-b",
+          relationshipStatus: "USER_CONFIRMED",
+        }),
+      ]),
+    );
+    expect(
+      database.raw
+        .prepare(
+          `SELECT 1 FROM library_issues WHERE library_album_id=?
+           AND album_id='facts-a' AND code='MISSING_ARTWORK'`,
+        )
+        .get(groupId),
+    ).toBeUndefined();
+
+    const split = database.applyLibraryIdentityDecision(
+      groupId,
+      {
+        type: "SPLIT",
+        requestId: "facts-split",
+        revision: 1,
+        partitions: [{ versionIds: ["facts-a"] }, { versionIds: ["facts-b"] }],
+      },
+      actor,
+    );
+    const splitId = database.getAlbumSummary("facts-b")!.id;
+    database.replaceAlbumsForRoot("music", [
+      a,
+      {
+        ...b,
+        mixedAudioSpecs: true,
+      },
+      target,
+    ]);
+    expect(database.getAlbum(splitId)?.localVersions[0]).toEqual(
+      expect.objectContaining({ relationshipStatus: "USER_SEPARATE" }),
+    );
+    expect(
+      database.raw
+        .prepare(
+          `SELECT evidence_json FROM library_issues WHERE library_album_id=?
+           AND album_id='facts-b' AND code='MIXED_AUDIO_SPECS'`,
+        )
+        .get(splitId),
+    ).toBeTruthy();
+
+    const targetId = database.getAlbumSummary("facts-target")!.id;
+    database.applyLibraryIdentityDecision(
+      splitId,
+      {
+        type: "MERGE",
+        requestId: "facts-merge",
+        revision: database.getAlbumSummary(splitId)!.revision,
+        targetLibraryAlbumId: targetId,
+        targetRevision: database.getAlbumSummary(targetId)!.revision,
+        primaryVersionId: "facts-target",
+      },
+      actor,
+    );
+    database.replaceAlbumsForRoot("music", [a, b, target]);
+    expect(database.getAlbum(targetId)?.localVersions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "facts-b",
+          relationshipStatus: "USER_CONFIRMED",
+        }),
+        expect.objectContaining({
+          id: "facts-target",
+          relationshipStatus: "USER_CONFIRMED",
+        }),
+      ]),
+    );
+    expect(
+      database.raw
+        .prepare(
+          `SELECT 1 FROM library_issues WHERE library_album_id=?
+           AND album_id='facts-b' AND code='MIXED_AUDIO_SPECS'`,
+        )
+        .get(targetId),
+    ).toBeUndefined();
+    expect(split.decision.details.partitions).toHaveLength(2);
+  });
+
+  it("pins USER primary membership and advances automatic revisions for observed membership changes", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    const base = [
+      {
+        ...albumInput("revision-a", []),
+        title: "Revision",
+        albumArtist: "Artist",
+      },
+      {
+        ...albumInput("revision-b", []),
+        title: "Revision",
+        albumArtist: "Artist",
+      },
+    ];
+    database.replaceAlbumsForRoot("music", base);
+    const groupId = database.getAlbumSummary("revision-a")!.id;
+    database.applyLibraryIdentityDecision(
+      groupId,
+      {
+        type: "SET_PRIMARY",
+        requestId: "revision-primary",
+        revision: 0,
+        primaryVersionId: "revision-b",
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    database.replaceAlbumsForRoot("music", [
+      base[0]!,
+      { ...base[1]!, title: "Renamed by scan" },
+    ]);
+    expect(database.getAlbum(groupId)).toEqual(
+      expect.objectContaining({
+        primaryVersionId: "revision-b",
+        revision: 1,
+        localVersions: expect.arrayContaining([
+          expect.objectContaining({ id: "revision-b" }),
+        ]),
+      }),
+    );
+    database.replaceAlbumsForRoot("music", [
+      base[0]!,
+      { ...base[1]!, title: "Renamed by scan" },
+      {
+        ...albumInput("revision-c", []),
+        title: "Revision",
+        albumArtist: "Artist",
+      },
+    ]);
+    expect(database.getAlbumSummary(groupId)!.revision).toBe(2);
+    expect(() =>
+      database.applyLibraryIdentityDecision(
+        groupId,
+        {
+          type: "SET_PRIMARY",
+          requestId: "revision-stale",
+          revision: 1,
+          primaryVersionId: "revision-a",
+        },
+        { id: "admin", displayName: "Admin" },
+      ),
+    ).toThrow(/刷新后重试/);
+    database.replaceAlbumsForRoot("music", [
+      { ...base[1]!, title: "Renamed by scan" },
+      {
+        ...albumInput("revision-c", []),
+        title: "Revision",
+        albumArtist: "Artist",
+      },
+    ]);
+    expect(database.getAlbumSummary(groupId)!.revision).toBe(3);
+    expect(
+      database.getAlbum(groupId)?.localVersions.map((item) => item.id),
+    ).toEqual(["revision-b", "revision-c"]);
+  });
+
+  it("advances revision when automatic primary selection changes on rescan", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    const goodArtwork = {
+      source: "SIDECAR" as const,
+      url: "/cover.jpg",
+      mimeType: "image/jpeg",
+      width: 1200,
+      height: 1200,
+    };
+    const poorArtwork = albumInput("unused", []).artwork;
+    const a = {
+      ...albumInput("auto-primary-a", []),
+      title: "Auto Primary",
+      albumArtist: "Artist",
+      artwork: goodArtwork,
+    };
+    const b = {
+      ...albumInput("auto-primary-b", []),
+      title: "Auto Primary",
+      albumArtist: "Artist",
+      artwork: poorArtwork,
+    };
+    database.replaceAlbumsForRoot("music", [a, b]);
+    const groupId = database.getAlbumSummary("auto-primary-a")!.id;
+    expect(database.getAlbumSummary(groupId)!.primaryVersionId).toBe(
+      "auto-primary-a",
+    );
+    database.replaceAlbumsForRoot("music", [
+      { ...a, artwork: poorArtwork },
+      { ...b, artwork: goodArtwork },
+    ]);
+    expect(database.getAlbumSummary(groupId)).toEqual(
+      expect.objectContaining({
+        primaryVersionId: "auto-primary-b",
+        revision: 1,
+      }),
+    );
+  });
+
+  it("keeps alias/current ids disjoint and uses a collision-safe automatic id after merge", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    const source = {
+      ...albumInput("alias-source-version", []),
+      title: "Alias Source",
+      albumArtist: "Artist",
+    };
+    const target = {
+      ...albumInput("alias-target-version", []),
+      title: "Alias Target",
+      albumArtist: "Artist",
+    };
+    database.replaceAlbumsForRoot("music", [source, target]);
+    const sourceId = database.getAlbumSummary(source.id)!.id;
+    const targetId = database.getAlbumSummary(target.id)!.id;
+    database.applyLibraryIdentityDecision(
+      sourceId,
+      {
+        type: "MERGE",
+        requestId: "alias-merge",
+        revision: 0,
+        targetLibraryAlbumId: targetId,
+        targetRevision: 0,
+        primaryVersionId: target.id,
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    database.replaceAlbumsForRoot("music", [
+      source,
+      target,
+      {
+        ...albumInput("alias-new-version", []),
+        title: "Alias Source",
+        albumArtist: "Artist",
+      },
+    ]);
+    const newGroupId = database.getAlbumSummary("alias-new-version")!.id;
+    expect(newGroupId).not.toBe(sourceId);
+    expect(database.getAlbumSummary(sourceId)!.id).toBe(targetId);
+    expect(() =>
+      database.raw
+        .prepare(
+          "INSERT INTO library_albums(id,identity_key,title,album_artist,primary_version_id,decision_source,primary_version_source,revision,created_at,updated_at) VALUES (?,?,?,?,?,'AUTOMATIC','AUTOMATIC',0,?,?)",
+        )
+        .run(
+          sourceId,
+          "conflict",
+          "Conflict",
+          "Artist",
+          "alias-new-version",
+          "now",
+          "now",
+        ),
+    ).toThrow(/conflicts with an alias/);
+    expect(() =>
+      database.raw
+        .prepare(
+          "INSERT INTO library_album_aliases(alias_id,library_album_id,created_at) VALUES (?,?,?)",
+        )
+        .run(newGroupId, targetId, "now"),
+    ).toThrow(/conflicts with a current id/);
+  });
+
+  it("inherits audit history through merge and split and successfully compensates a merge", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    const actor = { id: "admin", displayName: "Admin" };
+    database.replaceAlbumsForRoot("music", [
+      {
+        ...albumInput("audit-source", []),
+        title: "Audit Source",
+        albumArtist: "Artist",
+      },
+      {
+        ...albumInput("audit-target", []),
+        title: "Audit Target",
+        albumArtist: "Artist",
+      },
+    ]);
+    const sourceId = database.getAlbumSummary("audit-source")!.id;
+    const targetId = database.getAlbumSummary("audit-target")!.id;
+    const sourcePrior = database.applyLibraryIdentityDecision(
+      sourceId,
+      {
+        type: "SET_PRIMARY",
+        requestId: "audit-source-prior",
+        revision: 0,
+        primaryVersionId: "audit-source",
+      },
+      actor,
+    );
+    const targetPrior = database.applyLibraryIdentityDecision(
+      targetId,
+      {
+        type: "CONFIRM",
+        requestId: "audit-target-prior",
+        revision: 0,
+      },
+      actor,
+    );
+    const merged = database.applyLibraryIdentityDecision(
+      sourceId,
+      {
+        type: "MERGE",
+        requestId: "audit-merge",
+        revision: 1,
+        targetLibraryAlbumId: targetId,
+        targetRevision: 1,
+        primaryVersionId: "audit-target",
+      },
+      actor,
+    );
+    expect(merged.affectedLibraryAlbumIds).toEqual(
+      merged.decision.affectedLibraryAlbumIds,
+    );
+    expect(merged.affectedLibraryAlbumIds).toEqual(
+      expect.arrayContaining([sourceId, targetId]),
+    );
+    expect(merged.decision.details).toEqual(
+      expect.objectContaining({
+        targetLibraryAlbumId: targetId,
+        primaryVersionId: "audit-target",
+      }),
+    );
+    expect(
+      database
+        .listLibraryIdentityDecisionHistory(targetId)
+        .map((item) => item.id),
+    ).toEqual([
+      merged.decision.id,
+      targetPrior.decision.id,
+      sourcePrior.decision.id,
+    ]);
+    const sourceReplay = database.applyLibraryIdentityDecision(
+      sourceId,
+      {
+        type: "SET_PRIMARY",
+        requestId: "audit-source-prior",
+        revision: 0,
+        primaryVersionId: "audit-source",
+      },
+      actor,
+    );
+    expect(sourceReplay.affectedLibraryAlbumIds).toEqual(
+      sourceReplay.decision.affectedLibraryAlbumIds,
+    );
+    expect(sourceReplay.affectedLibraryAlbumIds).toEqual([sourceId]);
+
+    const undone = database.undoLibraryIdentityDecision(
+      targetId,
+      merged.decision.id,
+      "audit-merge-undo",
+      2,
+      actor,
+    );
+    expect(undone.affectedLibraryAlbumIds).toEqual(
+      expect.arrayContaining([sourceId, targetId]),
+    );
+    expect(database.getAlbumSummary(sourceId)).toEqual(
+      expect.objectContaining({
+        id: sourceId,
+        primaryVersionId: "audit-source",
+      }),
+    );
+    expect(database.getAlbumSummary(targetId)).toEqual(
+      expect.objectContaining({
+        id: targetId,
+        primaryVersionId: "audit-target",
+      }),
+    );
+    expect(
+      database.getAlbum(sourceId)?.localVersions.map((item) => item.id),
+    ).toEqual(["audit-source"]);
+    expect(
+      database.getAlbum(targetId)?.localVersions.map((item) => item.id),
+    ).toEqual(["audit-target"]);
+
+    database.replaceAlbumsForRoot("music", [
+      {
+        ...albumInput("split-history-a", []),
+        title: "Split History",
+        albumArtist: "Artist",
+      },
+      {
+        ...albumInput("split-history-b", []),
+        title: "Split History",
+        albumArtist: "Artist",
+      },
+    ]);
+    const splitParent = database.getAlbumSummary("split-history-a")!.id;
+    const parentDecision = database.applyLibraryIdentityDecision(
+      splitParent,
+      { type: "CONFIRM", requestId: "split-history-confirm", revision: 0 },
+      actor,
+    );
+    database.applyLibraryIdentityDecision(
+      splitParent,
+      {
+        type: "SPLIT",
+        requestId: "split-history-split",
+        revision: 1,
+        partitions: [
+          { versionIds: ["split-history-a"] },
+          { versionIds: ["split-history-b"] },
+        ],
+      },
+      actor,
+    );
+    const childId = database.getAlbumSummary("split-history-b")!.id;
+    expect(
+      database
+        .listLibraryIdentityDecisionHistory(childId)
+        .map((item) => item.id),
+    ).toContain(parentDecision.decision.id);
+  });
+
+  it("orders audit history by insertion causality and caps it at the latest 100 events", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    database.replaceAlbumsForRoot("music", [
+      {
+        ...albumInput("history-cap", []),
+        title: "History",
+        albumArtist: "Artist",
+      },
+    ]);
+    const groupId = database.getAlbumSummary("history-cap")!.id;
+    const ids: string[] = [];
+    for (let revision = 0; revision < 105; revision += 1) {
+      const result = database.applyLibraryIdentityDecision(
+        groupId,
+        {
+          type: "SET_PRIMARY",
+          requestId: `history-cap-${revision}`,
+          revision,
+          primaryVersionId: "history-cap",
+        },
+        { id: "admin", displayName: "Admin" },
+      );
+      ids.push(result.decision.id);
+    }
+    expect(
+      database
+        .listLibraryIdentityDecisionHistory(groupId)
+        .map((item) => item.id),
+    ).toEqual(ids.slice(-100).reverse());
   });
 
   it("allows separate USER groups for one identity while keeping one automatic group and unique group issues", () => {

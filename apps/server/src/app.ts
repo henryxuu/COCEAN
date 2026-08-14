@@ -20,12 +20,14 @@ import {
   coceanSettingsSchema,
   deviceCategorySchema,
   deviceOwnershipSchema,
+  libraryIdentityDecisionCommandSchema,
   physicalMediumSchema,
   scanFileOutcomeSchema,
   scanModeSchema,
+  undoLibraryIdentityDecisionCommandSchema,
   type ReleaseCandidate,
 } from "@cocean/contracts";
-import { CoceanDatabase } from "@cocean/database";
+import { CoceanDatabase, LibraryIdentityDecisionError } from "@cocean/database";
 import { parseRuntimeStillCatalog } from "@cocean/still-catalog";
 import { z } from "zod";
 import type { ServerConfig } from "./config.js";
@@ -381,7 +383,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       .send();
   });
 
-  const requireAdmin = (
+  const requireSession = (
     request: FastifyRequest,
     reply: FastifyReply,
   ): ReturnType<typeof readSession> => {
@@ -393,6 +395,15 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       });
       return null;
     }
+    return session;
+  };
+
+  const requireAdmin = (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): ReturnType<typeof readSession> => {
+    const session = requireSession(request, reply);
+    if (!session) return null;
     if (session.user.role !== "ADMIN") {
       reply.code(403).send({
         error: "ADMIN_REQUIRED",
@@ -754,6 +765,66 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         .send({ error: "ALBUM_NOT_FOUND", message: "没有找到这张专辑" });
     return album;
   });
+
+  app.get("/api/v1/albums/:id/identity-decisions", async (request, reply) => {
+    if (!requireSession(request, reply)) return;
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    if (!database.getAlbum(id))
+      return reply
+        .code(404)
+        .send({ error: "ALBUM_NOT_FOUND", message: "没有找到这张专辑" });
+    return { items: database.listLibraryIdentityDecisionHistory(id) };
+  });
+
+  app.post("/api/v1/albums/:id/identity-decisions", async (request, reply) => {
+    const admin = requireAdmin(request, reply);
+    if (!admin) return;
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const command = libraryIdentityDecisionCommandSchema.parse(
+      request.body ?? {},
+    );
+    try {
+      return database.applyLibraryIdentityDecision(id, command, {
+        id: admin.user.id,
+        displayName: admin.user.displayName,
+      });
+    } catch (error) {
+      if (error instanceof LibraryIdentityDecisionError)
+        return reply
+          .code(error.code === "INVALID_IDENTITY_DECISION" ? 400 : 409)
+          .send({ error: error.code, message: error.message });
+      throw error;
+    }
+  });
+
+  app.post(
+    "/api/v1/albums/:id/identity-decisions/:decisionId/undo",
+    async (request, reply) => {
+      const admin = requireAdmin(request, reply);
+      if (!admin) return;
+      const { id, decisionId } = z
+        .object({ id: z.string(), decisionId: z.string() })
+        .parse(request.params);
+      const command = undoLibraryIdentityDecisionCommandSchema.parse(
+        request.body ?? {},
+      );
+      try {
+        return database.undoLibraryIdentityDecision(
+          id,
+          decisionId,
+          command.requestId,
+          command.revision,
+          { id: admin.user.id, displayName: admin.user.displayName },
+        );
+      } catch (error) {
+        if (error instanceof LibraryIdentityDecisionError)
+          return reply
+            .code(error.code === "INVALID_IDENTITY_DECISION" ? 400 : 409)
+            .send({ error: error.code, message: error.message });
+        throw error;
+      }
+    },
+  );
 
   app.get("/api/v1/albums/:id/match-candidates", async (request, reply) => {
     const { id } = z.object({ id: z.string() }).parse(request.params);
