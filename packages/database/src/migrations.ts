@@ -887,4 +887,108 @@ export const migrations = [
         BEGIN SELECT RAISE(ABORT, 'library album current id conflicts with an alias'); END;
     `,
   },
+  {
+    version: 18,
+    name: "album_metadata_governance",
+    sql: `
+      ALTER TABLE library_albums ADD COLUMN metadata_revision INTEGER NOT NULL DEFAULT 0
+        CHECK(metadata_revision >= 0);
+      ALTER TABLE library_issues ADD COLUMN resolution_status TEXT NOT NULL DEFAULT 'PENDING'
+        CHECK(resolution_status IN ('PENDING','RESOLVED_BY_METADATA'));
+
+      CREATE TABLE library_metadata_values (
+        scope_type TEXT NOT NULL CHECK(scope_type IN ('ALBUM','VERSION')),
+        owner_id TEXT NOT NULL,
+        field_name TEXT NOT NULL CHECK(field_name IN (
+          'title','albumArtist','year','label','catalogNumber','barcode','country','releaseDate'
+        )),
+        source_type TEXT NOT NULL CHECK(source_type IN ('USER_OVERRIDE','CONFIRMED_EXTERNAL')),
+        value_json TEXT,
+        evidence_json TEXT NOT NULL DEFAULT '{}',
+        actor_id TEXT,
+        actor_display_name TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(scope_type, owner_id, field_name, source_type),
+        CHECK((scope_type='ALBUM' AND field_name IN ('title','albumArtist','year')) OR
+              (scope_type='VERSION' AND field_name IN ('label','catalogNumber','barcode','country','releaseDate')))
+      );
+      CREATE INDEX library_metadata_values_owner_idx
+        ON library_metadata_values(scope_type,owner_id,source_type,field_name);
+
+      CREATE TABLE library_metadata_events (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        library_album_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK(event_type IN ('UPDATE','CONFIRM_EXTERNAL','UNDO')),
+        actor_id TEXT NOT NULL,
+        actor_display_name TEXT NOT NULL,
+        expected_metadata_revision INTEGER NOT NULL CHECK(expected_metadata_revision >= 0),
+        resulting_metadata_revision INTEGER NOT NULL CHECK(resulting_metadata_revision >= 0),
+        input_json TEXT NOT NULL,
+        commands_json TEXT NOT NULL,
+        before_state_json TEXT NOT NULL,
+        after_state_json TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        compensates_event_id TEXT REFERENCES library_metadata_events(id),
+        created_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX library_metadata_events_compensation_idx
+        ON library_metadata_events(compensates_event_id)
+        WHERE compensates_event_id IS NOT NULL;
+      CREATE INDEX library_metadata_events_album_idx
+        ON library_metadata_events(library_album_id,created_at DESC,id DESC);
+      CREATE TABLE library_metadata_event_groups (
+        event_id TEXT NOT NULL REFERENCES library_metadata_events(id),
+        library_album_id TEXT NOT NULL,
+        PRIMARY KEY(event_id,library_album_id)
+      );
+      CREATE INDEX library_metadata_event_groups_album_idx
+        ON library_metadata_event_groups(library_album_id,event_id);
+      CREATE TRIGGER library_metadata_events_no_update BEFORE UPDATE ON library_metadata_events
+        BEGIN SELECT RAISE(ABORT, 'library metadata event ledger is append-only'); END;
+      CREATE TRIGGER library_metadata_events_no_delete BEFORE DELETE ON library_metadata_events
+        BEGIN SELECT RAISE(ABORT, 'library metadata event ledger is append-only'); END;
+      CREATE TRIGGER library_metadata_event_groups_no_update BEFORE UPDATE ON library_metadata_event_groups
+        BEGIN SELECT RAISE(ABORT, 'library metadata event group ledger is append-only'); END;
+      CREATE TRIGGER library_metadata_event_groups_no_delete BEFORE DELETE ON library_metadata_event_groups
+        BEGIN SELECT RAISE(ABORT, 'library metadata event group ledger is append-only'); END;
+
+      INSERT INTO library_metadata_values
+        (scope_type,owner_id,field_name,source_type,value_json,evidence_json,
+         actor_id,actor_display_name,created_at,updated_at)
+      SELECT 'VERSION',id,'label','CONFIRMED_EXTERNAL',json_quote(label),
+             json_object('provider','MUSICBRAINZ','candidateId',musicbrainz_release_id),
+             NULL,NULL,updated_at,updated_at
+      FROM albums WHERE match_status='USER_CONFIRMED' AND label IS NOT NULL;
+      INSERT INTO library_metadata_values
+        (scope_type,owner_id,field_name,source_type,value_json,evidence_json,
+         actor_id,actor_display_name,created_at,updated_at)
+      SELECT 'VERSION',id,'catalogNumber','CONFIRMED_EXTERNAL',json_quote(catalog_number),
+             json_object('provider','MUSICBRAINZ','candidateId',musicbrainz_release_id),
+             NULL,NULL,updated_at,updated_at
+      FROM albums WHERE match_status='USER_CONFIRMED' AND catalog_number IS NOT NULL;
+      INSERT INTO library_metadata_values
+        (scope_type,owner_id,field_name,source_type,value_json,evidence_json,
+         actor_id,actor_display_name,created_at,updated_at)
+      SELECT 'VERSION',id,'barcode','CONFIRMED_EXTERNAL',json_quote(barcode),
+             json_object('provider','MUSICBRAINZ','candidateId',musicbrainz_release_id),
+             NULL,NULL,updated_at,updated_at
+      FROM albums WHERE match_status='USER_CONFIRMED' AND barcode IS NOT NULL;
+      INSERT INTO library_metadata_values
+        (scope_type,owner_id,field_name,source_type,value_json,evidence_json,
+         actor_id,actor_display_name,created_at,updated_at)
+      SELECT 'VERSION',id,'country','CONFIRMED_EXTERNAL',json_quote(country),
+             json_object('provider','MUSICBRAINZ','candidateId',musicbrainz_release_id),
+             NULL,NULL,updated_at,updated_at
+      FROM albums WHERE match_status='USER_CONFIRMED' AND country IS NOT NULL;
+      INSERT INTO library_metadata_values
+        (scope_type,owner_id,field_name,source_type,value_json,evidence_json,
+         actor_id,actor_display_name,created_at,updated_at)
+      SELECT 'VERSION',id,'releaseDate','CONFIRMED_EXTERNAL',json_quote(release_date),
+             json_object('provider','MUSICBRAINZ','candidateId',musicbrainz_release_id),
+             NULL,NULL,updated_at,updated_at
+      FROM albums WHERE match_status='USER_CONFIRMED' AND release_date IS NOT NULL;
+    `,
+  },
 ] as const;

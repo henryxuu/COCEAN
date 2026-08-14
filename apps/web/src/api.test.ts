@@ -195,4 +195,46 @@ describe("web API client", () => {
     expect(requests[0]?.init?.method).toBe("POST");
     expect(JSON.parse(String(requests[0]?.init?.body))).toEqual(body);
   });
+
+  it("patches metadata and confirms candidates with exact revision and LocalVersion bindings", async () => {
+    const requests: Array<{ input: string; init: RequestInit | undefined }> =
+      [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        requests.push({ input: String(input), init });
+        return new Response(JSON.stringify({ metadata: {}, event: {} }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+    const metadataCommand = {
+      requestId: "metadata-one",
+      expectedMetadataRevision: 4,
+      commands: [
+        { action: "SET" as const, field: "title" as const, value: "标题" },
+        { action: "CLEAR" as const, field: "year" as const },
+      ],
+    };
+    await api.updateAlbumMetadata("album/a", metadataCommand);
+    await api.confirmMatchCandidate("album/a", "candidate/b", {
+      requestId: "candidate-one",
+      expectedMetadataRevision: 5,
+      localVersionId: "version-one",
+    });
+    expect(requests[0]?.input).toBe("/api/v1/albums/album%2Fa/metadata");
+    expect(requests[0]?.init?.method).toBe("PATCH");
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual(
+      metadataCommand,
+    );
+    expect(requests[1]?.input).toBe(
+      "/api/v1/albums/album%2Fa/match-candidates/candidate%2Fb/confirm",
+    );
+    expect(JSON.parse(String(requests[1]?.init?.body))).toEqual({
+      requestId: "candidate-one",
+      expectedMetadataRevision: 5,
+      localVersionId: "version-one",
+    });
+  });
 });

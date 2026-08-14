@@ -1,12 +1,16 @@
 import {
   formatFullAudioSpec,
   type AlbumDetail,
+  type AlbumMetadataEvent,
   type AlbumSummary,
   type DeliveryJob,
   type DeliveryTarget,
   type LibraryIdentityDecision,
   type LibraryIdentityDecisionCommand,
   type LocalVersionSummary,
+  type MetadataCommand,
+  type MetadataField,
+  type MetadataFieldState,
   type PhysicalMedium,
 } from "@cocean/contracts";
 import {
@@ -29,7 +33,7 @@ import {
   useParams,
   useSearchParams,
 } from "react-router-dom";
-import { api } from "../api.js";
+import { ApiError, api } from "../api.js";
 import {
   AlbumArtwork,
   AudioSpecBadge,
@@ -71,6 +75,7 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
   const deliveries = useAsync(() => api.albumDeliveries(id), [id]);
   const introduction = useAsync(() => api.albumIntroduction(id), [id]);
   const identityHistory = useAsync(() => api.identityDecisions(id), [id]);
+  const metadataHistory = useAsync(() => api.metadataHistory(id), [id]);
   const capabilities = useAsync(() => api.capabilities(), []);
   const [listeningTrackId, setListeningTrackId] = useState<string | null>(null);
   const [deliveryTargetId, setDeliveryTargetId] = useState("");
@@ -495,6 +500,23 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
           </small>
         </aside>
       </section>
+
+      {item.metadata ? (
+        <AlbumMetadataGovernance
+          metadata={item.metadata}
+          history={metadataHistory.data ?? []}
+          historyError={metadataHistory.error?.message ?? null}
+          canManage={canManage}
+          onReload={async () => {
+            const [latest] = await Promise.all([
+              album.reload(),
+              metadataHistory.reload(),
+            ]);
+            return latest !== null;
+          }}
+          onToast={toast.show}
+        />
+      ) : null}
 
       <div className="detail-grid">
         <section className="surface-card owned-versions">
@@ -929,6 +951,493 @@ function Fact({ label, value }: { label: string; value: string | null }) {
       <strong>{value ?? "待确认"}</strong>
     </div>
   );
+}
+
+const metadataLabels: Record<MetadataField, string> = {
+  title: "标题",
+  albumArtist: "专辑艺术家",
+  year: "年份",
+  label: "厂牌",
+  catalogNumber: "目录号",
+  barcode: "条码",
+  country: "国家",
+  releaseDate: "发行日期",
+};
+
+export function AlbumMetadataGovernance({
+  metadata,
+  history,
+  historyError,
+  canManage,
+  onReload,
+  onToast,
+}: {
+  metadata: NonNullable<AlbumDetail["metadata"]>;
+  history: AlbumMetadataEvent[];
+  historyError: string | null;
+  canManage: boolean;
+  onReload: () => Promise<boolean>;
+  onToast: (message: string) => void;
+}) {
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [touched, setTouched] = useState<Set<string>>(new Set());
+  const [cleared, setCleared] = useState<Set<string>>(new Set());
+  const [working, setWorking] = useState(false);
+  const [reloadBlocked, setReloadBlocked] = useState(false);
+  const previousAlbumId = useRef(metadata.libraryAlbumId);
+  const albumRows = (["title", "albumArtist", "year"] as const).map(
+    (field) => ({
+      key: field,
+      field,
+      versionId: undefined as string | undefined,
+      state: metadata.album[field],
+    }),
+  );
+  const versionRows = metadata.versions.flatMap((version) =>
+    (Object.keys(version.fields) as Array<keyof typeof version.fields>).map(
+      (field) => ({
+        key: `${version.versionId}:${field}`,
+        field,
+        versionId: version.versionId,
+        state: version.fields[field],
+      }),
+    ),
+  );
+  const rows = [...albumRows, ...versionRows];
+  useEffect(() => {
+    const changedAlbum = previousAlbumId.current !== metadata.libraryAlbumId;
+    previousAlbumId.current = metadata.libraryAlbumId;
+    const validKeys = new Set(rows.map((row) => row.key));
+    setReloadBlocked(false);
+    setTouched((current) =>
+      changedAlbum
+        ? new Set()
+        : new Set([...current].filter((key) => validKeys.has(key))),
+    );
+    setCleared((current) =>
+      changedAlbum
+        ? new Set()
+        : new Set([...current].filter((key) => validKeys.has(key))),
+    );
+    setDraft((current) => {
+      const next = changedAlbum ? {} : { ...current };
+      for (const row of rows)
+        if (changedAlbum || !touched.has(row.key))
+          next[row.key] = metadataDisplayValue(row.state.effectiveValue);
+      return next;
+    });
+  }, [metadata.libraryAlbumId, metadata.metadataRevision]);
+
+  const save = async () => {
+    let commands: MetadataCommand[];
+    try {
+      commands = buildMetadataCommands(rows, touched, cleared, draft);
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "字段值无效");
+      return;
+    }
+    if (!commands.length) return;
+    setWorking(true);
+    try {
+      await api.updateAlbumMetadata(metadata.libraryAlbumId, {
+        requestId: createBrowserUuid(),
+        expectedMetadataRevision: metadata.metadataRevision,
+        commands,
+      });
+      setTouched(new Set());
+      setCleared(new Set());
+      const reloaded = await onReload();
+      setReloadBlocked(!reloaded);
+      onToast(
+        reloaded
+          ? "元数据已保存；仅修改 COCEAN 数据库，扫描标签未改变"
+          : "元数据已保存，但最新详情加载失败；已暂停编辑，请刷新页面",
+      );
+    } catch (error) {
+      const reloaded = await onReload();
+      setReloadBlocked(!reloaded);
+      onToast(
+        error instanceof ApiError && error.status === 409
+          ? "元数据已变化，页面已刷新；未提交草稿仍保留"
+          : error instanceof Error
+            ? error.message
+            : "元数据保存失败",
+      );
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const reset = async (row: (typeof rows)[number]) => {
+    setWorking(true);
+    try {
+      await api.updateAlbumMetadata(metadata.libraryAlbumId, {
+        requestId: createBrowserUuid(),
+        expectedMetadataRevision: metadata.metadataRevision,
+        commands: [
+          {
+            action: "RESET",
+            field: row.field,
+            ...(row.versionId ? { versionId: row.versionId } : {}),
+          },
+        ],
+      });
+      setTouched((current) => {
+        const next = new Set(current);
+        next.delete(row.key);
+        return next;
+      });
+      setCleared((current) => {
+        const next = new Set(current);
+        next.delete(row.key);
+        return next;
+      });
+      const reloaded = await onReload();
+      setReloadBlocked(!reloaded);
+      onToast("已移除人工覆盖，恢复到下一层可信值");
+    } catch (error) {
+      const reloaded = await onReload();
+      setReloadBlocked(!reloaded);
+      onToast(error instanceof Error ? error.message : "恢复失败");
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const undo = async (event: AlbumMetadataEvent) => {
+    setWorking(true);
+    try {
+      await api.undoMetadataEvent(metadata.libraryAlbumId, event.id, {
+        requestId: createBrowserUuid(),
+        expectedMetadataRevision: metadata.metadataRevision,
+      });
+      const reloaded = await onReload();
+      setReloadBlocked(!reloaded);
+      onToast("元数据事件已撤销，并追加了补偿记录");
+    } catch (error) {
+      const reloaded = await onReload();
+      setReloadBlocked(!reloaded);
+      onToast(error instanceof Error ? error.message : "撤销失败");
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  return (
+    <section
+      className="surface-card metadata-governance"
+      aria-label="元数据治理"
+    >
+      <SectionTitle
+        title="元数据"
+        meta={`revision ${metadata.metadataRevision} · ${canManage ? "管理员可编辑" : "只读"}`}
+      />
+      <p className="quiet-row">
+        有效值按人工覆盖、外部确认、扫描标签、路径回退依次解析；操作仅修改
+        COCEAN 数据库，不改 NAS 文件。
+      </p>
+      <h3>唱片级字段</h3>
+      <div className="metadata-field-list">
+        {albumRows.map((row) => (
+          <MetadataFieldEditor
+            key={row.key}
+            label={metadataLabels[row.field]}
+            state={row.state}
+            value={draft[row.key] ?? ""}
+            canManage={canManage}
+            disabled={working || reloadBlocked}
+            allowClear={row.field === "year"}
+            error={
+              touched.has(row.key) && !cleared.has(row.key)
+                ? metadataDraftError(row.field, draft[row.key] ?? "")
+                : null
+            }
+            onChange={(value) => {
+              setDraft((current) => ({ ...current, [row.key]: value }));
+              setTouched((current) => new Set(current).add(row.key));
+              setCleared((current) => {
+                const next = new Set(current);
+                next.delete(row.key);
+                return next;
+              });
+            }}
+            onClear={() => {
+              setDraft((current) => ({ ...current, [row.key]: "" }));
+              setTouched((current) => new Set(current).add(row.key));
+              setCleared((current) => new Set(current).add(row.key));
+            }}
+            onReset={() => void reset(row)}
+          />
+        ))}
+      </div>
+      {metadata.versions.map((version) => (
+        <div key={version.versionId} className="metadata-version-group">
+          <h3>版本级字段 · {shortStableId(version.versionId)}</h3>
+          {versionRows
+            .filter((row) => row.versionId === version.versionId)
+            .map((row) => (
+              <MetadataFieldEditor
+                key={row.key}
+                label={metadataLabels[row.field]}
+                state={row.state}
+                value={draft[row.key] ?? ""}
+                canManage={canManage}
+                disabled={working || reloadBlocked}
+                allowClear
+                error={
+                  touched.has(row.key) && !cleared.has(row.key)
+                    ? metadataDraftError(row.field, draft[row.key] ?? "")
+                    : null
+                }
+                onChange={(value) => {
+                  setDraft((current) => ({ ...current, [row.key]: value }));
+                  setTouched((current) => new Set(current).add(row.key));
+                  setCleared((current) => {
+                    const next = new Set(current);
+                    next.delete(row.key);
+                    return next;
+                  });
+                }}
+                onClear={() => {
+                  setDraft((current) => ({ ...current, [row.key]: "" }));
+                  setTouched((current) => new Set(current).add(row.key));
+                  setCleared((current) => new Set(current).add(row.key));
+                }}
+                onReset={() => void reset(row)}
+              />
+            ))}
+        </div>
+      ))}
+      {canManage ? (
+        <Button
+          disabled={working || reloadBlocked || touched.size === 0}
+          onClick={() => void save()}
+        >
+          保存修改（{touched.size} 个字段）
+        </Button>
+      ) : (
+        <p className="identity-governance-readonly">
+          成员与 Demo 可以查看来源和历史；编辑、清空、恢复与撤销仅对管理员开放。
+        </p>
+      )}
+      <div className="metadata-history">
+        <h3>最近元数据历史</h3>
+        {historyError ? <p className="error-row">{historyError}</p> : null}
+        {history.map((event) => (
+          <div className="version-row" key={event.id}>
+            <Clock3 />
+            <div>
+              <strong>{metadataEventLabel(event.type)}</strong>
+              <span>
+                {event.actor.displayName} · {metadataEventCommands(event)} ·
+                revision {event.resultingMetadataRevision}
+              </span>
+              <small>{new Date(event.createdAt).toLocaleString()}</small>
+            </div>
+            {canManage && event.canUndo ? (
+              <Button
+                variant="quiet"
+                disabled={working}
+                onClick={() => void undo(event)}
+              >
+                撤销
+              </Button>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function MetadataFieldEditor({
+  label,
+  state,
+  value,
+  canManage,
+  disabled,
+  allowClear,
+  error,
+  onChange,
+  onClear,
+  onReset,
+}: {
+  label: string;
+  state: MetadataFieldState;
+  value: string;
+  canManage: boolean;
+  disabled: boolean;
+  allowClear: boolean;
+  error: string | null;
+  onChange: (value: string) => void;
+  onClear: () => void;
+  onReset: () => void;
+}) {
+  return (
+    <div className="metadata-field-row">
+      <label>
+        <span>{label}</span>
+        {canManage ? (
+          <input
+            disabled={disabled}
+            value={value}
+            onChange={(event) => onChange(event.target.value)}
+          />
+        ) : (
+          <strong>{metadataDisplayValue(state.effectiveValue) || "空"}</strong>
+        )}
+      </label>
+      <small>
+        来源：{metadataSourceLabel(state.effectiveSource)} · 观察值：
+        {metadataDisplayValue(state.observed.value) || "空"}
+      </small>
+      {state.confirmedExternal ? (
+        <small>
+          外部证据：{state.confirmedExternal.provider} · 候选{" "}
+          {state.confirmedExternal.candidateId} ·{" "}
+          {new Date(state.confirmedExternal.confirmedAt).toLocaleString()}
+        </small>
+      ) : null}
+      {state.userOverride ? (
+        <small>
+          人工覆盖：{state.userOverride.actor.displayName} ·{" "}
+          {new Date(state.userOverride.updatedAt).toLocaleString()}
+        </small>
+      ) : null}
+      {error ? <small className="error-row">{error}</small> : null}
+      {canManage ? (
+        <div>
+          {allowClear ? (
+            <Button variant="quiet" disabled={disabled} onClick={onClear}>
+              清空有效值
+            </Button>
+          ) : null}
+          <Button
+            variant="quiet"
+            disabled={disabled || !state.userOverride}
+            onClick={onReset}
+          >
+            移除人工覆盖 / 恢复下一层可信值
+          </Button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function metadataDisplayValue(value: unknown): string {
+  return value === null || value === undefined ? "" : String(value);
+}
+
+function metadataDraftError(
+  field: MetadataField,
+  value: string,
+): string | null {
+  const text = value.trim();
+  if (!text)
+    return `${metadataLabels[field]}不能设置为空白；需要空值时请使用“清空有效值”`;
+  if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u.test(text))
+    return `${metadataLabels[field]}不能包含控制字符`;
+  const maximum =
+    field === "catalogNumber" ? 100 : field === "barcode" ? 14 : 300;
+  if (text.length > maximum)
+    return `${metadataLabels[field]}不能超过 ${maximum} 个字符`;
+  if (field === "year") {
+    const year = Number(text);
+    if (
+      !Number.isInteger(year) ||
+      year < 1000 ||
+      year > new Date().getFullYear() + 1
+    )
+      return "年份必须是 1000 至下一年之间的整数";
+  }
+  if (field === "barcode" && !/^(?:\d{8}|\d{12}|\d{13}|\d{14})$/.test(text))
+    return "条码必须是 8、12、13 或 14 位数字";
+  if (field === "country" && !/^[A-Z]{2}$/.test(text))
+    return "国家必须是两位大写国家码";
+  if (field === "releaseDate" && !validMetadataDate(text))
+    return "发行日期必须是 YYYY、YYYY-MM 或有效的 YYYY-MM-DD";
+  return null;
+}
+
+export function buildMetadataCommands(
+  rows: Array<{
+    key: string;
+    field: MetadataField;
+    versionId?: string | undefined;
+  }>,
+  touched: Set<string>,
+  cleared: Set<string>,
+  draft: Record<string, string>,
+): MetadataCommand[] {
+  return rows
+    .filter((row) => touched.has(row.key))
+    .map((row) => {
+      const common = {
+        field: row.field,
+        ...(row.versionId ? { versionId: row.versionId } : {}),
+      };
+      if (cleared.has(row.key)) return { action: "CLEAR" as const, ...common };
+      const value = draft[row.key] ?? "";
+      const error = metadataDraftError(row.field, value);
+      if (error) throw new Error(error);
+      return {
+        action: "SET" as const,
+        ...common,
+        value: row.field === "year" ? Number(value) : value,
+      };
+    });
+}
+
+function metadataEventCommands(event: AlbumMetadataEvent): string {
+  return event.commands
+    .map((command) => {
+      const target = command.versionId
+        ? `${shortStableId(command.versionId)} / `
+        : "";
+      const value =
+        command.action === "SET" ? ` = ${String(command.value)}` : "";
+      return `${target}${metadataLabels[command.field]} ${command.action}${value}`;
+    })
+    .join("；");
+}
+
+function validMetadataDate(value: string): boolean {
+  if (/^\d{4}$/.test(value) || /^\d{4}-(?:0[1-9]|1[0-2])$/.test(value))
+    return true;
+  if (!/^\d{4}-(?:0[1-9]|1[0-2])-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split("-").map(Number) as [
+    number,
+    number,
+    number,
+  ];
+  const date = new Date(year, month - 1, day);
+  return (
+    date.getFullYear() === year &&
+    date.getMonth() === month - 1 &&
+    date.getDate() === day
+  );
+}
+
+function metadataSourceLabel(source: string): string {
+  return (
+    (
+      {
+        USER_OVERRIDE: "人工覆盖",
+        CONFIRMED_EXTERNAL: "已确认外部来源",
+        OBSERVED_TAG: "扫描标签",
+        PATH_FALLBACK: "路径回退",
+      } as Record<string, string>
+    )[source] ?? source
+  );
+}
+
+function metadataEventLabel(type: AlbumMetadataEvent["type"]): string {
+  return type === "UNDO"
+    ? "撤销补偿"
+    : type === "CONFIRM_EXTERNAL"
+      ? "确认外部候选"
+      : "字段修订";
 }
 function statusLabel(status: string) {
   return (

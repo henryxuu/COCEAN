@@ -21,6 +21,48 @@
   --radius-full: 999px;
 }
 
+.metadata-governance {
+  margin-top: 24px;
+}
+
+.metadata-field-list,
+.metadata-version-group,
+.metadata-history {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.metadata-field-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(220px, 1.5fr) auto;
+  gap: 12px;
+  align-items: end;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border-default);
+}
+
+.metadata-field-row label {
+  display: grid;
+  gap: 6px;
+}
+
+.metadata-field-row > small {
+  align-self: center;
+}
+
+.metadata-field-row > div {
+  display: flex;
+  gap: 6px;
+}
+
+@media (max-width: 760px) {
+  .metadata-field-row {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+}
+
 /* Functional account, scan and delivery surfaces */
 .sidebar-account {
   display: flex;

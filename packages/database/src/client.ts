@@ -6,6 +6,9 @@ import type {
   AlbumAggregationIssue,
   AlbumDetail,
   AlbumIntroduction,
+  AlbumMetadata,
+  AlbumMetadataEvent,
+  AlbumMetadataMutationResult,
   AlbumSummary,
   AuthSession,
   AuthUser,
@@ -19,6 +22,9 @@ import type {
   LibraryIdentityDecisionCommand,
   LibraryIdentityDecisionResult,
   LibraryStats,
+  MetadataCommand,
+  MetadataField,
+  MetadataFieldState,
   ModelConfiguration,
   ModelVerificationStatus,
   ObservedMediaFile,
@@ -33,6 +39,7 @@ import type {
   ScanReport,
   StillCatalogAlbum,
   StillRuntimeCatalog,
+  UpdateAlbumMetadataCommand,
 } from "@cocean/contracts";
 import {
   formatCompactAudioSpec,
@@ -116,6 +123,41 @@ export class LibraryIdentityDecisionError extends Error {
   }
 }
 
+export class AlbumMetadataDecisionError extends Error {
+  constructor(
+    public readonly code:
+      "INVALID_METADATA_DECISION" | "METADATA_DECISION_CONFLICT",
+    message: string,
+  ) {
+    super(message);
+    this.name = "AlbumMetadataDecisionError";
+  }
+}
+
+interface StoredMetadataValue {
+  scopeType: "ALBUM" | "VERSION";
+  ownerId: string;
+  fieldName: MetadataField;
+  sourceType: "USER_OVERRIDE" | "CONFIRMED_EXTERNAL";
+  valueJson: string | null;
+  evidenceJson: string;
+  actorId: string | null;
+  actorDisplayName: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface AlbumMetadataSnapshot {
+  libraryAlbumId: string;
+  memberVersionIds: string[];
+  values: StoredMetadataValue[];
+  releaseMatchStates?: Array<{
+    versionId: string;
+    matchStatus: AlbumSummary["matchStatus"];
+    musicBrainzReleaseId: string | null;
+  }>;
+}
+
 interface LibraryIdentitySnapshot {
   groups: Array<{
     id: string;
@@ -126,6 +168,7 @@ interface LibraryIdentitySnapshot {
     decisionSource: "AUTOMATIC" | "USER";
     primaryVersionSource: "AUTOMATIC" | "USER";
     revision: number;
+    metadataRevision: number;
     createdAt: string;
     updatedAt: string;
     members: Array<{
@@ -147,11 +190,13 @@ interface LibraryIdentitySnapshot {
     libraryAlbumId: string;
     createdAt: string;
   }>;
+  albumMetadataValues: StoredMetadataValue[];
 }
 
 interface AutomaticIdentityBaseline {
   members: Map<string, string[]>;
   primaryVersions: Map<string, string | null>;
+  metadataSignatures: Map<string, string>;
 }
 
 interface LibraryIdentityGovernanceState {
@@ -1539,9 +1584,9 @@ export class CoceanDatabase {
           WHEN albums.match_status IN ('SOURCE_MATCHED','USER_CONFIRMED') THEN albums.match_status
           ELSE excluded.match_status
         END,
-        label=COALESCE(albums.label, excluded.label),
-        catalog_number=COALESCE(albums.catalog_number, excluded.catalog_number),
-        barcode=COALESCE(albums.barcode, excluded.barcode),
+        label=excluded.label,
+        catalog_number=excluded.catalog_number,
+        barcode=excluded.barcode,
         musicbrainz_release_id=COALESCE(albums.musicbrainz_release_id, excluded.musicbrainz_release_id),
         updated_at=excluded.updated_at`,
     );
@@ -1613,7 +1658,16 @@ export class CoceanDatabase {
            AND NOT EXISTS (SELECT 1 FROM release_match_candidates WHERE release_match_candidates.album_id = albums.id)
            AND NOT EXISTS (SELECT 1 FROM delivery_records WHERE delivery_records.album_id = albums.id)
            AND NOT EXISTS (SELECT 1 FROM delivery_jobs WHERE delivery_jobs.album_id = albums.id)
-           AND NOT EXISTS (SELECT 1 FROM album_introductions WHERE album_introductions.album_id = albums.id)`,
+           AND NOT EXISTS (SELECT 1 FROM album_introductions WHERE album_introductions.album_id = albums.id)
+           AND NOT EXISTS (
+             SELECT 1 FROM library_metadata_values mv
+             WHERE mv.scope_type='VERSION' AND mv.owner_id=albums.id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM library_album_members lm
+             JOIN library_metadata_event_groups meg ON meg.library_album_id=lm.library_album_id
+             WHERE lm.album_id=albums.id
+           )`,
       )
       .run(rootId);
     this.raw
@@ -1944,9 +1998,7 @@ export class CoceanDatabase {
 
   private captureAutomaticIdentityBaseline(): AutomaticIdentityBaseline {
     const groups = this.raw
-      .prepare(
-        "SELECT id,primary_version_id FROM library_albums WHERE decision_source='AUTOMATIC'",
-      )
+      .prepare("SELECT id,primary_version_id FROM library_albums")
       .all() as Array<{ id: string; primary_version_id: string | null }>;
     return {
       members: new Map(
@@ -1957,6 +2009,12 @@ export class CoceanDatabase {
       ),
       primaryVersions: new Map(
         groups.map((group) => [group.id, group.primary_version_id]),
+      ),
+      metadataSignatures: new Map(
+        groups.map((group) => [
+          group.id,
+          this.albumMetadataEffectiveSignature(group.id),
+        ]),
       ),
     };
   }
@@ -1976,7 +2034,11 @@ export class CoceanDatabase {
     const protectedGroups = this.raw
       .prepare(
         `SELECT * FROM library_albums
-         WHERE decision_source='USER' OR primary_version_source='USER'`,
+         WHERE decision_source='USER' OR primary_version_source='USER'
+            OR EXISTS (SELECT 1 FROM library_metadata_values mv
+                       WHERE mv.scope_type='ALBUM' AND mv.owner_id=library_albums.id)
+            OR EXISTS (SELECT 1 FROM library_metadata_event_groups meg
+                       WHERE meg.library_album_id=library_albums.id)`,
       )
       .all() as Record<string, unknown>[];
     const protectedGroupIds = new Set(
@@ -1990,6 +2052,10 @@ export class CoceanDatabase {
              WHERE library_album_id IN (
                SELECT id FROM library_albums
                WHERE decision_source='USER' OR primary_version_source='USER'
+                  OR EXISTS (SELECT 1 FROM library_metadata_values mv
+                             WHERE mv.scope_type='ALBUM' AND mv.owner_id=library_albums.id)
+                  OR EXISTS (SELECT 1 FROM library_metadata_event_groups meg
+                             WHERE meg.library_album_id=library_albums.id)
              )`,
           )
           .all() as Array<{ album_id: string }>
@@ -2028,7 +2094,12 @@ export class CoceanDatabase {
         `DELETE FROM library_album_members
          WHERE relationship_status='AUTO_CANDIDATE'
            AND library_album_id NOT IN (
-             SELECT id FROM library_albums WHERE primary_version_source='USER'
+             SELECT id FROM library_albums
+             WHERE primary_version_source='USER' OR decision_source='USER'
+                OR EXISTS (SELECT 1 FROM library_metadata_values mv
+                           WHERE mv.scope_type='ALBUM' AND mv.owner_id=library_albums.id)
+                OR EXISTS (SELECT 1 FROM library_metadata_event_groups meg
+                           WHERE meg.library_album_id=library_albums.id)
            )`,
       )
       .run();
@@ -2098,6 +2169,11 @@ export class CoceanDatabase {
           );
       for (const member of members) addMember.run(groupId, member.id, now, now);
       this.rebuildLibraryIssuesForGroup(groupId, members, true, now);
+      this.bumpMetadataRevisionForEffectiveChange(
+        groupId,
+        baseline.metadataSignatures.get(groupId),
+        now,
+      );
     }
     for (const group of protectedGroups) {
       const groupId = String(group.id);
@@ -2125,6 +2201,11 @@ export class CoceanDatabase {
         groupId,
         members,
         group.decision_source === "AUTOMATIC" && members.length > 1,
+        now,
+      );
+      this.bumpMetadataRevisionForEffectiveChange(
+        groupId,
+        baseline.metadataSignatures.get(groupId),
         now,
       );
     }
@@ -2156,6 +2237,50 @@ export class CoceanDatabase {
         .get(id, id);
       if (!collision) return id;
     }
+  }
+
+  private albumMetadataEffectiveSignature(libraryAlbumId: string): string {
+    const metadata = this.getAlbumMetadata(libraryAlbumId);
+    if (!metadata) return "";
+    return JSON.stringify({
+      title: [
+        metadata.album.title.effectiveSource,
+        metadata.album.title.effectiveValue,
+      ],
+      albumArtist: [
+        metadata.album.albumArtist.effectiveSource,
+        metadata.album.albumArtist.effectiveValue,
+      ],
+      year: [
+        metadata.album.year.effectiveSource,
+        metadata.album.year.effectiveValue,
+      ],
+      versions: metadata.versions.map((version) => ({
+        versionId: version.versionId,
+        fields: Object.fromEntries(
+          Object.entries(version.fields).map(([field, value]) => [
+            field,
+            [value.effectiveSource, value.effectiveValue],
+          ]),
+        ),
+      })),
+    });
+  }
+
+  private bumpMetadataRevisionForEffectiveChange(
+    libraryAlbumId: string,
+    previousSignature: string | undefined,
+    now: string,
+  ): void {
+    if (
+      previousSignature !== undefined &&
+      previousSignature !== this.albumMetadataEffectiveSignature(libraryAlbumId)
+    )
+      this.raw
+        .prepare(
+          "UPDATE library_albums SET metadata_revision=metadata_revision+1,updated_at=? WHERE id=?",
+        )
+        .run(now, libraryAlbumId);
   }
 
   private rebuildLibraryIssuesForGroup(
@@ -2244,6 +2369,7 @@ export class CoceanDatabase {
       if (this.versionUsesFallbackIdentity(memberId))
         insertIssue(memberId, "MISSING_IDENTITY", { fallback: true });
     }
+    this.refreshMetadataIssueStatus(groupId);
   }
 
   private versionUsesFallbackIdentity(albumId: string): boolean {
@@ -2289,11 +2415,14 @@ export class CoceanDatabase {
       const source = this.libraryIdentityGroup(sourceId);
       this.assertIdentityRevision(source, command.revision);
       const now = new Date().toISOString();
+      const sourceMetadataSignature =
+        this.albumMetadataEffectiveSignature(sourceId);
       let scope = [sourceId];
       let before = this.captureLibraryIdentitySnapshot(scope);
       let currentLibraryAlbumId = sourceId;
       let inheritedDecisionIds: string[] = [];
       let inheritedHistoryTargets: string[] = [];
+      let mergeTargetMetadataSignature: string | null = null;
 
       if (command.type === "CONFIRM") {
         if (command.primaryVersionId)
@@ -2343,6 +2472,8 @@ export class CoceanDatabase {
           );
         const target = this.libraryIdentityGroup(targetId);
         this.assertIdentityRevision(target, command.targetRevision);
+        mergeTargetMetadataSignature =
+          this.albumMetadataEffectiveSignature(targetId);
         const mergedVersionIds = this.libraryIdentityMemberIds([
           sourceId,
           targetId,
@@ -2370,6 +2501,7 @@ export class CoceanDatabase {
           );
         scope = [sourceId, targetId];
         before = this.captureLibraryIdentitySnapshot(scope);
+        this.mergeAlbumMetadataOwnership(sourceId, targetId, now);
         inheritedDecisionIds =
           this.libraryIdentityDecisionIdsForGroup(sourceId);
         inheritedHistoryTargets = [targetId];
@@ -2537,6 +2669,28 @@ export class CoceanDatabase {
         }
         scope = [...new Set([...scope, ...createdIds])];
         inheritedHistoryTargets = createdIds.filter((id) => id !== sourceId);
+        this.inheritSplitAlbumMetadata(
+          sourceId,
+          createdIds.filter((id) => id !== sourceId),
+          now,
+        );
+      }
+
+      if (command.type === "SET_PRIMARY" || command.type === "SPLIT") {
+        this.bumpMetadataRevisionForEffectiveChange(
+          sourceId,
+          sourceMetadataSignature,
+          now,
+        );
+        this.refreshMetadataIssueStatus(sourceId);
+      }
+      if (command.type === "MERGE" && mergeTargetMetadataSignature !== null) {
+        this.bumpMetadataRevisionForEffectiveChange(
+          currentLibraryAlbumId,
+          mergeTargetMetadataSignature,
+          now,
+        );
+        this.refreshMetadataIssueStatus(currentLibraryAlbumId);
       }
 
       const after = this.captureLibraryIdentitySnapshot(scope);
@@ -2563,6 +2717,127 @@ export class CoceanDatabase {
       });
       return result;
     })();
+  }
+
+  private mergeAlbumMetadataOwnership(
+    sourceId: string,
+    targetId: string,
+    now: string,
+  ): void {
+    const rows = this.raw
+      .prepare(
+        `SELECT * FROM library_metadata_values
+         WHERE scope_type='ALBUM' AND owner_id IN (?,?)
+         ORDER BY field_name,source_type,owner_id`,
+      )
+      .all(sourceId, targetId) as Record<string, unknown>[];
+    const sourceRows = rows.filter((row) => row.owner_id === sourceId);
+    const targetRows = rows.filter((row) => row.owner_id === targetId);
+    for (const source of sourceRows) {
+      const target = targetRows.find(
+        (row) =>
+          row.field_name === source.field_name &&
+          row.source_type === source.source_type,
+      );
+      if (target && target.value_json !== source.value_json)
+        throw new LibraryIdentityDecisionError(
+          "IDENTITY_DECISION_CONFLICT",
+          `合并唱片的 ${String(source.field_name)} 人工或外部确认值冲突，请先处理字段冲突`,
+        );
+    }
+    this.raw
+      .prepare(
+        `INSERT OR IGNORE INTO library_metadata_values
+         (scope_type,owner_id,field_name,source_type,value_json,evidence_json,
+          actor_id,actor_display_name,created_at,updated_at)
+         SELECT scope_type,?,field_name,source_type,value_json,evidence_json,
+                actor_id,actor_display_name,created_at,updated_at
+         FROM library_metadata_values WHERE scope_type='ALBUM' AND owner_id=?`,
+      )
+      .run(targetId, sourceId);
+    this.raw
+      .prepare(
+        "DELETE FROM library_metadata_values WHERE scope_type='ALBUM' AND owner_id=?",
+      )
+      .run(sourceId);
+    this.raw
+      .prepare(
+        `INSERT OR IGNORE INTO library_metadata_event_groups(event_id,library_album_id)
+         SELECT event_id,? FROM library_metadata_event_groups WHERE library_album_id=?`,
+      )
+      .run(targetId, sourceId);
+  }
+
+  private inheritSplitAlbumMetadata(
+    sourceId: string,
+    createdIds: string[],
+    now: string,
+  ): void {
+    const external = this.raw
+      .prepare(
+        `SELECT * FROM library_metadata_values
+         WHERE scope_type='ALBUM' AND owner_id=? AND source_type='CONFIRMED_EXTERNAL'`,
+      )
+      .all(sourceId) as Record<string, unknown>[];
+    for (const createdId of createdIds) {
+      const metadata = this.getAlbumMetadata(createdId);
+      if (!metadata) continue;
+      const before = this.albumMetadataEffectiveSignature(createdId);
+      const memberIds = new Set(
+        metadata.versions.map((version) => version.versionId),
+      );
+      for (const row of external) {
+        const evidence = parseJson<Record<string, unknown>>(
+          row.evidence_json,
+          {},
+        );
+        if (!memberIds.has(String(evidence.localVersionId ?? ""))) continue;
+        this.raw
+          .prepare(
+            `INSERT INTO library_metadata_values
+             (scope_type,owner_id,field_name,source_type,value_json,evidence_json,
+              actor_id,actor_display_name,created_at,updated_at)
+             VALUES ('ALBUM',?,?, 'CONFIRMED_EXTERNAL',?,?,?,?,?,?)`,
+          )
+          .run(
+            createdId,
+            row.field_name,
+            row.value_json,
+            row.evidence_json,
+            row.actor_id,
+            row.actor_display_name,
+            row.created_at,
+            row.updated_at,
+          );
+      }
+      const events = this.raw
+        .prepare(
+          `SELECT e.id,e.input_json,e.commands_json FROM library_metadata_events e
+           JOIN library_metadata_event_groups g ON g.event_id=e.id
+           WHERE g.library_album_id=? ORDER BY e.rowid`,
+        )
+        .all(sourceId) as Record<string, unknown>[];
+      const associate = this.raw.prepare(
+        `INSERT OR IGNORE INTO library_metadata_event_groups(event_id,library_album_id)
+         VALUES (?,?)`,
+      );
+      for (const event of events) {
+        const commands = parseJson<MetadataCommand[]>(event.commands_json, []);
+        const input = parseJson<{
+          commands?: Array<{ localVersionId?: string }>;
+        }>(event.input_json, {});
+        const applies =
+          commands.some(
+            (command) => command.versionId && memberIds.has(command.versionId),
+          ) ||
+          input.commands?.some(
+            (item) => item.localVersionId && memberIds.has(item.localVersionId),
+          );
+        if (applies) associate.run(event.id, createdId);
+      }
+      this.bumpMetadataRevisionForEffectiveChange(createdId, before, now);
+      this.refreshMetadataIssueStatus(createdId);
+    }
   }
 
   listLibraryIdentityDecisionHistory(
@@ -2648,7 +2923,7 @@ export class CoceanDatabase {
         );
       const expectedAfter = parseJson<LibraryIdentitySnapshot>(
         row.after_state_json,
-        { groups: [], aliases: [] },
+        { groups: [], aliases: [], albumMetadataValues: [] },
       );
       const beforeUndo = this.captureLibraryIdentitySnapshot(scope);
       if (!sameLibraryIdentityGovernance(beforeUndo, expectedAfter))
@@ -2658,7 +2933,7 @@ export class CoceanDatabase {
         );
       const restore = parseJson<LibraryIdentitySnapshot>(
         row.before_state_json,
-        { groups: [], aliases: [] },
+        { groups: [], aliases: [], albumMetadataValues: [] },
       );
       const now = new Date().toISOString();
       const nextRevision =
@@ -2673,6 +2948,7 @@ export class CoceanDatabase {
         nextRevision,
         now,
         beforeUndo,
+        expectedAfter,
       );
       const restoredFallbackId =
         this.resolveLibraryAlbumId(albumId) ?? restore.groups[0]?.id ?? null;
@@ -2831,7 +3107,8 @@ export class CoceanDatabase {
   private captureLibraryIdentitySnapshot(
     scope: string[],
   ): LibraryIdentitySnapshot {
-    if (!scope.length) return { groups: [], aliases: [] };
+    if (!scope.length)
+      return { groups: [], aliases: [], albumMetadataValues: [] };
     const placeholders = scope.map(() => "?").join(",");
     const groupRows = this.raw
       .prepare(
@@ -2881,6 +3158,7 @@ export class CoceanDatabase {
         primaryVersionSource: row.primary_version_source as
           "AUTOMATIC" | "USER",
         revision: Number(row.revision),
+        metadataRevision: Number(row.metadata_revision ?? 0),
         createdAt: String(row.created_at),
         updatedAt: String(row.updated_at),
         members,
@@ -2903,7 +3181,18 @@ export class CoceanDatabase {
       libraryAlbumId: String(alias.library_album_id),
       createdAt: String(alias.created_at),
     }));
-    return { groups, aliases };
+    const albumMetadataValues = groupIds.length
+      ? (
+          this.raw
+            .prepare(
+              `SELECT * FROM library_metadata_values
+               WHERE scope_type='ALBUM' AND owner_id IN (${groupIds.map(() => "?").join(",")})
+               ORDER BY owner_id,field_name,source_type`,
+            )
+            .all(...groupIds) as Record<string, unknown>[]
+        ).map(mapStoredMetadataValue)
+      : [];
+    return { groups, aliases, albumMetadataValues };
   }
 
   private restoreLibraryIdentitySnapshot(
@@ -2912,6 +3201,7 @@ export class CoceanDatabase {
     revision: number,
     now: string,
     currentFacts: LibraryIdentitySnapshot,
+    expectedAfter: LibraryIdentitySnapshot,
   ): void {
     const current = this.captureLibraryIdentitySnapshot(scope);
     const groupIds = current.groups.map((group) => group.id);
@@ -2942,8 +3232,8 @@ export class CoceanDatabase {
         .prepare(
           `INSERT INTO library_albums
              (id,identity_key,title,album_artist,primary_version_id,decision_source,
-              primary_version_source,revision,created_at,updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?)`,
+              primary_version_source,revision,metadata_revision,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
         )
         .run(
           group.id,
@@ -2954,6 +3244,10 @@ export class CoceanDatabase {
           group.decisionSource,
           group.primaryVersionSource,
           revision,
+          Math.max(
+            currentGroup?.metadataRevision ?? group.metadataRevision,
+            group.metadataRevision,
+          ),
           currentGroup?.createdAt ?? group.createdAt,
           now,
         );
@@ -3051,6 +3345,147 @@ export class CoceanDatabase {
            VALUES (?,?,?)`,
         )
         .run(alias.aliasId, alias.libraryAlbumId, alias.createdAt);
+    this.reconcileAlbumMetadataAfterIdentityUndo(
+      snapshot,
+      expectedAfter,
+      currentFacts,
+      now,
+    );
+  }
+
+  private reconcileAlbumMetadataAfterIdentityUndo(
+    restore: LibraryIdentitySnapshot,
+    expectedAfter: LibraryIdentitySnapshot,
+    current: LibraryIdentitySnapshot,
+    now: string,
+  ): void {
+    const restoredIds = new Set(restore.groups.map((group) => group.id));
+    const key = (value: StoredMetadataValue) =>
+      `${value.ownerId}\0${value.fieldName}\0${value.sourceType}`;
+    const same = (left: StoredMetadataValue, right: StoredMetadataValue) =>
+      left.valueJson === right.valueJson &&
+      left.evidenceJson === right.evidenceJson &&
+      left.actorId === right.actorId &&
+      left.actorDisplayName === right.actorDisplayName &&
+      left.updatedAt === right.updatedAt;
+    const expected = new Map(
+      (expectedAfter.albumMetadataValues ?? []).map((value) => [
+        key(value),
+        value,
+      ]),
+    );
+    const preserved = (current.albumMetadataValues ?? []).filter((value) => {
+      const prior = expected.get(key(value));
+      return !prior || !same(value, prior);
+    });
+    const final = new Map(
+      (restore.albumMetadataValues ?? []).map((value) => [key(value), value]),
+    );
+    const currentKeys = new Set(
+      (current.albumMetadataValues ?? []).map((value) => key(value)),
+    );
+    for (const removed of expected.values()) {
+      if (currentKeys.has(key(removed))) continue;
+      for (const [candidateKey, candidate] of final)
+        if (
+          candidate.fieldName === removed.fieldName &&
+          candidate.sourceType === removed.sourceType
+        )
+          final.delete(candidateKey);
+    }
+    for (const value of preserved) {
+      let next = value;
+      if (!restoredIds.has(value.ownerId)) {
+        if (restoredIds.size !== 1)
+          throw new LibraryIdentityDecisionError(
+            "IDENTITY_DECISION_CONFLICT",
+            "身份撤销后无法确定后续元数据事件的归属",
+          );
+        const ownerId = [...restoredIds][0]!;
+        next = { ...value, ownerId };
+        const collision = final.get(key(next));
+        if (collision && !same(collision, next))
+          throw new LibraryIdentityDecisionError(
+            "IDENTITY_DECISION_CONFLICT",
+            "身份撤销会造成后续元数据字段冲突",
+          );
+        this.raw
+          .prepare(
+            `INSERT OR IGNORE INTO library_metadata_event_groups(event_id,library_album_id)
+             SELECT event_id,? FROM library_metadata_event_groups WHERE library_album_id=?`,
+          )
+          .run(ownerId, value.ownerId);
+      }
+      final.set(key(next), next);
+    }
+    const owners = [
+      ...new Set([
+        ...(restore.albumMetadataValues ?? []).map((value) => value.ownerId),
+        ...(expectedAfter.albumMetadataValues ?? []).map(
+          (value) => value.ownerId,
+        ),
+        ...(current.albumMetadataValues ?? []).map((value) => value.ownerId),
+      ]),
+    ];
+    if (owners.length)
+      this.raw
+        .prepare(
+          `DELETE FROM library_metadata_values
+           WHERE scope_type='ALBUM' AND owner_id IN (${owners.map(() => "?").join(",")})`,
+        )
+        .run(...owners);
+    const insert = this.raw.prepare(
+      `INSERT INTO library_metadata_values
+       (scope_type,owner_id,field_name,source_type,value_json,evidence_json,
+        actor_id,actor_display_name,created_at,updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    );
+    for (const value of final.values())
+      insert.run(
+        value.scopeType,
+        value.ownerId,
+        value.fieldName,
+        value.sourceType,
+        value.valueJson,
+        value.evidenceJson,
+        value.actorId,
+        value.actorDisplayName,
+        value.createdAt,
+        value.updatedAt,
+      );
+    for (const groupId of restoredIds) {
+      this.raw
+        .prepare(
+          "UPDATE library_albums SET metadata_revision=metadata_revision+1,updated_at=? WHERE id=?",
+        )
+        .run(now, groupId);
+      this.refreshMetadataIssueStatus(groupId);
+      const members = new Set(this.libraryIdentityMemberIds([groupId]));
+      const events = this.raw
+        .prepare(
+          "SELECT id,input_json,commands_json FROM library_metadata_events ORDER BY rowid",
+        )
+        .all() as Record<string, unknown>[];
+      const associate = this.raw.prepare(
+        `INSERT OR IGNORE INTO library_metadata_event_groups(event_id,library_album_id)
+         VALUES (?,?)`,
+      );
+      for (const event of events) {
+        const commands = parseJson<MetadataCommand[]>(event.commands_json, []);
+        const input = parseJson<{
+          commands?: Array<{ localVersionId?: string }>;
+        }>(event.input_json, {});
+        if (
+          commands.some(
+            (command) => command.versionId && members.has(command.versionId),
+          ) ||
+          input.commands?.some(
+            (item) => item.localVersionId && members.has(item.localVersionId),
+          )
+        )
+          associate.run(event.id, groupId);
+      }
+    }
   }
 
   private recordLibraryIdentityDecision(input: {
@@ -3169,7 +3604,7 @@ export class CoceanDatabase {
     if (!compensated && row.decision_type !== "UNDO") {
       const expected = parseJson<LibraryIdentitySnapshot>(
         row.after_state_json,
-        { groups: [], aliases: [] },
+        { groups: [], aliases: [], albumMetadataValues: [] },
       );
       canUndo = sameLibraryIdentityGovernance(
         this.captureLibraryIdentitySnapshot(affectedLibraryAlbumIds),
@@ -3200,6 +3635,688 @@ export class CoceanDatabase {
     };
   }
 
+  getAlbumMetadata(albumId: string): AlbumMetadata | null {
+    const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+    if (!libraryAlbumId) return null;
+    const group = this.raw
+      .prepare(
+        "SELECT primary_version_id,metadata_revision FROM library_albums WHERE id=?",
+      )
+      .get(libraryAlbumId) as
+      { primary_version_id: string; metadata_revision: number } | undefined;
+    if (!group?.primary_version_id) return null;
+    const versionIds = this.libraryIdentityMemberIds([libraryAlbumId]);
+    const versions = this.raw
+      .prepare(
+        `SELECT a.id,a.title,a.album_artist,a.year,a.label,a.catalog_number,a.barcode,
+                NULL AS observed_country,
+                (SELECT MIN(NULLIF(trim(mf.date_text),''))
+                 FROM album_files af JOIN media_files mf ON mf.id=af.media_file_id
+                 WHERE af.album_id=a.id AND af.is_primary=1) AS observed_release_date
+         FROM albums a WHERE a.id IN (${versionIds.map(() => "?").join(",")}) ORDER BY a.id`,
+      )
+      .all(...versionIds) as Record<string, unknown>[];
+    const primary = versions.find(
+      (version) => String(version.id) === group.primary_version_id,
+    );
+    if (!primary) return null;
+    const stored = this.metadataValuesFor(libraryAlbumId, versionIds);
+    const state = (
+      scopeType: "ALBUM" | "VERSION",
+      ownerId: string,
+      fieldName: MetadataField,
+      observedValue: string | number | null,
+      observedSource: "OBSERVED_TAG" | "PATH_FALLBACK",
+      versionId: string,
+    ): MetadataFieldState => {
+      const rows = stored.filter(
+        (row) =>
+          row.scopeType === scopeType &&
+          row.ownerId === ownerId &&
+          row.fieldName === fieldName,
+      );
+      const external = rows.find(
+        (row) => row.sourceType === "CONFIRMED_EXTERNAL",
+      );
+      const override = rows.find((row) => row.sourceType === "USER_OVERRIDE");
+      const externalEvidence = external
+        ? parseJson<Record<string, unknown>>(external.evidenceJson, {})
+        : {};
+      const externalValue = external
+        ? parseMetadataJson(external.valueJson)
+        : null;
+      const overrideValue = override
+        ? parseMetadataJson(override.valueJson)
+        : null;
+      return {
+        observed: {
+          value: observedValue,
+          source: observedSource,
+          versionId,
+        },
+        confirmedExternal: external
+          ? {
+              value: externalValue,
+              provider: String(externalEvidence.provider ?? "UNKNOWN"),
+              candidateId: String(externalEvidence.candidateId ?? ""),
+              confirmedAt: external.updatedAt,
+            }
+          : null,
+        userOverride: override
+          ? {
+              value: overrideValue,
+              actor: {
+                id: override.actorId ?? "system",
+                displayName: override.actorDisplayName ?? "系统迁移",
+              },
+              updatedAt: override.updatedAt,
+            }
+          : null,
+        effectiveValue: override
+          ? overrideValue
+          : external
+            ? externalValue
+            : observedValue,
+        effectiveSource: override
+          ? "USER_OVERRIDE"
+          : external
+            ? "CONFIRMED_EXTERNAL"
+            : observedSource,
+      };
+    };
+    const albumObservedSource = (field: "title" | "albumArtist" | "year") =>
+      field === "year"
+        ? ("OBSERVED_TAG" as const)
+        : this.observedIdentitySource(group.primary_version_id, field);
+    return {
+      libraryAlbumId,
+      metadataRevision: Number(group.metadata_revision),
+      album: {
+        title: state(
+          "ALBUM",
+          libraryAlbumId,
+          "title",
+          String(primary.title),
+          albumObservedSource("title"),
+          group.primary_version_id,
+        ),
+        albumArtist: state(
+          "ALBUM",
+          libraryAlbumId,
+          "albumArtist",
+          String(primary.album_artist),
+          albumObservedSource("albumArtist"),
+          group.primary_version_id,
+        ),
+        year: state(
+          "ALBUM",
+          libraryAlbumId,
+          "year",
+          nullableNumber(primary.year),
+          albumObservedSource("year"),
+          group.primary_version_id,
+        ),
+      },
+      versions: versions.map((version) => {
+        const versionId = String(version.id);
+        const versionState = (
+          field: MetadataField,
+          column: keyof typeof version,
+        ) =>
+          state(
+            "VERSION",
+            versionId,
+            field,
+            nullableString(version[column]),
+            "OBSERVED_TAG",
+            versionId,
+          );
+        return {
+          versionId,
+          fields: {
+            label: versionState("label", "label"),
+            catalogNumber: versionState("catalogNumber", "catalog_number"),
+            barcode: versionState("barcode", "barcode"),
+            country: versionState("country", "observed_country"),
+            releaseDate: versionState("releaseDate", "observed_release_date"),
+          },
+        };
+      }),
+      observedIssues: this.listLibraryIssues(libraryAlbumId, undefined, true),
+    };
+  }
+
+  applyAlbumMetadata(
+    albumId: string,
+    command: UpdateAlbumMetadataCommand,
+    actor: LibraryIdentityActor,
+  ): AlbumMetadataMutationResult {
+    return this.raw.transaction(() => {
+      const inputJson = canonicalMetadataInput(
+        albumId,
+        command.expectedMetadataRevision,
+        command.commands,
+      );
+      const replay = this.metadataResultByRequestId(
+        command.requestId,
+        inputJson,
+      );
+      if (replay) return replay;
+      const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+      if (!libraryAlbumId)
+        throw new AlbumMetadataDecisionError(
+          "METADATA_DECISION_CONFLICT",
+          "唱片已经不存在或无法解析",
+        );
+      const normalized = this.normalizeMetadataCommands(
+        libraryAlbumId,
+        command.commands,
+      );
+      this.assertMetadataRevision(
+        libraryAlbumId,
+        command.expectedMetadataRevision,
+      );
+      const before = this.captureAlbumMetadataSnapshot(libraryAlbumId);
+      const now = new Date().toISOString();
+      for (const item of normalized) {
+        const scopeType = isAlbumMetadataField(item.field)
+          ? "ALBUM"
+          : "VERSION";
+        const ownerId =
+          scopeType === "ALBUM" ? libraryAlbumId : item.versionId!;
+        if (item.action === "RESET") {
+          this.raw
+            .prepare(
+              `DELETE FROM library_metadata_values
+               WHERE scope_type=? AND owner_id=? AND field_name=? AND source_type='USER_OVERRIDE'`,
+            )
+            .run(scopeType, ownerId, item.field);
+        } else {
+          this.raw
+            .prepare(
+              `INSERT INTO library_metadata_values
+                 (scope_type,owner_id,field_name,source_type,value_json,evidence_json,
+                  actor_id,actor_display_name,created_at,updated_at)
+               VALUES (?,?,?,'USER_OVERRIDE',?,'{}',?,?,?,?)
+               ON CONFLICT(scope_type,owner_id,field_name,source_type) DO UPDATE SET
+                 value_json=excluded.value_json,actor_id=excluded.actor_id,
+                 actor_display_name=excluded.actor_display_name,updated_at=excluded.updated_at`,
+            )
+            .run(
+              scopeType,
+              ownerId,
+              item.field,
+              item.action === "CLEAR" ? null : JSON.stringify(item.value),
+              actor.id,
+              actor.displayName,
+              now,
+              now,
+            );
+        }
+      }
+      this.raw
+        .prepare(
+          "UPDATE library_albums SET metadata_revision=metadata_revision+1,updated_at=? WHERE id=?",
+        )
+        .run(now, libraryAlbumId);
+      this.refreshMetadataIssueStatus(libraryAlbumId);
+      const after = this.captureAlbumMetadataSnapshot(libraryAlbumId);
+      return this.recordAlbumMetadataEvent({
+        requestId: command.requestId,
+        inputJson,
+        libraryAlbumId,
+        type: "UPDATE",
+        actor,
+        expectedMetadataRevision: command.expectedMetadataRevision,
+        commands: normalized,
+        before,
+        after,
+        compensatesEventId: null,
+        createdAt: now,
+      });
+    })();
+  }
+
+  listAlbumMetadataHistory(albumId: string): AlbumMetadataEvent[] {
+    const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+    if (!libraryAlbumId) return [];
+    return (
+      this.raw
+        .prepare(
+          `SELECT * FROM library_metadata_events
+           WHERE EXISTS (
+             SELECT 1 FROM library_metadata_event_groups g
+             WHERE g.event_id=library_metadata_events.id AND g.library_album_id=?
+           ) ORDER BY rowid DESC LIMIT 100`,
+        )
+        .all(libraryAlbumId) as Record<string, unknown>[]
+    ).map((row) => this.mapAlbumMetadataEvent(row, libraryAlbumId));
+  }
+
+  undoAlbumMetadataEvent(
+    albumId: string,
+    eventId: string,
+    requestId: string,
+    expectedMetadataRevision: number,
+    actor: LibraryIdentityActor,
+  ): AlbumMetadataMutationResult {
+    return this.raw.transaction(() => {
+      const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+      if (!libraryAlbumId)
+        throw new AlbumMetadataDecisionError(
+          "METADATA_DECISION_CONFLICT",
+          "唱片已经不存在或无法解析",
+        );
+      const inputJson = canonicalMetadataInput(
+        albumId,
+        expectedMetadataRevision,
+        [{ action: "RESET", field: "title", eventId }],
+      );
+      const replay = this.metadataResultByRequestId(requestId, inputJson);
+      if (replay) return replay;
+      this.assertMetadataRevision(libraryAlbumId, expectedMetadataRevision);
+      const row = this.raw
+        .prepare("SELECT * FROM library_metadata_events WHERE id=?")
+        .get(eventId) as Record<string, unknown> | undefined;
+      if (
+        !row ||
+        !this.raw
+          .prepare(
+            "SELECT 1 FROM library_metadata_event_groups WHERE event_id=? AND library_album_id=?",
+          )
+          .get(eventId, libraryAlbumId) ||
+        row.event_type === "UNDO" ||
+        this.raw
+          .prepare(
+            "SELECT 1 FROM library_metadata_events WHERE compensates_event_id=?",
+          )
+          .get(eventId)
+      )
+        throw new AlbumMetadataDecisionError(
+          "METADATA_DECISION_CONFLICT",
+          "只能撤销当前唱片最新且仍有效的元数据事件",
+        );
+      const before = this.captureAlbumMetadataSnapshot(libraryAlbumId);
+      const expectedAfter = parseJson<AlbumMetadataSnapshot>(
+        row.after_state_json,
+        { libraryAlbumId, memberVersionIds: [], values: [] },
+      );
+      if (
+        Number(row.resulting_metadata_revision) !== expectedMetadataRevision ||
+        JSON.stringify(before) !== JSON.stringify(expectedAfter)
+      )
+        throw new AlbumMetadataDecisionError(
+          "METADATA_DECISION_CONFLICT",
+          "元数据状态已被后续事件或身份变化覆盖，不能静默撤销",
+        );
+      const restore = parseJson<AlbumMetadataSnapshot>(row.before_state_json, {
+        libraryAlbumId,
+        memberVersionIds: [],
+        values: [],
+      });
+      if (
+        restore.libraryAlbumId !== libraryAlbumId ||
+        JSON.stringify(restore.memberVersionIds) !==
+          JSON.stringify(before.memberVersionIds)
+      )
+        throw new AlbumMetadataDecisionError(
+          "METADATA_DECISION_CONFLICT",
+          "唱片成员已经变化，无法无冲突恢复字段归属",
+        );
+      this.restoreAlbumMetadataSnapshot(restore);
+      const now = new Date().toISOString();
+      this.raw
+        .prepare(
+          "UPDATE library_albums SET metadata_revision=metadata_revision+1,updated_at=? WHERE id=?",
+        )
+        .run(now, libraryAlbumId);
+      this.refreshMetadataIssueStatus(libraryAlbumId);
+      const after = this.captureAlbumMetadataSnapshot(libraryAlbumId);
+      return this.recordAlbumMetadataEvent({
+        requestId,
+        inputJson,
+        libraryAlbumId,
+        type: "UNDO",
+        actor,
+        expectedMetadataRevision,
+        commands: parseJson<MetadataCommand[]>(row.commands_json, []),
+        before,
+        after,
+        compensatesEventId: eventId,
+        createdAt: now,
+      });
+    })();
+  }
+
+  private normalizeMetadataCommands(
+    libraryAlbumId: string,
+    commands: MetadataCommand[],
+  ): MetadataCommand[] {
+    const members = new Set(this.libraryIdentityMemberIds([libraryAlbumId]));
+    const seen = new Set<string>();
+    return commands.map((command) => {
+      const albumField = isAlbumMetadataField(command.field);
+      if (albumField && command.versionId)
+        throw new AlbumMetadataDecisionError(
+          "INVALID_METADATA_DECISION",
+          `${command.field} 是唱片级字段，不能指定本地版本`,
+        );
+      if (
+        !albumField &&
+        (!command.versionId || !members.has(command.versionId))
+      )
+        throw new AlbumMetadataDecisionError(
+          "METADATA_DECISION_CONFLICT",
+          `${command.field} 的目标版本已不属于当前唱片`,
+        );
+      const key = `${command.versionId ?? libraryAlbumId}\0${command.field}`;
+      if (seen.has(key))
+        throw new AlbumMetadataDecisionError(
+          "INVALID_METADATA_DECISION",
+          "同一请求不能重复修改同一个字段",
+        );
+      seen.add(key);
+      if (
+        command.action === "CLEAR" &&
+        (command.field === "title" || command.field === "albumArtist")
+      )
+        throw new AlbumMetadataDecisionError(
+          "INVALID_METADATA_DECISION",
+          "标题和专辑艺术家不能显式清空",
+        );
+      if (command.action !== "SET") return command;
+      return {
+        ...command,
+        value: normalizeMetadataValue(command.field, command.value),
+      };
+    });
+  }
+
+  private assertMetadataRevision(
+    libraryAlbumId: string,
+    expected: number,
+  ): void {
+    const row = this.raw
+      .prepare("SELECT metadata_revision FROM library_albums WHERE id=?")
+      .get(libraryAlbumId) as { metadata_revision: number } | undefined;
+    if (!row || Number(row.metadata_revision) !== expected)
+      throw new AlbumMetadataDecisionError(
+        "METADATA_DECISION_CONFLICT",
+        "元数据 revision 已变化，请刷新后重试",
+      );
+  }
+
+  private metadataValuesFor(
+    libraryAlbumId: string,
+    versionIds: string[],
+  ): StoredMetadataValue[] {
+    const placeholders = versionIds.map(() => "?").join(",");
+    const rows = this.raw
+      .prepare(
+        `SELECT * FROM library_metadata_values
+         WHERE (scope_type='ALBUM' AND owner_id=?)
+            OR (scope_type='VERSION' AND owner_id IN (${placeholders}))
+         ORDER BY scope_type,owner_id,field_name,source_type`,
+      )
+      .all(libraryAlbumId, ...versionIds) as Record<string, unknown>[];
+    return rows.map(mapStoredMetadataValue);
+  }
+
+  private captureAlbumMetadataSnapshot(
+    libraryAlbumId: string,
+  ): AlbumMetadataSnapshot {
+    const memberVersionIds = this.libraryIdentityMemberIds([libraryAlbumId]);
+    return {
+      libraryAlbumId,
+      memberVersionIds,
+      values: this.metadataValuesFor(libraryAlbumId, memberVersionIds),
+      releaseMatchStates: memberVersionIds.map((versionId) => {
+        const row = this.raw
+          .prepare(
+            "SELECT match_status,musicbrainz_release_id FROM albums WHERE id=?",
+          )
+          .get(versionId) as Record<string, unknown>;
+        return {
+          versionId,
+          matchStatus: row.match_status as AlbumSummary["matchStatus"],
+          musicBrainzReleaseId: nullableString(row.musicbrainz_release_id),
+        };
+      }),
+    };
+  }
+
+  private restoreAlbumMetadataSnapshot(snapshot: AlbumMetadataSnapshot): void {
+    const placeholders = snapshot.memberVersionIds.map(() => "?").join(",");
+    this.raw
+      .prepare(
+        `DELETE FROM library_metadata_values
+         WHERE (scope_type='ALBUM' AND owner_id=?)
+            OR (scope_type='VERSION' AND owner_id IN (${placeholders}))`,
+      )
+      .run(snapshot.libraryAlbumId, ...snapshot.memberVersionIds);
+    const insert = this.raw.prepare(
+      `INSERT INTO library_metadata_values
+       (scope_type,owner_id,field_name,source_type,value_json,evidence_json,
+        actor_id,actor_display_name,created_at,updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    );
+    for (const value of snapshot.values)
+      insert.run(
+        value.scopeType,
+        value.ownerId,
+        value.fieldName,
+        value.sourceType,
+        value.valueJson,
+        value.evidenceJson,
+        value.actorId,
+        value.actorDisplayName,
+        value.createdAt,
+        value.updatedAt,
+      );
+    for (const state of snapshot.releaseMatchStates ?? [])
+      this.raw
+        .prepare(
+          "UPDATE albums SET match_status=?,musicbrainz_release_id=? WHERE id=?",
+        )
+        .run(state.matchStatus, state.musicBrainzReleaseId, state.versionId);
+  }
+
+  private recordAlbumMetadataEvent(input: {
+    requestId: string;
+    inputJson: string;
+    libraryAlbumId: string;
+    type: AlbumMetadataEvent["type"];
+    actor: LibraryIdentityActor;
+    expectedMetadataRevision: number;
+    commands: MetadataCommand[];
+    before: AlbumMetadataSnapshot;
+    after: AlbumMetadataSnapshot;
+    compensatesEventId: string | null;
+    createdAt: string;
+    resultExtra?: Record<string, unknown>;
+  }): AlbumMetadataMutationResult {
+    const id = randomUUID();
+    const metadata = this.getAlbumMetadata(input.libraryAlbumId)!;
+    this.raw
+      .prepare(
+        `INSERT INTO library_metadata_events
+         (id,request_id,library_album_id,event_type,actor_id,actor_display_name,
+          expected_metadata_revision,resulting_metadata_revision,input_json,commands_json,
+          before_state_json,after_state_json,result_json,compensates_event_id,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        id,
+        input.requestId,
+        input.libraryAlbumId,
+        input.type,
+        input.actor.id,
+        input.actor.displayName,
+        input.expectedMetadataRevision,
+        metadata.metadataRevision,
+        input.inputJson,
+        JSON.stringify(input.commands),
+        JSON.stringify(input.before),
+        JSON.stringify(input.after),
+        JSON.stringify({ metadata, ...input.resultExtra }),
+        input.compensatesEventId,
+        input.createdAt,
+      );
+    this.raw
+      .prepare(
+        "INSERT INTO library_metadata_event_groups(event_id,library_album_id) VALUES (?,?)",
+      )
+      .run(id, input.libraryAlbumId);
+    return {
+      metadata,
+      event: this.mapAlbumMetadataEvent(
+        this.raw
+          .prepare("SELECT * FROM library_metadata_events WHERE id=?")
+          .get(id) as Record<string, unknown>,
+        input.libraryAlbumId,
+      ),
+    };
+  }
+
+  private metadataResultByRequestId(
+    requestId: string,
+    inputJson: string,
+  ): AlbumMetadataMutationResult | null {
+    const row = this.raw
+      .prepare("SELECT * FROM library_metadata_events WHERE request_id=?")
+      .get(requestId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    if (String(row.input_json) !== inputJson)
+      throw new AlbumMetadataDecisionError(
+        "METADATA_DECISION_CONFLICT",
+        "requestId 已用于不同的元数据请求",
+      );
+    const stored = parseJson<{ metadata: AlbumMetadata }>(row.result_json, {
+      metadata: this.getAlbumMetadata(String(row.library_album_id))!,
+    });
+    return {
+      metadata: stored.metadata,
+      event: this.mapAlbumMetadataEvent(
+        row,
+        this.resolveLibraryAlbumId(String(row.library_album_id)) ??
+          String(row.library_album_id),
+      ),
+    };
+  }
+
+  private mapAlbumMetadataEvent(
+    row: Record<string, unknown>,
+    historyLibraryAlbumId: string,
+  ): AlbumMetadataEvent {
+    const latest = this.raw
+      .prepare(
+        `SELECT e.id FROM library_metadata_events e
+         WHERE EXISTS (SELECT 1 FROM library_metadata_event_groups g
+           WHERE g.event_id=e.id AND g.library_album_id=?)
+         ORDER BY e.rowid DESC LIMIT 1`,
+      )
+      .get(historyLibraryAlbumId) as { id: string } | undefined;
+    const compensated = Boolean(
+      this.raw
+        .prepare(
+          "SELECT 1 FROM library_metadata_events WHERE compensates_event_id=?",
+        )
+        .get(String(row.id)),
+    );
+    const group = this.raw
+      .prepare("SELECT metadata_revision FROM library_albums WHERE id=?")
+      .get(historyLibraryAlbumId) as { metadata_revision: number } | undefined;
+    const expectedAfter = parseJson<AlbumMetadataSnapshot>(
+      row.after_state_json,
+      {
+        libraryAlbumId: historyLibraryAlbumId,
+        memberVersionIds: [],
+        values: [],
+      },
+    );
+    const canUndo =
+      row.event_type !== "UNDO" &&
+      !compensated &&
+      latest?.id === String(row.id) &&
+      Number(group?.metadata_revision) ===
+        Number(row.resulting_metadata_revision) &&
+      JSON.stringify(
+        this.captureAlbumMetadataSnapshot(historyLibraryAlbumId),
+      ) === JSON.stringify(expectedAfter);
+    return {
+      id: String(row.id),
+      requestId: String(row.request_id),
+      libraryAlbumId: String(row.library_album_id),
+      type: row.event_type as AlbumMetadataEvent["type"],
+      actor: {
+        id: String(row.actor_id),
+        displayName: String(row.actor_display_name),
+      },
+      expectedMetadataRevision: Number(row.expected_metadata_revision),
+      resultingMetadataRevision: Number(row.resulting_metadata_revision),
+      commands: parseJson<MetadataCommand[]>(row.commands_json, []),
+      compensatesEventId: nullableString(row.compensates_event_id),
+      canUndo,
+      createdAt: String(row.created_at),
+    };
+  }
+
+  private observedIdentitySource(
+    versionId: string,
+    field: "title" | "albumArtist",
+  ): "OBSERVED_TAG" | "PATH_FALLBACK" {
+    const expression =
+      field === "title"
+        ? "trim(COALESCE(media_files.album,'')) <> ''"
+        : "trim(COALESCE(media_files.album_artist,'')) <> '' OR json_array_length(media_files.artists_json)>0";
+    return this.raw
+      .prepare(
+        `SELECT 1 FROM album_files JOIN media_files ON media_files.id=album_files.media_file_id
+         WHERE album_files.album_id=? AND album_files.is_primary=1 AND (${expression}) LIMIT 1`,
+      )
+      .get(versionId)
+      ? "OBSERVED_TAG"
+      : "PATH_FALLBACK";
+  }
+
+  private refreshMetadataIssueStatus(libraryAlbumId: string): void {
+    const metadata = this.getAlbumMetadata(libraryAlbumId);
+    if (!metadata) return;
+    const title = metadata.album.title.effectiveValue;
+    const artist = metadata.album.albumArtist.effectiveValue;
+    const textResolved =
+      typeof title === "string" &&
+      title.trim() !== "" &&
+      !hasBrokenText(title) &&
+      typeof artist === "string" &&
+      artist.trim() !== "" &&
+      !hasBrokenText(artist);
+    this.raw
+      .prepare(
+        `UPDATE library_issues SET resolution_status=?,updated_at=?
+         WHERE library_album_id=? AND code='BROKEN_TEXT'`,
+      )
+      .run(
+        textResolved ? "RESOLVED_BY_METADATA" : "PENDING",
+        new Date().toISOString(),
+        libraryAlbumId,
+      );
+    const identityResolved =
+      textResolved &&
+      metadata.album.title.effectiveSource !== "PATH_FALLBACK" &&
+      metadata.album.albumArtist.effectiveSource !== "PATH_FALLBACK";
+    this.raw
+      .prepare(
+        `UPDATE library_issues SET resolution_status=?,updated_at=?
+         WHERE library_album_id=? AND code='MISSING_IDENTITY'`,
+      )
+      .run(
+        identityResolved ? "RESOLVED_BY_METADATA" : "PENDING",
+        new Date().toISOString(),
+        libraryAlbumId,
+      );
+  }
+
   listAlbums(
     options: {
       search?: string;
@@ -3216,11 +4333,17 @@ export class CoceanDatabase {
     const issue = options.issue ?? "ALL";
     const limit = Math.min(Math.max(options.limit ?? 100, 1), 500);
     const offset = Math.max(options.offset ?? 0, 0);
+    const effectiveTitle = effectiveAlbumFieldSql("title", "a.title");
+    const effectiveArtist = effectiveAlbumFieldSql(
+      "albumArtist",
+      "a.album_artist",
+    );
+    const effectiveYear = effectiveAlbumFieldSql("year", "a.year");
     const conditions: string[] = [];
     const parameters: Record<string, string | number> = { limit, offset };
     if (search) {
       conditions.push(
-        "(a.title LIKE @query ESCAPE '\\' OR a.album_artist LIKE @query ESCAPE '\\')",
+        `(${effectiveTitle} LIKE @query ESCAPE '\\' OR ${effectiveArtist} LIKE @query ESCAPE '\\')`,
       );
       parameters.query = `%${escapeLike(search)}%`;
     }
@@ -3236,21 +4359,24 @@ export class CoceanDatabase {
     }
     if (issue !== "ALL") {
       conditions.push(
-        "EXISTS (SELECT 1 FROM library_issues li WHERE li.library_album_id=la.id AND li.code=@issue)",
+        "EXISTS (SELECT 1 FROM library_issues li WHERE li.library_album_id=la.id AND li.code=@issue AND li.resolution_status='PENDING')",
       );
       parameters.issue = issue;
     }
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
     const order =
       sort === "TITLE"
-        ? "a.title COLLATE NOCASE, a.album_artist COLLATE NOCASE, a.year"
+        ? `${effectiveTitle} COLLATE NOCASE, ${effectiveArtist} COLLATE NOCASE, ${effectiveYear}`
         : sort === "YEAR_DESC"
-          ? "a.year IS NULL, a.year DESC, a.title COLLATE NOCASE, a.album_artist COLLATE NOCASE"
-          : "a.album_artist COLLATE NOCASE, a.year, a.title COLLATE NOCASE";
+          ? `${effectiveYear} IS NULL, ${effectiveYear} DESC, ${effectiveTitle} COLLATE NOCASE, ${effectiveArtist} COLLATE NOCASE`
+          : `${effectiveArtist} COLLATE NOCASE, ${effectiveYear}, ${effectiveTitle} COLLATE NOCASE`;
     const rows = this.raw
       .prepare(
         `SELECT a.*, la.id AS library_album_id, la.primary_version_id,
-                la.primary_version_source, la.revision,
+                la.primary_version_source, la.revision, la.metadata_revision,
+                ${effectiveTitle} AS effective_title,
+                ${effectiveArtist} AS effective_album_artist,
+                ${effectiveYear} AS effective_year,
                 (SELECT COUNT(*) FROM library_album_members WHERE library_album_id=la.id) AS version_count
          FROM library_albums la JOIN albums a ON a.id=la.primary_version_id
          ${where} ORDER BY ${order}, la.id LIMIT @limit OFFSET @offset`,
@@ -3271,11 +4397,16 @@ export class CoceanDatabase {
     const search = options.search?.trim();
     const filter = options.filter ?? "ALL";
     const issue = options.issue ?? "ALL";
+    const effectiveTitle = effectiveAlbumFieldSql("title", "a.title");
+    const effectiveArtist = effectiveAlbumFieldSql(
+      "albumArtist",
+      "a.album_artist",
+    );
     const conditions: string[] = [];
     const parameters: Record<string, string> = {};
     if (search) {
       conditions.push(
-        "(a.title LIKE @query ESCAPE '\\' OR a.album_artist LIKE @query ESCAPE '\\')",
+        `(${effectiveTitle} LIKE @query ESCAPE '\\' OR ${effectiveArtist} LIKE @query ESCAPE '\\')`,
       );
       parameters.query = `%${escapeLike(search)}%`;
     }
@@ -3291,7 +4422,7 @@ export class CoceanDatabase {
     }
     if (issue !== "ALL") {
       conditions.push(
-        "EXISTS (SELECT 1 FROM library_issues li WHERE li.library_album_id=la.id AND li.code=@issue)",
+        "EXISTS (SELECT 1 FROM library_issues li WHERE li.library_album_id=la.id AND li.code=@issue AND li.resolution_status='PENDING')",
       );
       parameters.issue = issue;
     }
@@ -3305,10 +4436,19 @@ export class CoceanDatabase {
   }
 
   getAlbumSummary(id: string): AlbumSummary | null {
+    const effectiveTitle = effectiveAlbumFieldSql("title", "a.title");
+    const effectiveArtist = effectiveAlbumFieldSql(
+      "albumArtist",
+      "a.album_artist",
+    );
+    const effectiveYear = effectiveAlbumFieldSql("year", "a.year");
     const row = this.raw
       .prepare(
         `SELECT a.*, la.id AS library_album_id, la.primary_version_id,
-        la.primary_version_source, la.revision,
+        la.primary_version_source, la.revision, la.metadata_revision,
+        ${effectiveTitle} AS effective_title,
+        ${effectiveArtist} AS effective_album_artist,
+        ${effectiveYear} AS effective_year,
         (SELECT COUNT(*) FROM library_album_members WHERE library_album_id=la.id) AS version_count
         FROM library_albums la JOIN albums a ON a.id=la.primary_version_id
         WHERE la.id=COALESCE(
@@ -3395,6 +4535,8 @@ export class CoceanDatabase {
         title: String(row.title),
         albumArtist: String(row.album_artist),
         year: nullableNumber(row.year),
+        matchStatus: row.match_status as AlbumSummary["matchStatus"],
+        musicBrainzReleaseId: nullableString(row.musicbrainz_release_id),
         isPrimary: row.primary_version_id === row.id,
         relationshipStatus: row.relationship_status as
           "AUTO_CANDIDATE" | "USER_CONFIRMED" | "USER_SEPARATE",
@@ -3425,22 +4567,26 @@ export class CoceanDatabase {
   private listLibraryIssues(
     libraryAlbumId: string,
     albumId?: string,
+    includeResolved = false,
   ): LibraryIssue[] {
+    const status = includeResolved ? "" : " AND resolution_status='PENDING'";
     const rows = albumId
       ? this.raw
           .prepare(
-            "SELECT * FROM library_issues WHERE library_album_id=? AND album_id=? ORDER BY code, album_id",
+            `SELECT * FROM library_issues WHERE library_album_id=? AND album_id=?${status} ORDER BY code, album_id`,
           )
           .all(libraryAlbumId, albumId)
       : this.raw
           .prepare(
-            "SELECT * FROM library_issues WHERE library_album_id=? ORDER BY code, album_id",
+            `SELECT * FROM library_issues WHERE library_album_id=?${status} ORDER BY code, album_id`,
           )
           .all(libraryAlbumId);
     return (rows as Record<string, unknown>[]).map((row) => ({
       code: row.code as LibraryIssueCode,
       versionId: nullableString(row.album_id),
       evidence: parseJson<Record<string, unknown>>(row.evidence_json, {}),
+      resolutionStatus: (nullableString(row.resolution_status) ??
+        "PENDING") as LibraryIssue["resolutionStatus"],
     }));
   }
 
@@ -3448,17 +4594,22 @@ export class CoceanDatabase {
     title: string,
     albumArtist: string,
   ): AlbumSummary | null {
+    const effectiveTitle = effectiveAlbumFieldSql("title", "a.title");
+    const effectiveArtist = effectiveAlbumFieldSql(
+      "albumArtist",
+      "a.album_artist",
+    );
     const row = this.raw
       .prepare(
-        `SELECT albums.* FROM albums
-         WHERE title = ? COLLATE NOCASE AND album_artist = ? COLLATE NOCASE
+        `SELECT la.id FROM library_albums la JOIN albums a ON a.id=la.primary_version_id
+         WHERE ${effectiveTitle} = ? COLLATE NOCASE AND ${effectiveArtist} = ? COLLATE NOCASE
          ORDER BY EXISTS(
-           SELECT 1 FROM album_files WHERE album_files.album_id = albums.id
-         ) DESC, albums.updated_at DESC, albums.id
+           SELECT 1 FROM album_files WHERE album_files.album_id = a.id
+         ) DESC, a.updated_at DESC, la.id
          LIMIT 1`,
       )
-      .get(title, albumArtist) as Record<string, unknown> | undefined;
-    return row ? this.getAlbumSummary(String(row.id)) : null;
+      .get(title, albumArtist) as { id: string } | undefined;
+    return row ? this.getAlbumSummary(row.id) : null;
   }
 
   getAlbum(id: string): AlbumDetail | null {
@@ -3470,6 +4621,11 @@ export class CoceanDatabase {
       .get(localId) as Record<string, unknown> | undefined;
     if (!row) return null;
     const summary = librarySummary;
+    const metadata = this.getAlbumMetadata(summary.id);
+    if (!metadata) return null;
+    const versionMetadata = metadata.versions.find(
+      (version) => version.versionId === localId,
+    );
     const root = this.getAnyLibraryRoot(String(row.root_id));
     if (!root)
       throw new Error(`Library root ${String(row.root_id)} is missing`);
@@ -3511,11 +4667,15 @@ export class CoceanDatabase {
     return {
       ...summary,
       release: {
-        label: nullableString(row.label),
-        catalogNumber: nullableString(row.catalog_number),
-        barcode: nullableString(row.barcode),
-        country: nullableString(row.country),
-        releaseDate: nullableString(row.release_date),
+        label: metadataString(versionMetadata?.fields.label.effectiveValue),
+        catalogNumber: metadataString(
+          versionMetadata?.fields.catalogNumber.effectiveValue,
+        ),
+        barcode: metadataString(versionMetadata?.fields.barcode.effectiveValue),
+        country: metadataString(versionMetadata?.fields.country.effectiveValue),
+        releaseDate: metadataString(
+          versionMetadata?.fields.releaseDate.effectiveValue,
+        ),
         musicBrainzReleaseId: nullableString(row.musicbrainz_release_id),
       },
       tracks,
@@ -3529,6 +4689,7 @@ export class CoceanDatabase {
             readOnly: root.policy === "WATCH_ONLY",
           },
       localVersions: this.listLocalVersions(summary.id),
+      metadata,
     };
   }
 
@@ -3620,8 +4781,12 @@ export class CoceanDatabase {
   replaceReleaseCandidates(
     albumId: string,
     candidates: ReleaseCandidate[],
+    requestedLocalVersionId?: string,
   ): void {
-    const localVersionId = this.resolveLocalVersionId(albumId);
+    const localVersionId = this.resolveCandidateLocalVersionId(
+      albumId,
+      requestedLocalVersionId,
+    );
     if (!localVersionId) throw new Error(`Album ${albumId} does not exist`);
     if (
       candidates.some(
@@ -3674,8 +4839,14 @@ export class CoceanDatabase {
     })();
   }
 
-  listReleaseCandidates(albumId: string): ReleaseCandidate[] {
-    const localVersionId = this.resolveLocalVersionId(albumId);
+  listReleaseCandidates(
+    albumId: string,
+    requestedLocalVersionId?: string,
+  ): ReleaseCandidate[] {
+    const localVersionId = this.resolveCandidateLocalVersionId(
+      albumId,
+      requestedLocalVersionId,
+    );
     if (!localVersionId) return [];
     return this.raw
       .prepare(
@@ -3687,6 +4858,24 @@ export class CoceanDatabase {
           JSON.parse(String((row as { payload_json: string }).payload_json)),
         ),
       );
+  }
+
+  private resolveCandidateLocalVersionId(
+    albumId: string,
+    requestedLocalVersionId?: string,
+  ): string | null {
+    const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+    if (!libraryAlbumId) return null;
+    if (!requestedLocalVersionId)
+      return this.resolveLocalVersionId(libraryAlbumId);
+    return this.raw
+      .prepare(
+        `SELECT album_id FROM library_album_members
+         WHERE library_album_id=? AND album_id=?`,
+      )
+      .get(libraryAlbumId, requestedLocalVersionId)
+      ? requestedLocalVersionId
+      : null;
   }
 
   confirmReleaseCandidate(
@@ -3704,31 +4893,221 @@ export class CoceanDatabase {
     const candidate = releaseCandidateSchema.parse(
       JSON.parse(row.payload_json),
     );
-    const now = new Date().toISOString();
-    this.raw
-      .prepare(
-        `UPDATE albums SET
-          match_status='USER_CONFIRMED',
-          label=COALESCE(@label, label),
-          catalog_number=COALESCE(@catalogNumber, catalog_number),
-          barcode=COALESCE(@barcode, barcode),
-          country=COALESCE(@country, country),
-          release_date=COALESCE(@releaseDate, release_date),
-          musicbrainz_release_id=@musicBrainzReleaseId,
-          updated_at=@updatedAt
-         WHERE id=@albumId`,
-      )
-      .run({
-        albumId: localVersionId,
-        label: candidate.labels[0] ?? null,
-        catalogNumber: candidate.catalogNumbers[0] ?? null,
-        barcode: candidate.barcode,
-        country: candidate.country,
-        releaseDate: candidate.releaseDate,
-        musicBrainzReleaseId: candidate.sourceId,
-        updatedAt: now,
-      });
+    const metadata = this.getAlbumMetadata(albumId);
+    if (metadata)
+      this.confirmReleaseCandidateMetadata(
+        albumId,
+        candidateId,
+        localVersionId,
+        `legacy-confirm-${randomUUID()}`,
+        metadata.metadataRevision,
+        { id: "legacy", displayName: "兼容接口" },
+      );
     return candidate;
+  }
+
+  confirmReleaseCandidateMetadata(
+    albumId: string,
+    candidateId: string,
+    localVersionId: string,
+    requestId: string,
+    expectedMetadataRevision: number,
+    actor: LibraryIdentityActor,
+  ): {
+    candidate: ReleaseCandidate;
+    result: AlbumMetadataMutationResult;
+  } | null {
+    return this.raw.transaction(() => {
+      const inputJson = canonicalMetadataInput(
+        albumId,
+        expectedMetadataRevision,
+        [{ candidateId, localVersionId }],
+      );
+      const replayRow = this.raw
+        .prepare("SELECT * FROM library_metadata_events WHERE request_id=?")
+        .get(requestId) as Record<string, unknown> | undefined;
+      if (replayRow) {
+        if (String(replayRow.input_json) !== inputJson)
+          throw new AlbumMetadataDecisionError(
+            "METADATA_DECISION_CONFLICT",
+            "requestId 已用于不同的元数据请求",
+          );
+        const stored = parseJson<{
+          metadata: AlbumMetadata;
+          candidate: ReleaseCandidate;
+        }>(replayRow.result_json, null as never);
+        if (!stored?.candidate)
+          throw new AlbumMetadataDecisionError(
+            "METADATA_DECISION_CONFLICT",
+            "历史候选确认结果不完整，无法安全重放",
+          );
+        return {
+          candidate: stored.candidate,
+          result: {
+            metadata: stored.metadata,
+            event: this.mapAlbumMetadataEvent(
+              replayRow,
+              this.resolveLibraryAlbumId(String(replayRow.library_album_id)) ??
+                String(replayRow.library_album_id),
+            ),
+          },
+        };
+      }
+      const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+      if (!libraryAlbumId)
+        throw new AlbumMetadataDecisionError(
+          "METADATA_DECISION_CONFLICT",
+          "唱片已经不存在或无法解析",
+        );
+      if (
+        !this.libraryIdentityMemberIds([libraryAlbumId]).includes(
+          localVersionId,
+        )
+      )
+        throw new AlbumMetadataDecisionError(
+          "METADATA_DECISION_CONFLICT",
+          "候选目标版本已不属于当前唱片",
+        );
+      const row = this.raw
+        .prepare(
+          "SELECT payload_json FROM release_match_candidates WHERE id=? AND album_id=?",
+        )
+        .get(candidateId, localVersionId) as
+        { payload_json: string } | undefined;
+      if (!row) return null;
+      const candidate = releaseCandidateSchema.parse(
+        JSON.parse(row.payload_json),
+      );
+      const year = candidate.releaseDate?.match(/^(\d{4})/)?.[1];
+      const commands: MetadataCommand[] = [
+        { action: "SET", field: "title", value: candidate.title },
+        { action: "SET", field: "albumArtist", value: candidate.artistCredit },
+        ...(year
+          ? ([{ action: "SET", field: "year", value: Number(year) }] as const)
+          : []),
+        ...(candidate.labels[0]
+          ? ([
+              {
+                action: "SET",
+                field: "label",
+                versionId: localVersionId,
+                value: candidate.labels[0],
+              },
+            ] as const)
+          : []),
+        ...(candidate.catalogNumbers[0]
+          ? ([
+              {
+                action: "SET",
+                field: "catalogNumber",
+                versionId: localVersionId,
+                value: candidate.catalogNumbers[0],
+              },
+            ] as const)
+          : []),
+        ...(candidate.barcode
+          ? ([
+              {
+                action: "SET",
+                field: "barcode",
+                versionId: localVersionId,
+                value: candidate.barcode,
+              },
+            ] as const)
+          : []),
+        ...(candidate.country
+          ? ([
+              {
+                action: "SET",
+                field: "country",
+                versionId: localVersionId,
+                value: candidate.country,
+              },
+            ] as const)
+          : []),
+        ...(candidate.releaseDate
+          ? ([
+              {
+                action: "SET",
+                field: "releaseDate",
+                versionId: localVersionId,
+                value: candidate.releaseDate,
+              },
+            ] as const)
+          : []),
+      ];
+      const normalized = this.normalizeMetadataCommands(
+        libraryAlbumId,
+        commands,
+      );
+      this.assertMetadataRevision(libraryAlbumId, expectedMetadataRevision);
+      const before = this.captureAlbumMetadataSnapshot(libraryAlbumId);
+      const now = new Date().toISOString();
+      const evidence = JSON.stringify({
+        provider: candidate.source,
+        candidateId: candidate.sourceId,
+        localVersionId,
+      });
+      this.raw
+        .prepare(
+          `DELETE FROM library_metadata_values
+           WHERE source_type='CONFIRMED_EXTERNAL'
+             AND ((scope_type='ALBUM' AND owner_id=?)
+               OR (scope_type='VERSION' AND owner_id=?))`,
+        )
+        .run(libraryAlbumId, localVersionId);
+      const insert = this.raw.prepare(
+        `INSERT INTO library_metadata_values
+         (scope_type,owner_id,field_name,source_type,value_json,evidence_json,
+          actor_id,actor_display_name,created_at,updated_at)
+         VALUES (?,?,?,'CONFIRMED_EXTERNAL',?,?,NULL,NULL,?,?)
+         ON CONFLICT(scope_type,owner_id,field_name,source_type) DO UPDATE SET
+           value_json=excluded.value_json,evidence_json=excluded.evidence_json,
+           updated_at=excluded.updated_at`,
+      );
+      for (const item of normalized) {
+        const scopeType = isAlbumMetadataField(item.field)
+          ? "ALBUM"
+          : "VERSION";
+        insert.run(
+          scopeType,
+          scopeType === "ALBUM" ? libraryAlbumId : item.versionId!,
+          item.field,
+          JSON.stringify(item.action === "SET" ? item.value : null),
+          evidence,
+          now,
+          now,
+        );
+      }
+      this.raw
+        .prepare(
+          `UPDATE albums SET match_status='USER_CONFIRMED',musicbrainz_release_id=?,updated_at=?
+           WHERE id=?`,
+        )
+        .run(candidate.sourceId, now, localVersionId);
+      this.raw
+        .prepare(
+          "UPDATE library_albums SET metadata_revision=metadata_revision+1,updated_at=? WHERE id=?",
+        )
+        .run(now, libraryAlbumId);
+      this.refreshMetadataIssueStatus(libraryAlbumId);
+      const after = this.captureAlbumMetadataSnapshot(libraryAlbumId);
+      const result = this.recordAlbumMetadataEvent({
+        requestId,
+        inputJson,
+        libraryAlbumId,
+        type: "CONFIRM_EXTERNAL",
+        actor,
+        expectedMetadataRevision,
+        commands: normalized,
+        before,
+        after,
+        compensatesEventId: null,
+        createdAt: now,
+        resultExtra: { candidate },
+      });
+      return { candidate, result };
+    })();
   }
 
   installStillCatalog(input: StillRuntimeCatalog): void {
@@ -4387,12 +5766,12 @@ export class CoceanDatabase {
            JOIN album_files af ON af.album_id=la.primary_version_id
            WHERE af.is_primary=1) AS tracks,
           (SELECT COUNT(*) FROM media_files) AS files,
-          (SELECT COUNT(DISTINCT library_album_id) FROM library_issues) AS needs_review,
-          (SELECT COUNT(DISTINCT library_album_id) FROM library_issues WHERE code='MISSING_ARTWORK') AS missing_artwork,
-          (SELECT COUNT(DISTINCT library_album_id) FROM library_issues WHERE code='IDENTITY_OVERLAP') AS pending_groups,
-          (SELECT COUNT(DISTINCT library_album_id) FROM library_issues WHERE code='INCOMPLETE_TRACKS') AS incomplete_albums,
-          (SELECT COUNT(DISTINCT library_album_id) FROM library_issues WHERE code='LOW_RES_ARTWORK') AS low_resolution_artwork,
-          (SELECT COUNT(DISTINCT library_album_id) FROM library_issues WHERE code IN ('BROKEN_TEXT','MISSING_IDENTITY')) AS broken_identity,
+          (SELECT COUNT(DISTINCT library_album_id) FROM library_issues WHERE resolution_status='PENDING') AS needs_review,
+          (SELECT COUNT(DISTINCT library_album_id) FROM library_issues WHERE code='MISSING_ARTWORK' AND resolution_status='PENDING') AS missing_artwork,
+          (SELECT COUNT(DISTINCT library_album_id) FROM library_issues WHERE code='IDENTITY_OVERLAP' AND resolution_status='PENDING') AS pending_groups,
+          (SELECT COUNT(DISTINCT library_album_id) FROM library_issues WHERE code='INCOMPLETE_TRACKS' AND resolution_status='PENDING') AS incomplete_albums,
+          (SELECT COUNT(DISTINCT library_album_id) FROM library_issues WHERE code='LOW_RES_ARTWORK' AND resolution_status='PENDING') AS low_resolution_artwork,
+          (SELECT COUNT(DISTINCT library_album_id) FROM library_issues WHERE code IN ('BROKEN_TEXT','MISSING_IDENTITY') AND resolution_status='PENDING') AS broken_identity,
           (SELECT COUNT(*) FROM library_albums
            WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-30 days')) AS recently_added,
           COALESCE((SELECT failed_files FROM scan_jobs
@@ -4440,12 +5819,17 @@ export class CoceanDatabase {
     );
     return {
       ...summary,
+      title: nullableString(row.effective_title) ?? summary.title,
+      albumArtist:
+        nullableString(row.effective_album_artist) ?? summary.albumArtist,
+      year: nullableNumber(row.effective_year),
       id,
       hasDigital,
       physicalMedia,
       primaryVersionId: String(row.primary_version_id),
       primaryVersionSource: row.primary_version_source as "AUTOMATIC" | "USER",
       revision: Number(row.revision),
+      metadataRevision: Number(row.metadata_revision ?? 0),
       versionCount: Number(row.version_count),
       issues: this.listLibraryIssues(id),
     };
@@ -4487,6 +5871,7 @@ export class CoceanDatabase {
       matchStatus: row.match_status as AlbumSummary["matchStatus"],
       primaryVersionSource: "AUTOMATIC",
       revision: 0,
+      metadataRevision: 0,
       trackCount: Number(row.track_count),
       discCount: Number(row.disc_count),
       sourceVersionCount: Number(row.source_version_count ?? 1),
@@ -4957,6 +6342,140 @@ function mapAudioSpec(
       (nullableString(row.dsd_rate) as
         "DSD64" | "DSD128" | "DSD256" | "DSD512" | null) ?? null,
   };
+}
+
+function isAlbumMetadataField(
+  field: MetadataField,
+): field is "title" | "albumArtist" | "year" {
+  return field === "title" || field === "albumArtist" || field === "year";
+}
+
+function normalizeMetadataValue(
+  field: MetadataField,
+  value: string | number,
+): string | number {
+  const invalidText = (text: string, maximum: number) =>
+    text.length > maximum ||
+    /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u.test(text);
+  if (field === "year") {
+    const year = typeof value === "number" ? value : Number(value);
+    if (
+      !Number.isInteger(year) ||
+      year < 1000 ||
+      year > new Date().getUTCFullYear() + 1
+    )
+      throw new AlbumMetadataDecisionError(
+        "INVALID_METADATA_DECISION",
+        "年份必须是 1000 至下一年之间的整数",
+      );
+    return year;
+  }
+  if (typeof value !== "string")
+    throw new AlbumMetadataDecisionError(
+      "INVALID_METADATA_DECISION",
+      `${field} 必须是文本`,
+    );
+  const text = value.trim();
+  const maximum =
+    field === "catalogNumber" ? 100 : field === "barcode" ? 14 : 300;
+  if (!text)
+    throw new AlbumMetadataDecisionError(
+      "INVALID_METADATA_DECISION",
+      `${field} 不能设置为空白；需要空值时请使用 CLEAR`,
+    );
+  if (invalidText(text, maximum))
+    throw new AlbumMetadataDecisionError(
+      "INVALID_METADATA_DECISION",
+      `${field} 的长度或字符不符合要求`,
+    );
+  if (field === "barcode" && !/^(?:\d{8}|\d{12}|\d{13}|\d{14})$/.test(text))
+    throw new AlbumMetadataDecisionError(
+      "INVALID_METADATA_DECISION",
+      "条码必须是 8、12、13 或 14 位数字",
+    );
+  if (field === "country" && !/^[A-Z]{2}$/.test(text))
+    throw new AlbumMetadataDecisionError(
+      "INVALID_METADATA_DECISION",
+      "国家必须是两位大写国家码",
+    );
+  if (field === "releaseDate" && !validReleaseDate(text))
+    throw new AlbumMetadataDecisionError(
+      "INVALID_METADATA_DECISION",
+      "发行日期必须是 YYYY、YYYY-MM 或有效的 YYYY-MM-DD",
+    );
+  return text;
+}
+
+function validReleaseDate(value: string): boolean {
+  if (/^\d{4}$/.test(value)) return true;
+  if (/^\d{4}-(?:0[1-9]|1[0-2])$/.test(value)) return true;
+  if (!/^\d{4}-(?:0[1-9]|1[0-2])-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split("-").map(Number) as [
+    number,
+    number,
+    number,
+  ];
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return (
+    date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day
+  );
+}
+
+function parseMetadataJson(value: string | null): string | number | null {
+  if (value === null) return null;
+  return parseJson<string | number | null>(value, null);
+}
+
+function metadataString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function mapStoredMetadataValue(
+  row: Record<string, unknown>,
+): StoredMetadataValue {
+  return {
+    scopeType: row.scope_type as StoredMetadataValue["scopeType"],
+    ownerId: String(row.owner_id),
+    fieldName: row.field_name as MetadataField,
+    sourceType: row.source_type as StoredMetadataValue["sourceType"],
+    valueJson: row.value_json === null ? null : String(row.value_json),
+    evidenceJson: String(row.evidence_json),
+    actorId: nullableString(row.actor_id),
+    actorDisplayName: nullableString(row.actor_display_name),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function canonicalMetadataInput(
+  libraryAlbumId: string,
+  expectedMetadataRevision: number,
+  commands: unknown[],
+): string {
+  return JSON.stringify({
+    libraryAlbumId,
+    expectedMetadataRevision,
+    commands,
+  });
+}
+
+function effectiveAlbumFieldSql(
+  field: "title" | "albumArtist" | "year",
+  observedSql: string,
+): string {
+  const row = (source: "USER_OVERRIDE" | "CONFIRMED_EXTERNAL") =>
+    `(SELECT json_extract(mv.value_json,'$') FROM library_metadata_values mv
+      WHERE mv.scope_type='ALBUM' AND mv.owner_id=la.id
+        AND mv.field_name='${field}' AND mv.source_type='${source}')`;
+  const exists = (source: "USER_OVERRIDE" | "CONFIRMED_EXTERNAL") =>
+    `EXISTS(SELECT 1 FROM library_metadata_values mv
+      WHERE mv.scope_type='ALBUM' AND mv.owner_id=la.id
+        AND mv.field_name='${field}' AND mv.source_type='${source}')`;
+  return `(CASE WHEN ${exists("USER_OVERRIDE")} THEN ${row("USER_OVERRIDE")}
+    WHEN ${exists("CONFIRMED_EXTERNAL")} THEN ${row("CONFIRMED_EXTERNAL")}
+    ELSE ${observedSql} END)`;
 }
 
 function parseJson<T>(value: unknown, fallback: T): T {
