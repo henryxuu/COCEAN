@@ -1,5 +1,6 @@
 import type {
   AlbumDetail,
+  AlbumArtworkGovernance,
   AlbumMetadata,
   DeliveryJob,
   LocalVersionSummary,
@@ -8,6 +9,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
   AlbumDeliveryRecord,
+  AlbumArtworkGovernancePanel,
   AlbumIdentityGovernance,
   AlbumIdentityHistory,
   AlbumIntegrityIssues,
@@ -168,6 +170,115 @@ describe("Album 元数据治理", () => {
     expect(html).toContain("成员与 Demo 可以查看来源和历史");
     expect(html).not.toContain("保存修改（");
     expect(html).not.toContain("清空有效值");
+    expect(html).not.toContain(">撤销<");
+  });
+});
+
+describe("Album 封面治理", () => {
+  const album = {
+    id: "library-art",
+    title: "Artwork Album",
+    albumArtist: "Artist",
+    localVersions: [
+      {
+        id: "local-art",
+        title: "Artwork Album",
+        albumArtist: "Artist",
+        year: 2026,
+        matchStatus: "USER_CONFIRMED",
+        musicBrainzReleaseId: "123e4567-e89b-42d3-a456-426614174000",
+      },
+    ],
+  } as AlbumDetail;
+  const governance = {
+    libraryAlbumId: "library-art",
+    artworkRevision: 2,
+    effectiveArtwork: {
+      source: "EMBEDDED",
+      url: `/api/v1/artwork/${"a".repeat(64)}`,
+      mimeType: "image/jpeg",
+      width: 1200,
+      height: 1200,
+    },
+    selectionSource: "USER_SELECTED",
+    selectedAssetSha256: "a".repeat(64),
+    selectedCandidateId: "candidate-local",
+    candidates: [
+      {
+        id: "candidate-local",
+        assetSha256: "a".repeat(64),
+        source: "OBSERVED_EMBEDDED",
+        localVersionId: "local-art",
+        relativePath: "Artist/Album/01.flac",
+        kind: "Front Cover",
+        mimeType: "image/jpeg",
+        width: 1200,
+        height: 1200,
+        sizeBytes: 120000,
+        url: `/api/v1/artwork/${"a".repeat(64)}`,
+        current: true,
+        selected: true,
+        lowResolution: false,
+        evidence: {},
+      },
+    ],
+    truncated: false,
+  } satisfies AlbumArtworkGovernance;
+
+  it("统一展示有效封面、本地候选、CAA、上传、质量事实与撤销入口", () => {
+    const html = renderToStaticMarkup(
+      <AlbumArtworkGovernancePanel
+        album={album}
+        governance={governance}
+        history={[
+          {
+            id: "art-event",
+            requestId: "art-request",
+            libraryAlbumId: "library-art",
+            type: "SELECT",
+            actor: { id: "admin", displayName: "管理员" },
+            expectedArtworkRevision: 1,
+            resultingArtworkRevision: 2,
+            assetSha256: "a".repeat(64),
+            candidateId: "candidate-local",
+            compensatesEventId: null,
+            canUndo: true,
+            createdAt: "2026-08-14T00:00:00.000Z",
+          },
+        ]}
+        historyError={null}
+        canManage
+        onReload={async () => true}
+        onToast={() => undefined}
+      />,
+    );
+    expect(html).toContain("人工选择");
+    expect(html).toContain("1200 × 1200");
+    expect(html).toContain("内嵌封面");
+    expect(html).toContain("MusicBrainz / CAA");
+    expect(html).toContain("导入 CAA 正面封面");
+    expect(html).toContain("上传并选中");
+    expect(html).toContain("服务端会真实解码校验");
+    expect(html).toContain("撤销");
+    expect(html).not.toMatch(/Hi-Res|HiRes/);
+  });
+
+  it("成员能看证据和历史，但没有选择、导入、上传或撤销按钮", () => {
+    const html = renderToStaticMarkup(
+      <AlbumArtworkGovernancePanel
+        album={album}
+        governance={governance}
+        history={[]}
+        historyError={null}
+        canManage={false}
+        onReload={async () => true}
+        onToast={() => undefined}
+      />,
+    );
+    expect(html).toContain("封面治理");
+    expect(html).toContain("内嵌封面");
+    expect(html).not.toContain("导入 CAA 正面封面");
+    expect(html).not.toContain("上传并选中");
     expect(html).not.toContain(">撤销<");
   });
 });

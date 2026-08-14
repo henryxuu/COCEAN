@@ -3,6 +3,9 @@ import { mkdirSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import BetterSqlite3 from "better-sqlite3";
 import type {
+  AlbumArtworkEvent,
+  AlbumArtworkGovernance,
+  AlbumArtworkMutationResult,
   AlbumAggregationIssue,
   AlbumDetail,
   AlbumIntroduction,
@@ -10,6 +13,8 @@ import type {
   AlbumMetadataEvent,
   AlbumMetadataMutationResult,
   AlbumSummary,
+  Artwork,
+  ArtworkDecisionCommand,
   AuthSession,
   AuthUser,
   CoceanSettings,
@@ -134,6 +139,38 @@ export class AlbumMetadataDecisionError extends Error {
   }
 }
 
+export class AlbumArtworkDecisionError extends Error {
+  constructor(
+    public readonly code:
+      "INVALID_ARTWORK_DECISION" | "ARTWORK_DECISION_CONFLICT",
+    message: string,
+  ) {
+    super(message);
+    this.name = "AlbumArtworkDecisionError";
+  }
+}
+
+export interface ArtworkAssetInput {
+  sha256: string;
+  mimeType: "image/jpeg" | "image/png" | "image/webp";
+  width: number;
+  height: number;
+  sizeBytes: number;
+  extension: ".jpg" | ".png" | ".webp";
+}
+
+export interface ArtworkCandidateInput extends ArtworkAssetInput {
+  source:
+    | "OBSERVED_EMBEDDED"
+    | "OBSERVED_SIDECAR"
+    | "USER_UPLOAD"
+    | "MUSICBRAINZ_CAA";
+  localVersionId: string | null;
+  relativePath: string | null;
+  kind: string | null;
+  evidence: Record<string, unknown>;
+}
+
 interface StoredMetadataValue {
   scopeType: "ALBUM" | "VERSION";
   ownerId: string;
@@ -158,6 +195,17 @@ interface AlbumMetadataSnapshot {
   }>;
 }
 
+interface ArtworkSelectionSnapshot {
+  libraryAlbumId: string;
+  state: "SELECTED" | "HIDDEN" | null;
+  assetSha256: string | null;
+  candidateId: string | null;
+  actorId: string | null;
+  actorDisplayName: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
 interface LibraryIdentitySnapshot {
   groups: Array<{
     id: string;
@@ -169,6 +217,10 @@ interface LibraryIdentitySnapshot {
     primaryVersionSource: "AUTOMATIC" | "USER";
     revision: number;
     metadataRevision: number;
+    artworkRevision?: number;
+    effectiveArtworkJson?: string;
+    effectiveArtworkSource?: AlbumArtworkGovernance["selectionSource"];
+    artworkSelection?: ArtworkSelectionSnapshot;
     createdAt: string;
     updatedAt: string;
     members: Array<{
@@ -2038,7 +2090,11 @@ export class CoceanDatabase {
             OR EXISTS (SELECT 1 FROM library_metadata_values mv
                        WHERE mv.scope_type='ALBUM' AND mv.owner_id=library_albums.id)
             OR EXISTS (SELECT 1 FROM library_metadata_event_groups meg
-                       WHERE meg.library_album_id=library_albums.id)`,
+                       WHERE meg.library_album_id=library_albums.id)
+            OR EXISTS (SELECT 1 FROM library_artwork_selections aws
+                       WHERE aws.library_album_id=library_albums.id)
+            OR EXISTS (SELECT 1 FROM library_artwork_event_groups aeg
+                       WHERE aeg.library_album_id=library_albums.id)`,
       )
       .all() as Record<string, unknown>[];
     const protectedGroupIds = new Set(
@@ -2056,6 +2112,10 @@ export class CoceanDatabase {
                              WHERE mv.scope_type='ALBUM' AND mv.owner_id=library_albums.id)
                   OR EXISTS (SELECT 1 FROM library_metadata_event_groups meg
                              WHERE meg.library_album_id=library_albums.id)
+                  OR EXISTS (SELECT 1 FROM library_artwork_selections aws
+                             WHERE aws.library_album_id=library_albums.id)
+                  OR EXISTS (SELECT 1 FROM library_artwork_event_groups aeg
+                             WHERE aeg.library_album_id=library_albums.id)
              )`,
           )
           .all() as Array<{ album_id: string }>
@@ -2100,6 +2160,10 @@ export class CoceanDatabase {
                            WHERE mv.scope_type='ALBUM' AND mv.owner_id=library_albums.id)
                 OR EXISTS (SELECT 1 FROM library_metadata_event_groups meg
                            WHERE meg.library_album_id=library_albums.id)
+                OR EXISTS (SELECT 1 FROM library_artwork_selections aws
+                           WHERE aws.library_album_id=library_albums.id)
+                OR EXISTS (SELECT 1 FROM library_artwork_event_groups aeg
+                           WHERE aeg.library_album_id=library_albums.id)
            )`,
       )
       .run();
@@ -2174,6 +2238,7 @@ export class CoceanDatabase {
         baseline.metadataSignatures.get(groupId),
         now,
       );
+      this.refreshEffectiveArtwork(groupId, Boolean(existing), now);
     }
     for (const group of protectedGroups) {
       const groupId = String(group.id);
@@ -2208,6 +2273,7 @@ export class CoceanDatabase {
         baseline.metadataSignatures.get(groupId),
         now,
       );
+      this.refreshEffectiveArtwork(groupId, true, now);
     }
     this.raw
       .prepare(
@@ -2502,6 +2568,7 @@ export class CoceanDatabase {
         scope = [sourceId, targetId];
         before = this.captureLibraryIdentitySnapshot(scope);
         this.mergeAlbumMetadataOwnership(sourceId, targetId, now);
+        this.mergeAlbumArtworkOwnership(sourceId, targetId, now);
         inheritedDecisionIds =
           this.libraryIdentityDecisionIdsForGroup(sourceId);
         inheritedHistoryTargets = [targetId];
@@ -2674,6 +2741,11 @@ export class CoceanDatabase {
           createdIds.filter((id) => id !== sourceId),
           now,
         );
+        this.inheritSplitAlbumArtwork(
+          sourceId,
+          createdIds.filter((id) => id !== sourceId),
+          now,
+        );
       }
 
       if (command.type === "SET_PRIMARY" || command.type === "SPLIT") {
@@ -2683,6 +2755,7 @@ export class CoceanDatabase {
           now,
         );
         this.refreshMetadataIssueStatus(sourceId);
+        this.refreshEffectiveArtwork(sourceId, true, now);
       }
       if (command.type === "MERGE" && mergeTargetMetadataSignature !== null) {
         this.bumpMetadataRevisionForEffectiveChange(
@@ -2691,6 +2764,7 @@ export class CoceanDatabase {
           now,
         );
         this.refreshMetadataIssueStatus(currentLibraryAlbumId);
+        this.refreshEffectiveArtwork(currentLibraryAlbumId, true, now);
       }
 
       const after = this.captureLibraryIdentitySnapshot(scope);
@@ -2766,6 +2840,138 @@ export class CoceanDatabase {
          SELECT event_id,? FROM library_metadata_event_groups WHERE library_album_id=?`,
       )
       .run(targetId, sourceId);
+  }
+
+  private mergeAlbumArtworkOwnership(
+    sourceId: string,
+    targetId: string,
+    now: string,
+  ): void {
+    const sourceSelection = this.captureArtworkSelection(sourceId);
+    const targetSelection = this.captureArtworkSelection(targetId);
+    if (
+      sourceSelection.state &&
+      targetSelection.state &&
+      (sourceSelection.state !== targetSelection.state ||
+        sourceSelection.assetSha256 !== targetSelection.assetSha256)
+    )
+      throw new LibraryIdentityDecisionError(
+        "IDENTITY_DECISION_CONFLICT",
+        "合并唱片的人工封面决定冲突，请先保留、隐藏或重置其中一张唱片的封面",
+      );
+
+    const candidates = this.raw
+      .prepare(
+        `SELECT c.*,a.mime_type,a.width,a.height,a.size_bytes,a.extension
+         FROM library_artwork_candidates c
+         JOIN library_artwork_assets a ON a.sha256=c.asset_sha256
+         WHERE c.library_album_id=? ORDER BY c.id`,
+      )
+      .all(sourceId) as Record<string, unknown>[];
+    const candidateIds = new Map<string, string>();
+    for (const candidate of candidates) {
+      const nextId = this.upsertArtworkCandidateInTransaction(
+        targetId,
+        {
+          sha256: String(candidate.asset_sha256),
+          mimeType: candidate.mime_type as ArtworkAssetInput["mimeType"],
+          width: Number(candidate.width),
+          height: Number(candidate.height),
+          sizeBytes: Number(candidate.size_bytes),
+          extension: candidate.extension as ArtworkAssetInput["extension"],
+          source: candidate.source_type as ArtworkCandidateInput["source"],
+          localVersionId: nullableString(candidate.local_version_id),
+          relativePath: nullableString(candidate.relative_path),
+          kind: nullableString(candidate.kind),
+          evidence: {
+            ...parseJson<Record<string, unknown>>(candidate.evidence_json, {}),
+            inheritedFromLibraryAlbumId: sourceId,
+          },
+        },
+        now,
+      );
+      candidateIds.set(String(candidate.id), nextId);
+      if (!Boolean(candidate.is_current))
+        this.raw
+          .prepare(
+            "UPDATE library_artwork_candidates SET is_current=0 WHERE id=?",
+          )
+          .run(nextId);
+    }
+    if (!targetSelection.state && sourceSelection.state) {
+      this.restoreArtworkSelection({
+        ...sourceSelection,
+        libraryAlbumId: targetId,
+        candidateId: sourceSelection.candidateId
+          ? (candidateIds.get(sourceSelection.candidateId) ?? null)
+          : null,
+        updatedAt: now,
+      });
+    }
+    this.raw
+      .prepare(
+        `INSERT OR IGNORE INTO library_artwork_event_groups(event_id,library_album_id)
+         SELECT event_id,? FROM library_artwork_event_groups WHERE library_album_id=?`,
+      )
+      .run(targetId, sourceId);
+  }
+
+  private inheritSplitAlbumArtwork(
+    sourceId: string,
+    createdIds: string[],
+    now: string,
+  ): void {
+    const selectedCandidateId =
+      this.captureArtworkSelection(sourceId).candidateId;
+    const candidates = this.raw
+      .prepare(
+        `SELECT c.*,a.mime_type,a.width,a.height,a.size_bytes,a.extension
+         FROM library_artwork_candidates c
+         JOIN library_artwork_assets a ON a.sha256=c.asset_sha256
+         WHERE c.library_album_id=? AND c.local_version_id IS NOT NULL
+         ORDER BY c.id`,
+      )
+      .all(sourceId) as Record<string, unknown>[];
+    for (const createdId of createdIds) {
+      const members = new Set(this.libraryIdentityMemberIds([createdId]));
+      for (const candidate of candidates) {
+        if (!members.has(String(candidate.local_version_id))) continue;
+        const nextId = this.upsertArtworkCandidateInTransaction(
+          createdId,
+          {
+            sha256: String(candidate.asset_sha256),
+            mimeType: candidate.mime_type as ArtworkAssetInput["mimeType"],
+            width: Number(candidate.width),
+            height: Number(candidate.height),
+            sizeBytes: Number(candidate.size_bytes),
+            extension: candidate.extension as ArtworkAssetInput["extension"],
+            source: candidate.source_type as ArtworkCandidateInput["source"],
+            localVersionId: String(candidate.local_version_id),
+            relativePath: nullableString(candidate.relative_path),
+            kind: nullableString(candidate.kind),
+            evidence: parseJson<Record<string, unknown>>(
+              candidate.evidence_json,
+              {},
+            ),
+          },
+          now,
+        );
+        if (!Boolean(candidate.is_current))
+          this.raw
+            .prepare(
+              "UPDATE library_artwork_candidates SET is_current=0 WHERE id=?",
+            )
+            .run(nextId);
+        if (String(candidate.id) !== selectedCandidateId)
+          this.raw
+            .prepare(
+              `UPDATE library_artwork_candidates SET is_current=0,updated_at=?
+               WHERE id=?`,
+            )
+            .run(now, String(candidate.id));
+      }
+      this.refreshEffectiveArtwork(createdId, false, now);
+    }
   }
 
   private inheritSplitAlbumMetadata(
@@ -3159,6 +3365,14 @@ export class CoceanDatabase {
           "AUTOMATIC" | "USER",
         revision: Number(row.revision),
         metadataRevision: Number(row.metadata_revision ?? 0),
+        artworkRevision: Number(row.artwork_revision ?? 0),
+        effectiveArtworkJson: String(
+          row.effective_artwork_json ?? JSON.stringify(emptyArtworkValue()),
+        ),
+        effectiveArtworkSource: String(
+          row.effective_artwork_source ?? "NONE",
+        ) as AlbumArtworkGovernance["selectionSource"],
+        artworkSelection: this.captureArtworkSelection(String(row.id)),
         createdAt: String(row.created_at),
         updatedAt: String(row.updated_at),
         members,
@@ -3205,6 +3419,19 @@ export class CoceanDatabase {
   ): void {
     const current = this.captureLibraryIdentitySnapshot(scope);
     const groupIds = current.groups.map((group) => group.id);
+    const preservedArtworkCandidates = groupIds.length
+      ? (this.raw
+          .prepare(
+            `SELECT * FROM library_artwork_candidates
+             WHERE library_album_id IN (${groupIds.map(() => "?").join(",")})
+             ORDER BY id`,
+          )
+          .all(...groupIds) as Record<string, unknown>[])
+      : [];
+    const selectionChangedSinceDecision = !sameArtworkSelections(
+      current,
+      expectedAfter,
+    );
     if (groupIds.length) {
       const placeholders = groupIds.map(() => "?").join(",");
       this.raw
@@ -3232,8 +3459,9 @@ export class CoceanDatabase {
         .prepare(
           `INSERT INTO library_albums
              (id,identity_key,title,album_artist,primary_version_id,decision_source,
-              primary_version_source,revision,metadata_revision,created_at,updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+              primary_version_source,revision,metadata_revision,artwork_revision,
+              effective_artwork_json,effective_artwork_source,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         )
         .run(
           group.id,
@@ -3248,6 +3476,16 @@ export class CoceanDatabase {
             currentGroup?.metadataRevision ?? group.metadataRevision,
             group.metadataRevision,
           ),
+          Math.max(
+            currentGroup?.artworkRevision ?? group.artworkRevision ?? 0,
+            group.artworkRevision ?? 0,
+          ),
+          currentGroup?.effectiveArtworkJson ??
+            group.effectiveArtworkJson ??
+            JSON.stringify(emptyArtworkValue()),
+          currentGroup?.effectiveArtworkSource ??
+            group.effectiveArtworkSource ??
+            "NONE",
           currentGroup?.createdAt ?? group.createdAt,
           now,
         );
@@ -3338,6 +3576,74 @@ export class CoceanDatabase {
           );
       }
     }
+    const restoredIds = new Set(snapshot.groups.map((group) => group.id));
+    const memberOwner = new Map<string, string>();
+    for (const group of snapshot.groups)
+      for (const member of group.members)
+        memberOwner.set(member.albumId, group.id);
+    for (const candidate of preservedArtworkCandidates) {
+      let ownerId = String(candidate.library_album_id);
+      const localVersionId = nullableString(candidate.local_version_id);
+      if (localVersionId && memberOwner.has(localVersionId))
+        ownerId = memberOwner.get(localVersionId)!;
+      else if (!restoredIds.has(ownerId)) {
+        if (restoredIds.size !== 1)
+          throw new LibraryIdentityDecisionError(
+            "IDENTITY_DECISION_CONFLICT",
+            "身份撤销后无法确定后续封面候选的归属",
+          );
+        ownerId = [...restoredIds][0]!;
+      }
+      this.raw
+        .prepare(
+          `INSERT INTO library_artwork_candidates
+           (id,library_album_id,local_version_id,asset_sha256,source_type,
+            relative_path,kind,evidence_json,is_current,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        )
+        .run(
+          candidate.id,
+          ownerId,
+          candidate.local_version_id,
+          candidate.asset_sha256,
+          candidate.source_type,
+          candidate.relative_path,
+          candidate.kind,
+          candidate.evidence_json,
+          candidate.is_current,
+          candidate.created_at,
+          candidate.updated_at,
+        );
+    }
+    const selections = selectionChangedSinceDecision
+      ? current.groups
+          .map((group) => group.artworkSelection)
+          .filter((selection): selection is ArtworkSelectionSnapshot =>
+            Boolean(selection?.state),
+          )
+      : snapshot.groups
+          .map((group) => group.artworkSelection)
+          .filter((selection): selection is ArtworkSelectionSnapshot =>
+            Boolean(selection?.state),
+          );
+    for (const selection of selections) {
+      let ownerId = selection.libraryAlbumId;
+      if (!restoredIds.has(ownerId)) {
+        if (restoredIds.size !== 1)
+          throw new LibraryIdentityDecisionError(
+            "IDENTITY_DECISION_CONFLICT",
+            "身份撤销会让后续人工封面决定失去唯一归属",
+          );
+        ownerId = [...restoredIds][0]!;
+      }
+      this.restoreArtworkSelection({
+        ...selection,
+        libraryAlbumId: ownerId,
+        updatedAt: now,
+      });
+    }
+    for (const group of snapshot.groups)
+      this.refreshEffectiveArtwork(group.id, false, now);
     for (const alias of snapshot.aliases)
       this.raw
         .prepare(
@@ -4317,6 +4623,847 @@ export class CoceanDatabase {
       );
   }
 
+  syncObservedArtworkCandidates(): void {
+    this.raw.transaction(() => {
+      const now = new Date().toISOString();
+      this.raw
+        .prepare(
+          `UPDATE library_artwork_candidates SET is_current=0,updated_at=?
+           WHERE source_type IN ('OBSERVED_EMBEDDED','OBSERVED_SIDECAR')`,
+        )
+        .run(now);
+      const rows = this.raw
+        .prepare(
+          `SELECT la.id AS library_album_id,a.id AS local_version_id,
+                  mf.relative_path,mf.artwork_json
+           FROM library_albums la
+           JOIN library_album_members lm ON lm.library_album_id=la.id
+           JOIN albums a ON a.id=lm.album_id
+           JOIN album_files af ON af.album_id=a.id
+           JOIN media_files mf ON mf.id=af.media_file_id
+           ORDER BY la.id,a.id,mf.relative_path`,
+        )
+        .all() as Record<string, unknown>[];
+      for (const row of rows) {
+        const candidates = parseJson<
+          Array<{
+            source?: string;
+            mimeType?: string | null;
+            width?: number | null;
+            height?: number | null;
+            bytes?: number | null;
+            sha256?: string | null;
+            kind?: string | null;
+          }>
+        >(row.artwork_json, []);
+        for (const candidate of candidates) {
+          const mimeType = supportedArtworkMime(candidate.mimeType);
+          if (
+            !mimeType ||
+            !candidate.sha256?.match(/^[a-f0-9]{64}$/) ||
+            !candidate.width ||
+            !candidate.height ||
+            candidate.bytes == null ||
+            !["EMBEDDED", "SIDECAR"].includes(candidate.source ?? "")
+          )
+            continue;
+          this.upsertArtworkCandidateInTransaction(
+            String(row.library_album_id),
+            {
+              sha256: candidate.sha256,
+              mimeType,
+              width: candidate.width,
+              height: candidate.height,
+              sizeBytes: candidate.bytes,
+              extension: artworkExtension(mimeType),
+              source:
+                candidate.source === "EMBEDDED"
+                  ? "OBSERVED_EMBEDDED"
+                  : "OBSERVED_SIDECAR",
+              localVersionId: String(row.local_version_id),
+              relativePath: String(row.relative_path),
+              kind: candidate.kind ?? null,
+              evidence: { mediaRelativePath: String(row.relative_path) },
+            },
+            now,
+          );
+        }
+      }
+      const groups = this.raw
+        .prepare("SELECT id FROM library_albums ORDER BY id")
+        .all() as Array<{ id: string }>;
+      for (const group of groups)
+        this.refreshEffectiveArtwork(group.id, true, now);
+    })();
+  }
+
+  getConfirmedMusicBrainzReleaseId(
+    albumId: string,
+    localVersionId: string,
+  ): string | null {
+    const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+    if (!libraryAlbumId) return null;
+    const row = this.raw
+      .prepare(
+        `SELECT a.musicbrainz_release_id FROM albums a
+         JOIN library_album_members m ON m.album_id=a.id
+         WHERE m.library_album_id=? AND a.id=? AND a.match_status='USER_CONFIRMED'`,
+      )
+      .get(libraryAlbumId, localVersionId) as
+      { musicbrainz_release_id: string | null } | undefined;
+    return row?.musicbrainz_release_id ?? null;
+  }
+
+  upsertArtworkCandidate(
+    albumId: string,
+    candidate: ArtworkCandidateInput,
+  ): string {
+    const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+    if (!libraryAlbumId)
+      throw new AlbumArtworkDecisionError(
+        "INVALID_ARTWORK_DECISION",
+        "没有找到需要管理封面的唱片",
+      );
+    if (
+      candidate.localVersionId &&
+      !this.libraryIdentityMemberIds([libraryAlbumId]).includes(
+        candidate.localVersionId,
+      )
+    )
+      throw new AlbumArtworkDecisionError(
+        "ARTWORK_DECISION_CONFLICT",
+        "封面候选绑定的本地版本已不属于当前唱片",
+      );
+    return this.raw.transaction(() => {
+      const now = new Date().toISOString();
+      const id = this.upsertArtworkCandidateInTransaction(
+        libraryAlbumId,
+        candidate,
+        now,
+      );
+      this.refreshEffectiveArtwork(libraryAlbumId, true, now);
+      return id;
+    })();
+  }
+
+  applyAlbumArtworkCandidateDecision(
+    albumId: string,
+    candidate: ArtworkCandidateInput,
+    command: { requestId: string; expectedArtworkRevision: number },
+    actor: LibraryIdentityActor,
+    eventType: "UPLOAD" | "IMPORT",
+  ): AlbumArtworkMutationResult {
+    const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+    if (!libraryAlbumId)
+      throw new AlbumArtworkDecisionError(
+        "INVALID_ARTWORK_DECISION",
+        "没有找到需要管理封面的唱片",
+      );
+    if (
+      candidate.localVersionId &&
+      !this.libraryIdentityMemberIds([libraryAlbumId]).includes(
+        candidate.localVersionId,
+      )
+    )
+      throw new AlbumArtworkDecisionError(
+        "ARTWORK_DECISION_CONFLICT",
+        "封面候选绑定的本地版本已不属于当前唱片",
+      );
+    const candidateId = artworkCandidateId(libraryAlbumId, candidate);
+    const decision: ArtworkDecisionCommand = {
+      action: "SELECT",
+      candidateId,
+      ...command,
+    };
+    const inputJson = JSON.stringify(
+      sortJsonValue({ libraryAlbumId, command: decision, eventType }),
+    );
+    const replay = this.artworkResultByRequestId(command.requestId, inputJson);
+    if (replay) return replay;
+    return this.raw.transaction(() => {
+      this.upsertArtworkCandidateInTransaction(
+        libraryAlbumId,
+        candidate,
+        new Date().toISOString(),
+      );
+      return this.applyAlbumArtworkDecision(
+        libraryAlbumId,
+        decision,
+        actor,
+        eventType,
+      );
+    })();
+  }
+
+  getAlbumArtworkGovernance(albumId: string): AlbumArtworkGovernance | null {
+    const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+    if (!libraryAlbumId) return null;
+    const group = this.raw
+      .prepare(
+        `SELECT artwork_revision,effective_artwork_json,effective_artwork_source
+         FROM library_albums WHERE id=?`,
+      )
+      .get(libraryAlbumId) as Record<string, unknown> | undefined;
+    if (!group) return null;
+    const selection = this.captureArtworkSelection(libraryAlbumId);
+    const total = Number(
+      (
+        this.raw
+          .prepare(
+            `SELECT COUNT(*) AS count FROM library_artwork_candidates
+             WHERE library_album_id=? AND (is_current=1 OR id=?)`,
+          )
+          .get(libraryAlbumId, selection.candidateId ?? "") as { count: number }
+      ).count,
+    );
+    const rows = this.raw
+      .prepare(
+        `SELECT c.*,a.mime_type,a.width,a.height,a.size_bytes
+         FROM library_artwork_candidates c
+         JOIN library_artwork_assets a ON a.sha256=c.asset_sha256
+         WHERE c.library_album_id=? AND (c.is_current=1 OR c.id=?)
+         ORDER BY CASE WHEN c.id=? THEN 0 ELSE 1 END,
+                  CASE c.source_type
+                    WHEN 'OBSERVED_EMBEDDED' THEN 0 WHEN 'OBSERVED_SIDECAR' THEN 1
+                    WHEN 'MUSICBRAINZ_CAA' THEN 2 ELSE 3 END,
+                  MIN(a.width,a.height) DESC,a.size_bytes DESC,c.id
+         LIMIT 100`,
+      )
+      .all(
+        libraryAlbumId,
+        selection.candidateId ?? "",
+        selection.candidateId ?? "",
+      ) as Record<string, unknown>[];
+    return {
+      libraryAlbumId,
+      artworkRevision: Number(group.artwork_revision),
+      effectiveArtwork: parseJson<Artwork>(
+        group.effective_artwork_json,
+        emptyArtworkValue(),
+      ),
+      selectionSource: String(
+        group.effective_artwork_source,
+      ) as AlbumArtworkGovernance["selectionSource"],
+      selectedAssetSha256: selection.assetSha256,
+      selectedCandidateId: selection.candidateId,
+      candidates: rows.map((row) => ({
+        id: String(row.id),
+        assetSha256: String(row.asset_sha256),
+        source:
+          row.source_type as AlbumArtworkGovernance["candidates"][number]["source"],
+        localVersionId: nullableString(row.local_version_id),
+        relativePath: nullableString(row.relative_path),
+        kind: nullableString(row.kind),
+        mimeType: row.mime_type as "image/jpeg" | "image/png" | "image/webp",
+        width: Number(row.width),
+        height: Number(row.height),
+        sizeBytes: Number(row.size_bytes),
+        url: `/api/v1/artwork/${String(row.asset_sha256)}`,
+        current: Boolean(row.is_current),
+        selected: selection.candidateId
+          ? selection.candidateId === String(row.id)
+          : selection.assetSha256 === String(row.asset_sha256),
+        lowResolution: Number(row.width) < 600 || Number(row.height) < 600,
+        evidence: parseJson<Record<string, unknown>>(row.evidence_json, {}),
+      })),
+      truncated: total > 100,
+    };
+  }
+
+  applyAlbumArtworkDecision(
+    albumId: string,
+    command: ArtworkDecisionCommand,
+    actor: LibraryIdentityActor,
+    eventType?: AlbumArtworkEvent["type"],
+  ): AlbumArtworkMutationResult {
+    const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+    if (!libraryAlbumId)
+      throw new AlbumArtworkDecisionError(
+        "INVALID_ARTWORK_DECISION",
+        "没有找到需要管理封面的唱片",
+      );
+    const inputJson = JSON.stringify(
+      sortJsonValue({ libraryAlbumId, command, eventType: eventType ?? null }),
+    );
+    const replay = this.artworkResultByRequestId(command.requestId, inputJson);
+    if (replay) return replay;
+    return this.raw.transaction(() => {
+      const row = this.raw
+        .prepare("SELECT artwork_revision FROM library_albums WHERE id=?")
+        .get(libraryAlbumId) as { artwork_revision: number };
+      if (Number(row.artwork_revision) !== command.expectedArtworkRevision)
+        throw new AlbumArtworkDecisionError(
+          "ARTWORK_DECISION_CONFLICT",
+          "封面已被其他操作更新，请刷新后重试",
+        );
+      const before = this.captureArtworkSelection(libraryAlbumId);
+      const now = new Date().toISOString();
+      let assetSha256: string | null = null;
+      let candidateId: string | null = null;
+      if (command.action === "SELECT") {
+        const candidate = this.raw
+          .prepare(
+            `SELECT id,asset_sha256 FROM library_artwork_candidates
+             WHERE id=? AND library_album_id=? AND is_current=1`,
+          )
+          .get(command.candidateId, libraryAlbumId) as
+          { id: string; asset_sha256: string } | undefined;
+        if (!candidate)
+          throw new AlbumArtworkDecisionError(
+            "ARTWORK_DECISION_CONFLICT",
+            "封面候选已变化，请重新选择",
+          );
+        assetSha256 = candidate.asset_sha256;
+        candidateId = candidate.id;
+        this.raw
+          .prepare(
+            `INSERT INTO library_artwork_selections
+             (library_album_id,state,asset_sha256,candidate_id,actor_id,actor_display_name,created_at,updated_at)
+             VALUES (?,'SELECTED',?,?,?,?,?,?)
+             ON CONFLICT(library_album_id) DO UPDATE SET
+               state='SELECTED',asset_sha256=excluded.asset_sha256,
+               candidate_id=excluded.candidate_id,actor_id=excluded.actor_id,
+               actor_display_name=excluded.actor_display_name,updated_at=excluded.updated_at`,
+          )
+          .run(
+            libraryAlbumId,
+            assetSha256,
+            candidateId,
+            actor.id,
+            actor.displayName,
+            before.createdAt ?? now,
+            now,
+          );
+      } else if (command.action === "HIDE") {
+        this.raw
+          .prepare(
+            `INSERT INTO library_artwork_selections
+             (library_album_id,state,asset_sha256,candidate_id,actor_id,actor_display_name,created_at,updated_at)
+             VALUES (?,'HIDDEN',NULL,NULL,?,?,?,?)
+             ON CONFLICT(library_album_id) DO UPDATE SET
+               state='HIDDEN',asset_sha256=NULL,candidate_id=NULL,
+               actor_id=excluded.actor_id,actor_display_name=excluded.actor_display_name,
+               updated_at=excluded.updated_at`,
+          )
+          .run(
+            libraryAlbumId,
+            actor.id,
+            actor.displayName,
+            before.createdAt ?? now,
+            now,
+          );
+      } else {
+        this.raw
+          .prepare(
+            "DELETE FROM library_artwork_selections WHERE library_album_id=?",
+          )
+          .run(libraryAlbumId);
+      }
+      this.raw
+        .prepare(
+          "UPDATE library_albums SET artwork_revision=artwork_revision+1,updated_at=? WHERE id=?",
+        )
+        .run(now, libraryAlbumId);
+      this.refreshEffectiveArtwork(libraryAlbumId, false, now);
+      const after = this.captureArtworkSelection(libraryAlbumId);
+      return this.recordAlbumArtworkEvent({
+        requestId: command.requestId,
+        inputJson,
+        libraryAlbumId,
+        type:
+          eventType ??
+          (command.action === "SELECT"
+            ? "SELECT"
+            : command.action === "HIDE"
+              ? "HIDE"
+              : "RESET"),
+        actor,
+        expectedArtworkRevision: command.expectedArtworkRevision,
+        before,
+        after,
+        assetSha256,
+        candidateId,
+        compensatesEventId: null,
+        createdAt: now,
+      });
+    })();
+  }
+
+  listAlbumArtworkHistory(albumId: string): AlbumArtworkEvent[] {
+    const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+    if (!libraryAlbumId) return [];
+    return (
+      this.raw
+        .prepare(
+          `SELECT e.* FROM library_artwork_events e
+           WHERE EXISTS (SELECT 1 FROM library_artwork_event_groups g
+             WHERE g.event_id=e.id AND g.library_album_id=?)
+           ORDER BY e.rowid DESC LIMIT 100`,
+        )
+        .all(libraryAlbumId) as Record<string, unknown>[]
+    ).map((row) => this.mapAlbumArtworkEvent(row, libraryAlbumId));
+  }
+
+  undoAlbumArtworkEvent(
+    albumId: string,
+    eventId: string,
+    requestId: string,
+    expectedArtworkRevision: number,
+    actor: LibraryIdentityActor,
+  ): AlbumArtworkMutationResult {
+    const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+    if (!libraryAlbumId)
+      throw new AlbumArtworkDecisionError(
+        "INVALID_ARTWORK_DECISION",
+        "没有找到需要撤销封面决定的唱片",
+      );
+    const inputJson = JSON.stringify(
+      sortJsonValue({
+        libraryAlbumId,
+        eventId,
+        requestId,
+        expectedArtworkRevision,
+        action: "UNDO",
+      }),
+    );
+    const replay = this.artworkResultByRequestId(requestId, inputJson);
+    if (replay) return replay;
+    return this.raw.transaction(() => {
+      const event = this.raw
+        .prepare("SELECT * FROM library_artwork_events WHERE id=?")
+        .get(eventId) as Record<string, unknown> | undefined;
+      const mapped = event
+        ? this.mapAlbumArtworkEvent(event, libraryAlbumId)
+        : null;
+      if (!event || !mapped?.canUndo)
+        throw new AlbumArtworkDecisionError(
+          "ARTWORK_DECISION_CONFLICT",
+          "该封面决定已不是可安全撤销的最新事件",
+        );
+      const group = this.raw
+        .prepare("SELECT artwork_revision FROM library_albums WHERE id=?")
+        .get(libraryAlbumId) as { artwork_revision: number };
+      if (Number(group.artwork_revision) !== expectedArtworkRevision)
+        throw new AlbumArtworkDecisionError(
+          "ARTWORK_DECISION_CONFLICT",
+          "封面已更新，请刷新后重试撤销",
+        );
+      const before = this.captureArtworkSelection(libraryAlbumId);
+      const restore = parseJson<ArtworkSelectionSnapshot>(
+        event.before_state_json,
+        emptyArtworkSelection(libraryAlbumId),
+      );
+      this.restoreArtworkSelection(restore);
+      const now = new Date().toISOString();
+      this.raw
+        .prepare(
+          "UPDATE library_albums SET artwork_revision=artwork_revision+1,updated_at=? WHERE id=?",
+        )
+        .run(now, libraryAlbumId);
+      this.refreshEffectiveArtwork(libraryAlbumId, false, now);
+      const after = this.captureArtworkSelection(libraryAlbumId);
+      return this.recordAlbumArtworkEvent({
+        requestId,
+        inputJson,
+        libraryAlbumId,
+        type: "UNDO",
+        actor,
+        expectedArtworkRevision,
+        before,
+        after,
+        assetSha256: after.assetSha256,
+        candidateId: after.candidateId,
+        compensatesEventId: eventId,
+        createdAt: now,
+      });
+    })();
+  }
+
+  private upsertArtworkCandidateInTransaction(
+    libraryAlbumId: string,
+    candidate: ArtworkCandidateInput,
+    now: string,
+  ): string {
+    if (
+      !candidate.sha256.match(/^[a-f0-9]{64}$/) ||
+      candidate.width <= 0 ||
+      candidate.height <= 0 ||
+      candidate.sizeBytes < 0
+    )
+      throw new AlbumArtworkDecisionError(
+        "INVALID_ARTWORK_DECISION",
+        "封面资产事实无效",
+      );
+    this.raw
+      .prepare(
+        `INSERT OR IGNORE INTO library_artwork_assets
+         (sha256,mime_type,width,height,size_bytes,extension,created_at)
+         VALUES (?,?,?,?,?,?,?)`,
+      )
+      .run(
+        candidate.sha256,
+        candidate.mimeType,
+        candidate.width,
+        candidate.height,
+        candidate.sizeBytes,
+        candidate.extension,
+        now,
+      );
+    const storedAsset = this.raw
+      .prepare(
+        `SELECT mime_type,width,height,size_bytes,extension
+         FROM library_artwork_assets WHERE sha256=?`,
+      )
+      .get(candidate.sha256) as Record<string, unknown>;
+    if (
+      storedAsset.mime_type !== candidate.mimeType ||
+      Number(storedAsset.width) !== candidate.width ||
+      Number(storedAsset.height) !== candidate.height ||
+      Number(storedAsset.size_bytes) !== candidate.sizeBytes ||
+      storedAsset.extension !== candidate.extension
+    )
+      throw new AlbumArtworkDecisionError(
+        "ARTWORK_DECISION_CONFLICT",
+        "相同内容哈希的封面资产事实不一致",
+      );
+    const id = artworkCandidateId(libraryAlbumId, candidate);
+    this.raw
+      .prepare(
+        `INSERT INTO library_artwork_candidates
+         (id,library_album_id,local_version_id,asset_sha256,source_type,
+          relative_path,kind,evidence_json,is_current,created_at,updated_at)
+         VALUES (?,?,?,?,?,?,?,?,1,?,?)
+         ON CONFLICT(id) DO UPDATE SET asset_sha256=excluded.asset_sha256,
+           relative_path=excluded.relative_path,kind=excluded.kind,
+           evidence_json=excluded.evidence_json,is_current=1,updated_at=excluded.updated_at`,
+      )
+      .run(
+        id,
+        libraryAlbumId,
+        candidate.localVersionId,
+        candidate.sha256,
+        candidate.source,
+        candidate.relativePath,
+        candidate.kind,
+        JSON.stringify(candidate.evidence),
+        now,
+        now,
+      );
+    return id;
+  }
+
+  private captureArtworkSelection(
+    libraryAlbumId: string,
+  ): ArtworkSelectionSnapshot {
+    const row = this.raw
+      .prepare(
+        "SELECT * FROM library_artwork_selections WHERE library_album_id=?",
+      )
+      .get(libraryAlbumId) as Record<string, unknown> | undefined;
+    return row
+      ? {
+          libraryAlbumId,
+          state: row.state as "SELECTED" | "HIDDEN",
+          assetSha256: nullableString(row.asset_sha256),
+          candidateId: nullableString(row.candidate_id),
+          actorId: nullableString(row.actor_id),
+          actorDisplayName: nullableString(row.actor_display_name),
+          createdAt: nullableString(row.created_at),
+          updatedAt: nullableString(row.updated_at),
+        }
+      : emptyArtworkSelection(libraryAlbumId);
+  }
+
+  private restoreArtworkSelection(snapshot: ArtworkSelectionSnapshot): void {
+    const candidateId = snapshot.candidateId
+      ? this.raw
+          .prepare("SELECT 1 FROM library_artwork_candidates WHERE id=?")
+          .get(snapshot.candidateId)
+        ? snapshot.candidateId
+        : null
+      : null;
+    this.raw
+      .prepare(
+        "DELETE FROM library_artwork_selections WHERE library_album_id=?",
+      )
+      .run(snapshot.libraryAlbumId);
+    if (!snapshot.state) return;
+    this.raw
+      .prepare(
+        `INSERT INTO library_artwork_selections
+         (library_album_id,state,asset_sha256,candidate_id,actor_id,
+          actor_display_name,created_at,updated_at)
+         VALUES (?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        snapshot.libraryAlbumId,
+        snapshot.state,
+        snapshot.assetSha256,
+        candidateId,
+        snapshot.actorId ?? "system",
+        snapshot.actorDisplayName ?? "System",
+        snapshot.createdAt ?? new Date().toISOString(),
+        snapshot.updatedAt ?? new Date().toISOString(),
+      );
+  }
+
+  private refreshEffectiveArtwork(
+    libraryAlbumId: string,
+    bumpRevision: boolean,
+    now: string,
+  ): void {
+    const group = this.raw
+      .prepare(
+        `SELECT primary_version_id,effective_artwork_json,effective_artwork_source
+         FROM library_albums WHERE id=?`,
+      )
+      .get(libraryAlbumId) as Record<string, unknown> | undefined;
+    if (!group) return;
+    const selection = this.captureArtworkSelection(libraryAlbumId);
+    let artwork = emptyArtworkValue();
+    let source: AlbumArtworkGovernance["selectionSource"] = "NONE";
+    if (selection.state === "HIDDEN") {
+      source = "USER_HIDDEN";
+    } else if (selection.state === "SELECTED" && selection.assetSha256) {
+      const asset = this.raw
+        .prepare(
+          `SELECT a.*,c.source_type FROM library_artwork_assets a
+           LEFT JOIN library_artwork_candidates c ON c.id=?
+           WHERE a.sha256=?`,
+        )
+        .get(selection.candidateId, selection.assetSha256) as
+        Record<string, unknown> | undefined;
+      if (asset) {
+        artwork = artworkFromAsset(asset);
+        source = "USER_SELECTED";
+      }
+    } else {
+      const candidate = this.raw
+        .prepare(
+          `SELECT c.*,a.mime_type,a.width,a.height,a.size_bytes
+           FROM library_artwork_candidates c
+           JOIN library_artwork_assets a ON a.sha256=c.asset_sha256
+           WHERE c.library_album_id=? AND c.is_current=1
+             AND c.source_type IN ('OBSERVED_EMBEDDED','OBSERVED_SIDECAR')
+           ORDER BY CASE WHEN c.local_version_id=? THEN 0 ELSE 1 END,
+                    CASE WHEN lower(COALESCE(c.kind,'')) LIKE '%front%' THEN 0
+                         WHEN lower(COALESCE(c.kind,'')) LIKE '%folder%' THEN 1 ELSE 2 END,
+                    CASE c.source_type WHEN 'OBSERVED_EMBEDDED' THEN 0 ELSE 1 END,
+                    MIN(a.width,a.height) DESC,a.size_bytes DESC,c.id
+           LIMIT 1`,
+        )
+        .get(libraryAlbumId, group.primary_version_id) as
+        Record<string, unknown> | undefined;
+      if (candidate) {
+        artwork = artworkFromAsset(candidate);
+        source =
+          candidate.local_version_id === group.primary_version_id
+            ? "AUTOMATIC_PRIMARY"
+            : "AUTOMATIC_REPRESENTATIVE";
+      } else {
+        const primary = this.raw
+          .prepare("SELECT artwork_json FROM albums WHERE id=?")
+          .get(group.primary_version_id) as
+          { artwork_json: string } | undefined;
+        const legacy = primary
+          ? parseJson<Artwork>(primary.artwork_json, emptyArtworkValue())
+          : emptyArtworkValue();
+        if (legacy.source !== "NONE") {
+          artwork = legacy;
+          source = "AUTOMATIC_PRIMARY";
+        }
+      }
+    }
+    const artworkJson = JSON.stringify(artwork);
+    const changed =
+      nullableString(group.effective_artwork_json) !== artworkJson ||
+      String(group.effective_artwork_source) !== source;
+    this.raw
+      .prepare(
+        `UPDATE library_albums SET effective_artwork_json=?,effective_artwork_source=?,
+           artwork_revision=artwork_revision+?,updated_at=? WHERE id=?`,
+      )
+      .run(
+        artworkJson,
+        source,
+        changed && bumpRevision ? 1 : 0,
+        now,
+        libraryAlbumId,
+      );
+    this.refreshArtworkIssueStatus(libraryAlbumId, artwork, source, now);
+  }
+
+  private refreshArtworkIssueStatus(
+    libraryAlbumId: string,
+    artwork: Artwork,
+    source: AlbumArtworkGovernance["selectionSource"],
+    now: string,
+  ): void {
+    const visible = artwork.source !== "NONE" && source !== "USER_HIDDEN";
+    const highResolution =
+      visible &&
+      artwork.width != null &&
+      artwork.height != null &&
+      artwork.width >= 600 &&
+      artwork.height >= 600;
+    this.raw
+      .prepare(
+        `UPDATE library_issues SET resolution_status=?,updated_at=?
+         WHERE library_album_id=? AND code='MISSING_ARTWORK'`,
+      )
+      .run(visible ? "RESOLVED_BY_ARTWORK" : "PENDING", now, libraryAlbumId);
+    this.raw
+      .prepare(
+        `UPDATE library_issues SET resolution_status=?,updated_at=?
+         WHERE library_album_id=? AND code='LOW_RES_ARTWORK'`,
+      )
+      .run(
+        highResolution ? "RESOLVED_BY_ARTWORK" : "PENDING",
+        now,
+        libraryAlbumId,
+      );
+  }
+
+  private recordAlbumArtworkEvent(input: {
+    requestId: string;
+    inputJson: string;
+    libraryAlbumId: string;
+    type: AlbumArtworkEvent["type"];
+    actor: LibraryIdentityActor;
+    expectedArtworkRevision: number;
+    before: ArtworkSelectionSnapshot;
+    after: ArtworkSelectionSnapshot;
+    assetSha256: string | null;
+    candidateId: string | null;
+    compensatesEventId: string | null;
+    createdAt: string;
+  }): AlbumArtworkMutationResult {
+    const id = randomUUID();
+    const artwork = this.getAlbumArtworkGovernance(input.libraryAlbumId)!;
+    this.raw
+      .prepare(
+        `INSERT INTO library_artwork_events
+         (id,request_id,library_album_id,event_type,actor_id,actor_display_name,
+          expected_artwork_revision,resulting_artwork_revision,input_json,
+          before_state_json,after_state_json,result_json,asset_sha256,candidate_id,
+          compensates_event_id,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        id,
+        input.requestId,
+        input.libraryAlbumId,
+        input.type,
+        input.actor.id,
+        input.actor.displayName,
+        input.expectedArtworkRevision,
+        artwork.artworkRevision,
+        input.inputJson,
+        JSON.stringify(input.before),
+        JSON.stringify(input.after),
+        JSON.stringify({ artwork }),
+        input.assetSha256,
+        input.candidateId,
+        input.compensatesEventId,
+        input.createdAt,
+      );
+    this.raw
+      .prepare(
+        "INSERT INTO library_artwork_event_groups(event_id,library_album_id) VALUES (?,?)",
+      )
+      .run(id, input.libraryAlbumId);
+    return {
+      artwork,
+      event: this.mapAlbumArtworkEvent(
+        this.raw
+          .prepare("SELECT * FROM library_artwork_events WHERE id=?")
+          .get(id) as Record<string, unknown>,
+        input.libraryAlbumId,
+      ),
+    };
+  }
+
+  private artworkResultByRequestId(
+    requestId: string,
+    inputJson: string,
+  ): AlbumArtworkMutationResult | null {
+    const row = this.raw
+      .prepare("SELECT * FROM library_artwork_events WHERE request_id=?")
+      .get(requestId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    if (String(row.input_json) !== inputJson)
+      throw new AlbumArtworkDecisionError(
+        "ARTWORK_DECISION_CONFLICT",
+        "requestId 已用于不同的封面请求",
+      );
+    const stored = parseJson<{ artwork: AlbumArtworkGovernance }>(
+      row.result_json,
+      {
+        artwork: this.getAlbumArtworkGovernance(String(row.library_album_id))!,
+      },
+    );
+    const historyAlbumId =
+      this.resolveLibraryAlbumId(String(row.library_album_id)) ??
+      String(row.library_album_id);
+    return {
+      artwork: stored.artwork,
+      event: this.mapAlbumArtworkEvent(row, historyAlbumId),
+    };
+  }
+
+  private mapAlbumArtworkEvent(
+    row: Record<string, unknown>,
+    historyLibraryAlbumId: string,
+  ): AlbumArtworkEvent {
+    const latest = this.raw
+      .prepare(
+        `SELECT e.id FROM library_artwork_events e
+         WHERE EXISTS (SELECT 1 FROM library_artwork_event_groups g
+           WHERE g.event_id=e.id AND g.library_album_id=?)
+         ORDER BY e.rowid DESC LIMIT 1`,
+      )
+      .get(historyLibraryAlbumId) as { id: string } | undefined;
+    const compensated = Boolean(
+      this.raw
+        .prepare(
+          "SELECT 1 FROM library_artwork_events WHERE compensates_event_id=?",
+        )
+        .get(String(row.id)),
+    );
+    const group = this.raw
+      .prepare("SELECT artwork_revision FROM library_albums WHERE id=?")
+      .get(historyLibraryAlbumId) as { artwork_revision: number } | undefined;
+    const expectedAfter = parseJson<ArtworkSelectionSnapshot>(
+      row.after_state_json,
+      emptyArtworkSelection(historyLibraryAlbumId),
+    );
+    const canUndo =
+      row.event_type !== "UNDO" &&
+      !compensated &&
+      latest?.id === String(row.id) &&
+      Number(group?.artwork_revision) ===
+        Number(row.resulting_artwork_revision) &&
+      JSON.stringify(this.captureArtworkSelection(historyLibraryAlbumId)) ===
+        JSON.stringify(expectedAfter);
+    return {
+      id: String(row.id),
+      requestId: String(row.request_id),
+      libraryAlbumId: String(row.library_album_id),
+      type: row.event_type as AlbumArtworkEvent["type"],
+      actor: {
+        id: String(row.actor_id),
+        displayName: String(row.actor_display_name),
+      },
+      expectedArtworkRevision: Number(row.expected_artwork_revision),
+      resultingArtworkRevision: Number(row.resulting_artwork_revision),
+      assetSha256: nullableString(row.asset_sha256),
+      candidateId: nullableString(row.candidate_id),
+      compensatesEventId: nullableString(row.compensates_event_id),
+      canUndo,
+      createdAt: String(row.created_at),
+    };
+  }
+
   listAlbums(
     options: {
       search?: string;
@@ -4374,6 +5521,7 @@ export class CoceanDatabase {
       .prepare(
         `SELECT a.*, la.id AS library_album_id, la.primary_version_id,
                 la.primary_version_source, la.revision, la.metadata_revision,
+                la.artwork_revision,la.effective_artwork_json,la.effective_artwork_source,
                 ${effectiveTitle} AS effective_title,
                 ${effectiveArtist} AS effective_album_artist,
                 ${effectiveYear} AS effective_year,
@@ -4446,6 +5594,7 @@ export class CoceanDatabase {
       .prepare(
         `SELECT a.*, la.id AS library_album_id, la.primary_version_id,
         la.primary_version_source, la.revision, la.metadata_revision,
+        la.artwork_revision,la.effective_artwork_json,la.effective_artwork_source,
         ${effectiveTitle} AS effective_title,
         ${effectiveArtist} AS effective_album_artist,
         ${effectiveYear} AS effective_year,
@@ -4690,6 +5839,8 @@ export class CoceanDatabase {
           },
       localVersions: this.listLocalVersions(summary.id),
       metadata,
+      artworkGovernance:
+        this.getAlbumArtworkGovernance(summary.id) ?? undefined,
     };
   }
 
@@ -5830,6 +6981,9 @@ export class CoceanDatabase {
       primaryVersionSource: row.primary_version_source as "AUTOMATIC" | "USER",
       revision: Number(row.revision),
       metadataRevision: Number(row.metadata_revision ?? 0),
+      artwork: row.effective_artwork_json
+        ? parseJson<Artwork>(row.effective_artwork_json, summary.artwork)
+        : summary.artwork,
       versionCount: Number(row.version_count),
       issues: this.listLibraryIssues(id),
     };
@@ -5889,6 +7043,90 @@ function canonicalLibraryIdentityDecisionInput(
   command: Record<string, unknown> | LibraryIdentityDecisionCommand,
 ): string {
   return JSON.stringify(sortJsonValue({ albumId, command }));
+}
+
+function supportedArtworkMime(
+  value: string | null | undefined,
+): ArtworkAssetInput["mimeType"] | null {
+  return value === "image/jpeg" ||
+    value === "image/png" ||
+    value === "image/webp"
+    ? value
+    : null;
+}
+
+function artworkExtension(
+  mimeType: ArtworkAssetInput["mimeType"],
+): ArtworkAssetInput["extension"] {
+  if (mimeType === "image/png") return ".png";
+  if (mimeType === "image/webp") return ".webp";
+  return ".jpg";
+}
+
+function artworkCandidateId(
+  libraryAlbumId: string,
+  candidate: ArtworkCandidateInput,
+): string {
+  return `artwork-${createHash("sha256")
+    .update(
+      JSON.stringify(
+        sortJsonValue({
+          libraryAlbumId,
+          localVersionId: candidate.localVersionId,
+          source: candidate.source,
+          sha256: candidate.sha256,
+          kind: candidate.kind,
+        }),
+      ),
+    )
+    .digest("hex")
+    .slice(0, 32)}`;
+}
+
+function emptyArtworkValue(): Artwork {
+  return {
+    source: "NONE",
+    url: null,
+    mimeType: null,
+    width: null,
+    height: null,
+  };
+}
+
+function emptyArtworkSelection(
+  libraryAlbumId: string,
+): ArtworkSelectionSnapshot {
+  return {
+    libraryAlbumId,
+    state: null,
+    assetSha256: null,
+    candidateId: null,
+    actorId: null,
+    actorDisplayName: null,
+    createdAt: null,
+    updatedAt: null,
+  };
+}
+
+function artworkFromAsset(row: Record<string, unknown>): Artwork {
+  const sourceType = nullableString(row.source_type);
+  const source: Artwork["source"] =
+    sourceType === "OBSERVED_EMBEDDED"
+      ? "EMBEDDED"
+      : sourceType === "OBSERVED_SIDECAR"
+        ? "SIDECAR"
+        : sourceType === "USER_UPLOAD"
+          ? "USER_UPLOAD"
+          : sourceType === "MUSICBRAINZ_CAA"
+            ? "MUSICBRAINZ_CAA"
+            : "REPRESENTATIVE";
+  return {
+    source,
+    url: `/api/v1/artwork/${String(row.asset_sha256 ?? row.sha256)}`,
+    mimeType: String(row.mime_type),
+    width: Number(row.width),
+    height: Number(row.height),
+  };
 }
 
 function libraryIdentityDecisionDetails(
@@ -5961,6 +7199,21 @@ function sameLibraryIdentityGovernance(
     JSON.stringify(libraryIdentityGovernanceState(left)) ===
     JSON.stringify(libraryIdentityGovernanceState(right))
   );
+}
+
+function sameArtworkSelections(
+  left: LibraryIdentitySnapshot,
+  right: LibraryIdentitySnapshot,
+): boolean {
+  const state = (snapshot: LibraryIdentitySnapshot) =>
+    snapshot.groups
+      .map((group) => ({
+        id: group.id,
+        state: group.artworkSelection?.state ?? null,
+        assetSha256: group.artworkSelection?.assetSha256 ?? null,
+      }))
+      .sort((a, b) => a.id.localeCompare(b.id));
+  return JSON.stringify(state(left)) === JSON.stringify(state(right));
 }
 
 function normalizeLibraryIdentity(artist: string, title: string): string {

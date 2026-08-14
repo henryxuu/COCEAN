@@ -1,5 +1,8 @@
 import type {
   AlbumDetail,
+  AlbumArtworkEvent,
+  AlbumArtworkGovernance,
+  AlbumArtworkMutationResult,
   AlbumIntroduction,
   AlbumMetadata,
   AlbumMetadataEvent,
@@ -17,6 +20,7 @@ import type {
   LibraryIdentityDecision,
   LibraryIdentityDecisionCommand,
   LibraryIdentityDecisionResult,
+  ArtworkDecisionCommand,
   UpdateAlbumMetadataCommand,
   ModelConfiguration,
   ModelVerificationStatus,
@@ -43,10 +47,12 @@ const forceDemo = import.meta.env.VITE_DEMO_MODE === "true";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const hasBody = init?.body !== undefined && init.body !== null;
+  const isFormData =
+    typeof FormData !== "undefined" && init?.body instanceof FormData;
   const response = await fetch(`${apiBase}${path}`, {
     ...init,
     headers: {
-      ...(hasBody ? { "content-type": "application/json" } : {}),
+      ...(hasBody && !isFormData ? { "content-type": "application/json" } : {}),
       ...init?.headers,
     },
   });
@@ -227,6 +233,83 @@ export const api = {
     return withDemo(
       () => request(`/api/v1/albums/${encodeURIComponent(id)}`),
       () => demoAlbumDetail(id),
+    );
+  },
+  albumArtwork(albumId: string): Promise<AlbumArtworkGovernance> {
+    return request(`/api/v1/albums/${encodeURIComponent(albumId)}/artwork`);
+  },
+  artworkHistory(albumId: string): Promise<AlbumArtworkEvent[]> {
+    return withDemo(
+      () =>
+        request<{ items: AlbumArtworkEvent[] }>(
+          `/api/v1/albums/${encodeURIComponent(albumId)}/artwork-history`,
+        ).then((result) => result.items),
+      () => [],
+    );
+  },
+  selectAlbumArtwork(
+    albumId: string,
+    command: ArtworkDecisionCommand,
+  ): Promise<AlbumArtworkMutationResult> {
+    if (forceDemo)
+      return Promise.reject(
+        new ApiError(409, "DEMO_WRITE_DISABLED", "演示模式不保存封面治理决定"),
+      );
+    return request(
+      `/api/v1/albums/${encodeURIComponent(albumId)}/artwork/select`,
+      { method: "POST", body: JSON.stringify(command) },
+    );
+  },
+  uploadAlbumArtwork(
+    albumId: string,
+    file: File,
+    input: { requestId: string; expectedArtworkRevision: number },
+  ): Promise<AlbumArtworkMutationResult> {
+    if (forceDemo)
+      return Promise.reject(
+        new ApiError(409, "DEMO_WRITE_DISABLED", "演示模式不上传封面"),
+      );
+    const body = new FormData();
+    body.append("requestId", input.requestId);
+    body.append(
+      "expectedArtworkRevision",
+      String(input.expectedArtworkRevision),
+    );
+    body.append("file", file, file.name);
+    return request(
+      `/api/v1/albums/${encodeURIComponent(albumId)}/artwork/upload`,
+      { method: "POST", body },
+    );
+  },
+  importMusicBrainzArtwork(
+    albumId: string,
+    input: {
+      requestId: string;
+      expectedArtworkRevision: number;
+      localVersionId: string;
+    },
+  ): Promise<AlbumArtworkMutationResult> {
+    if (forceDemo)
+      return Promise.reject(
+        new ApiError(409, "DEMO_WRITE_DISABLED", "演示模式不导入外部封面"),
+      );
+    return request(
+      `/api/v1/albums/${encodeURIComponent(albumId)}/artwork/import/musicbrainz`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  },
+  undoArtworkEvent(
+    albumId: string,
+    eventId: string,
+    input: { requestId: string; expectedArtworkRevision: number },
+  ): Promise<AlbumArtworkMutationResult> {
+    if (forceDemo)
+      return Promise.reject(
+        new ApiError(409, "DEMO_WRITE_DISABLED", "演示模式不撤销封面治理决定"),
+      );
+    return request(
+      `/api/v1/albums/${encodeURIComponent(albumId)}/artwork-history/${encodeURIComponent(eventId)}/undo`,
+      { method: "POST", body: JSON.stringify(input) },
     );
   },
   identityDecisions(albumId: string): Promise<LibraryIdentityDecision[]> {

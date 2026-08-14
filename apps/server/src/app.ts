@@ -4,6 +4,7 @@ import { constants, createReadStream } from "node:fs";
 import { access, readFile, realpath, stat } from "node:fs/promises";
 import { extname, isAbsolute, join, relative, resolve } from "node:path";
 import cors from "@fastify/cors";
+import multipart from "@fastify/multipart";
 import staticPlugin from "@fastify/static";
 import Fastify, {
   type FastifyInstance,
@@ -17,21 +18,25 @@ import {
 } from "@cocean/catalog-sources";
 import {
   catalogRecommendationResponseSchema,
+  artworkDecisionCommandSchema,
   confirmReleaseCandidateCommandSchema,
   coceanSettingsSchema,
   deviceCategorySchema,
   deviceOwnershipSchema,
   libraryIdentityDecisionCommandSchema,
+  importMusicBrainzArtworkCommandSchema,
   physicalMediumSchema,
   scanFileOutcomeSchema,
   scanModeSchema,
   undoAlbumMetadataCommandSchema,
+  undoAlbumArtworkCommandSchema,
   undoLibraryIdentityDecisionCommandSchema,
   updateAlbumMetadataCommandSchema,
   type ReleaseCandidate,
 } from "@cocean/contracts";
 import {
   AlbumMetadataDecisionError,
+  AlbumArtworkDecisionError,
   CoceanDatabase,
   LibraryIdentityDecisionError,
 } from "@cocean/database";
@@ -51,6 +56,11 @@ import {
   verifyPassword,
 } from "./auth.js";
 import { AppleCatalogClient, externalMediaFallback } from "./apple-catalog.js";
+import {
+  ArtworkValidationError,
+  fetchCoverArtArchiveFront,
+  validateAndStoreArtwork,
+} from "./artwork.js";
 import { CredentialVault } from "./credential-vault.js";
 import { DeliveryRunner } from "./delivery.js";
 
@@ -219,6 +229,7 @@ export interface AppOptions {
     searchReleases(input: ReleaseSearchInput): Promise<ReleaseCandidate[]>;
   };
   deliveryExecution?: boolean;
+  artworkFetch?: typeof globalThis.fetch;
 }
 
 export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
@@ -290,6 +301,23 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (!options.database) database.close();
   });
   app.setErrorHandler(async (error, request, reply) => {
+    const multipartErrorCode =
+      typeof error === "object" && error !== null && "code" in error
+        ? String((error as { code?: unknown }).code)
+        : null;
+    if (multipartErrorCode === "FST_REQ_FILE_TOO_LARGE")
+      return reply.code(413).send({
+        error: "ARTWORK_TOO_LARGE",
+        message: "封面文件不能超过 20 MiB",
+      });
+    if (
+      multipartErrorCode &&
+      ["FST_FILES_LIMIT", "FST_FIELDS_LIMIT"].includes(multipartErrorCode)
+    )
+      return reply.code(400).send({
+        error: "INVALID_ARTWORK_FILE",
+        message: "封面上传字段或文件数量超出限制",
+      });
     if (error instanceof z.ZodError) {
       return reply.code(400).send({
         error: "VALIDATION_ERROR",
@@ -319,6 +347,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   if (options.config.nodeEnv !== "production") {
     await app.register(cors, { origin: true });
   }
+  await app.register(multipart, {
+    limits: { files: 1, fields: 4, fileSize: 20 * 1024 * 1024 },
+  });
 
   const health = async () => ({
     status: "ok",
@@ -536,7 +567,11 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
           implemented: true,
           configured: Boolean(releaseCatalogClient),
         },
-        coverArtArchive: { enabled: false, implemented: false },
+        coverArtArchive: {
+          enabled: options.config.musicBrainzEnabled,
+          implemented: true,
+          configured: Boolean(options.config.metadataContact),
+        },
         acoustId: { enabled: false, implemented: false },
         discogs: { enabled: false, implemented: false },
       },
@@ -775,11 +810,199 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         .code(404)
         .send({ error: "ALBUM_NOT_FOUND", message: "没有找到这张专辑" });
     if (!readSession(database, request.headers.cookie)) {
-      const { metadata: _metadata, ...publicAlbum } = album;
+      const {
+        metadata: _metadata,
+        artworkGovernance: _artworkGovernance,
+        ...publicAlbum
+      } = album;
       return publicAlbum;
     }
     return album;
   });
+
+  app.get("/api/v1/albums/:id/artwork", async (request, reply) => {
+    if (!requireSession(request, reply)) return;
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const artwork = database.getAlbumArtworkGovernance(id);
+    if (!artwork)
+      return reply
+        .code(404)
+        .send({ error: "ALBUM_NOT_FOUND", message: "没有找到这张专辑" });
+    return artwork;
+  });
+
+  app.post("/api/v1/albums/:id/artwork/select", async (request, reply) => {
+    const admin = requireAdmin(request, reply);
+    if (!admin) return;
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const command = artworkDecisionCommandSchema.parse(request.body ?? {});
+    try {
+      return database.applyAlbumArtworkDecision(id, command, {
+        id: admin.user.id,
+        displayName: admin.user.displayName,
+      });
+    } catch (error) {
+      return handleArtworkDecisionError(error, reply);
+    }
+  });
+
+  app.post(
+    "/api/v1/albums/:id/artwork/upload",
+    { bodyLimit: 21 * 1024 * 1024 },
+    async (request, reply) => {
+      const admin = requireAdmin(request, reply);
+      if (!admin) return;
+      const { id } = z.object({ id: z.string() }).parse(request.params);
+      const fields: Record<string, string> = {};
+      let upload: { bytes: Buffer; mimeType: string; filename: string } | null =
+        null;
+      for await (const part of request.parts()) {
+        if (part.type === "file") {
+          if (upload) {
+            part.file.resume();
+            return reply.code(400).send({
+              error: "INVALID_ARTWORK_FILE",
+              message: "一次只能上传一张封面",
+            });
+          }
+          upload = {
+            bytes: await part.toBuffer(),
+            mimeType: part.mimetype,
+            filename: part.filename,
+          };
+        } else fields[part.fieldname] = String(part.value);
+      }
+      if (!upload)
+        return reply.code(400).send({
+          error: "INVALID_ARTWORK_FILE",
+          message: "请选择要上传的封面文件",
+        });
+      const command = z
+        .object({
+          requestId: z.string().trim().min(1).max(200),
+          expectedArtworkRevision: z.coerce.number().int().nonnegative(),
+        })
+        .parse(fields);
+      try {
+        const asset = await validateAndStoreArtwork({
+          bytes: upload.bytes,
+          declaredMimeType: upload.mimeType,
+          cacheRoot: options.config.cacheRoot,
+          ffprobePath: options.config.ffprobePath,
+        });
+        return database.applyAlbumArtworkCandidateDecision(
+          id,
+          {
+            ...asset,
+            source: "USER_UPLOAD",
+            localVersionId: null,
+            relativePath: null,
+            kind: "FRONT",
+            evidence: { originalFilename: upload.filename },
+          },
+          command,
+          { id: admin.user.id, displayName: admin.user.displayName },
+          "UPLOAD",
+        );
+      } catch (error) {
+        return handleArtworkDecisionError(error, reply);
+      }
+    },
+  );
+
+  app.post(
+    "/api/v1/albums/:id/artwork/import/musicbrainz",
+    async (request, reply) => {
+      const admin = requireAdmin(request, reply);
+      if (!admin) return;
+      const { id } = z.object({ id: z.string() }).parse(request.params);
+      const command = importMusicBrainzArtworkCommandSchema.parse(
+        request.body ?? {},
+      );
+      if (!options.config.musicBrainzEnabled || !options.config.metadataContact)
+        return reply.code(409).send({
+          error: "CATALOG_SOURCE_NOT_CONFIGURED",
+          message:
+            "CAA 导入需要启用 MusicBrainz 并配置 COCEAN_METADATA_CONTACT",
+        });
+      const releaseId = database.getConfirmedMusicBrainzReleaseId(
+        id,
+        command.localVersionId,
+      );
+      if (!releaseId)
+        return reply.code(409).send({
+          error: "ARTWORK_DECISION_CONFLICT",
+          message:
+            "只能从当前本地版本已人工确认的 MusicBrainz Release 导入封面",
+        });
+      try {
+        const remote = await fetchCoverArtArchiveFront({
+          releaseId,
+          contact: options.config.metadataContact,
+          timeoutMs: options.config.externalLookupTimeoutMs,
+          ...(options.artworkFetch ? { fetch: options.artworkFetch } : {}),
+        });
+        const asset = await validateAndStoreArtwork({
+          bytes: remote.bytes,
+          declaredMimeType: remote.mimeType,
+          cacheRoot: options.config.cacheRoot,
+          ffprobePath: options.config.ffprobePath,
+        });
+        return database.applyAlbumArtworkCandidateDecision(
+          id,
+          {
+            ...asset,
+            source: "MUSICBRAINZ_CAA",
+            localVersionId: command.localVersionId,
+            relativePath: null,
+            kind: "FRONT",
+            evidence: { releaseId, sourceUrl: remote.sourceUrl },
+          },
+          {
+            requestId: command.requestId,
+            expectedArtworkRevision: command.expectedArtworkRevision,
+          },
+          { id: admin.user.id, displayName: admin.user.displayName },
+          "IMPORT",
+        );
+      } catch (error) {
+        return handleArtworkDecisionError(error, reply);
+      }
+    },
+  );
+
+  app.get("/api/v1/albums/:id/artwork-history", async (request, reply) => {
+    if (!requireSession(request, reply)) return;
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    if (!database.getAlbumArtworkGovernance(id))
+      return reply
+        .code(404)
+        .send({ error: "ALBUM_NOT_FOUND", message: "没有找到这张专辑" });
+    return { items: database.listAlbumArtworkHistory(id) };
+  });
+
+  app.post(
+    "/api/v1/albums/:id/artwork-history/:eventId/undo",
+    async (request, reply) => {
+      const admin = requireAdmin(request, reply);
+      if (!admin) return;
+      const { id, eventId } = z
+        .object({ id: z.string(), eventId: z.string() })
+        .parse(request.params);
+      const command = undoAlbumArtworkCommandSchema.parse(request.body ?? {});
+      try {
+        return database.undoAlbumArtworkEvent(
+          id,
+          eventId,
+          command.requestId,
+          command.expectedArtworkRevision,
+          { id: admin.user.id, displayName: admin.user.displayName },
+        );
+      } catch (error) {
+        return handleArtworkDecisionError(error, reply);
+      }
+    },
+  );
 
   app.get("/api/v1/albums/:id/metadata", async (request, reply) => {
     if (!requireSession(request, reply)) return;
@@ -1741,10 +1964,23 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       const path = join(artworkRoot, `${hash}${extension}`);
       try {
         await access(path, constants.R_OK);
+        const [canonicalRoot, canonicalPath] = await Promise.all([
+          realpath(artworkRoot),
+          realpath(path),
+        ]);
+        const withinRoot = relative(canonicalRoot, canonicalPath);
+        if (
+          withinRoot === "" ||
+          withinRoot.startsWith("..") ||
+          isAbsolute(withinRoot) ||
+          !(await stat(canonicalPath)).isFile()
+        )
+          continue;
         return reply
           .header("cache-control", "private, max-age=31536000, immutable")
+          .header("x-content-type-options", "nosniff")
           .type(mimeType)
-          .send(createReadStream(path));
+          .send(createReadStream(canonicalPath));
       } catch {
         // Try the next supported image extension.
       }
@@ -1897,6 +2133,21 @@ function deploymentRootView(
     policy: root.policy,
     enabled: root.enabled,
   };
+}
+
+function handleArtworkDecisionError(
+  error: unknown,
+  reply: FastifyReply,
+): FastifyReply {
+  if (error instanceof AlbumArtworkDecisionError)
+    return reply
+      .code(error.code === "INVALID_ARTWORK_DECISION" ? 400 : 409)
+      .send({ error: error.code, message: error.message });
+  if (error instanceof ArtworkValidationError)
+    return reply
+      .code(error.statusCode)
+      .send({ error: error.code, message: error.message });
+  throw error;
 }
 
 function modelCompletionEndpoint(baseUrl: string): URL {

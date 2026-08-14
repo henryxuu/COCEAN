@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import { CoceanDatabase } from "@cocean/database";
 import { convertLegacyStillCore } from "@cocean/still-catalog";
@@ -10,6 +12,7 @@ import { createSession } from "./auth.js";
 import type { ServerConfig } from "./config.js";
 
 const close: Array<() => Promise<void> | void> = [];
+const execFileAsync = promisify(execFile);
 
 afterEach(async () => {
   for (const callback of close.splice(0).reverse()) await callback();
@@ -465,6 +468,160 @@ describe("COCEAN HTTP API", () => {
     });
     expect(undone.statusCode, undone.body).toBe(200);
     expect(undone.json().metadata.album.title.effectiveValue).toBe("Observed");
+  });
+
+  it("exposes authenticated artwork selection, validated upload, CAA import and append-only undo", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cocean-artwork-http-"));
+    const imagePath = join(root, "front.png");
+    await execFileAsync("ffmpeg", [
+      "-nostdin",
+      "-v",
+      "error",
+      "-f",
+      "lavfi",
+      "-i",
+      "color=c=black:s=40x30",
+      "-frames:v",
+      "1",
+      imagePath,
+    ]);
+    const image = await readFile(imagePath);
+    const database = new CoceanDatabase(":memory:");
+    database.replaceAlbumsForRoot("music", [
+      {
+        id: "artwork-http",
+        rootId: "music",
+        groupKey: "artwork-http",
+        title: "Artwork",
+        albumArtist: "Artist",
+        year: 2026,
+        discCount: 1,
+        fileIds: [],
+        audioSummary: null,
+        mixedAudioSpecs: false,
+        artwork: {
+          source: "NONE",
+          url: null,
+          mimeType: null,
+          width: null,
+          height: null,
+        },
+      },
+    ]);
+    database.raw
+      .prepare(
+        `UPDATE albums SET match_status='USER_CONFIRMED',musicbrainz_release_id=?
+         WHERE id='artwork-http'`,
+      )
+      .run("123e4567-e89b-42d3-a456-426614174000");
+    const app = await buildApp({
+      config: testConfig({
+        cacheRoot: root,
+        musicBrainzEnabled: true,
+        metadataContact: "https://example.test/cocean",
+      }),
+      database,
+      artworkFetch: async () =>
+        new Response(image, {
+          status: 200,
+          headers: { "content-type": "image/png" },
+        }),
+    });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+      () => rm(root, { recursive: true, force: true }),
+    );
+    const albumId = database.getAlbumSummary("artwork-http")!.id;
+    expect(database.getAlbumArtworkGovernance(albumId)).toEqual(
+      expect.objectContaining({ artworkRevision: 0, candidates: [] }),
+    );
+    const member = sessionCookieFor(database, "MEMBER");
+    const admin = adminCookie(database);
+    const anonymousDetail = await app.inject({
+      method: "GET",
+      url: `/api/v1/albums/${albumId}`,
+    });
+    expect(anonymousDetail.json().artworkGovernance).toBeUndefined();
+    expect(anonymousDetail.json().artworkRevision).toBeUndefined();
+    const memberArtwork = await app.inject({
+      method: "GET",
+      url: `/api/v1/albums/${albumId}/artwork`,
+      headers: { cookie: member },
+    });
+    expect(memberArtwork.statusCode, memberArtwork.body).toBe(200);
+    const denied = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/artwork/upload`,
+      headers: {
+        cookie: member,
+        "content-type": "multipart/form-data; boundary=cocean-boundary",
+      },
+      payload: artworkMultipart("cocean-boundary", "member-upload", 0, image),
+    });
+    expect(denied.statusCode).toBe(403);
+    const uploadPayload = artworkMultipart(
+      "cocean-boundary",
+      "artwork-upload",
+      0,
+      image,
+    );
+    const uploaded = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/artwork/upload`,
+      headers: {
+        cookie: admin,
+        "content-type": "multipart/form-data; boundary=cocean-boundary",
+      },
+      payload: uploadPayload,
+    });
+    expect(uploaded.statusCode, uploaded.body).toBe(200);
+    expect(uploaded.json()).toEqual(
+      expect.objectContaining({
+        artwork: expect.objectContaining({
+          artworkRevision: 1,
+          selectionSource: "USER_SELECTED",
+        }),
+        event: expect.objectContaining({ type: "UPLOAD" }),
+      }),
+    );
+    const artworkUrl = uploaded.json().artwork.effectiveArtwork.url as string;
+    const imageResponse = await app.inject({ method: "GET", url: artworkUrl });
+    expect(imageResponse.statusCode).toBe(200);
+    expect(imageResponse.headers["content-type"]).toContain("image/png");
+    expect(imageResponse.headers["x-content-type-options"]).toBe("nosniff");
+    const imported = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/artwork/import/musicbrainz`,
+      headers: { cookie: admin },
+      payload: {
+        localVersionId: "artwork-http",
+        requestId: "artwork-import",
+        expectedArtworkRevision: 1,
+      },
+    });
+    expect(imported.statusCode, imported.body).toBe(200);
+    expect(imported.json().event.type).toBe("IMPORT");
+    const history = await app.inject({
+      method: "GET",
+      url: `/api/v1/albums/${albumId}/artwork-history`,
+      headers: { cookie: member },
+    });
+    expect(history.statusCode, history.body).toBe(200);
+    expect(history.json().items).toHaveLength(2);
+    const importEventId = imported.json().event.id as string;
+    const undone = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/artwork-history/${importEventId}/undo`,
+      headers: { cookie: admin },
+      payload: {
+        requestId: "artwork-undo",
+        expectedArtworkRevision: 2,
+      },
+    });
+    expect(undone.statusCode, undone.body).toBe(200);
+    expect(undone.json().event.type).toBe("UNDO");
+    expect(undone.json().artwork.artworkRevision).toBe(3);
   });
 
   it("queues a read-only library scan", async () => {
@@ -1981,4 +2138,25 @@ function sessionCookieFor(
   database.createUser(user, "unused-test-password-hash");
   const { token } = createSession(database, user, 1);
   return `cocean_session=${token}`;
+}
+
+function artworkMultipart(
+  boundary: string,
+  requestId: string,
+  expectedArtworkRevision: number,
+  image: Buffer,
+): Buffer {
+  const text = (name: string, value: string) =>
+    Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`,
+    );
+  return Buffer.concat([
+    text("requestId", requestId),
+    text("expectedArtworkRevision", String(expectedArtworkRevision)),
+    Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="front.png"\r\nContent-Type: image/png\r\n\r\n`,
+    ),
+    image,
+    Buffer.from(`\r\n--${boundary}--\r\n`),
+  ]);
 }

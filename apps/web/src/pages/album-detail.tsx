@@ -1,5 +1,7 @@
 import {
   formatFullAudioSpec,
+  type AlbumArtworkEvent,
+  type AlbumArtworkGovernance,
   type AlbumDetail,
   type AlbumMetadataEvent,
   type AlbumSummary,
@@ -16,7 +18,9 @@ import {
 import {
   ChevronRight,
   Clock3,
+  Download,
   FileAudio2,
+  ImageOff,
   Pause,
   Play,
   Plus,
@@ -25,6 +29,7 @@ import {
   Sparkles,
   Trash2,
   TriangleAlert,
+  Upload,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -76,6 +81,7 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
   const introduction = useAsync(() => api.albumIntroduction(id), [id]);
   const identityHistory = useAsync(() => api.identityDecisions(id), [id]);
   const metadataHistory = useAsync(() => api.metadataHistory(id), [id]);
+  const artworkHistory = useAsync(() => api.artworkHistory(id), [id]);
   const capabilities = useAsync(() => api.capabilities(), []);
   const [listeningTrackId, setListeningTrackId] = useState<string | null>(null);
   const [deliveryTargetId, setDeliveryTargetId] = useState("");
@@ -518,6 +524,24 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
         />
       ) : null}
 
+      {item.artworkGovernance ? (
+        <AlbumArtworkGovernancePanel
+          album={item}
+          governance={item.artworkGovernance}
+          history={artworkHistory.data ?? []}
+          historyError={artworkHistory.error?.message ?? null}
+          canManage={canManage}
+          onReload={async () => {
+            const [latest] = await Promise.all([
+              album.reload(),
+              artworkHistory.reload(),
+            ]);
+            return latest !== null;
+          }}
+          onToast={toast.show}
+        />
+      ) : null}
+
       <div className="detail-grid">
         <section className="surface-card owned-versions">
           <SectionTitle title="我的版本" />
@@ -951,6 +975,386 @@ function Fact({ label, value }: { label: string; value: string | null }) {
       <strong>{value ?? "待确认"}</strong>
     </div>
   );
+}
+
+export function AlbumArtworkGovernancePanel({
+  album,
+  governance,
+  history,
+  historyError,
+  canManage,
+  onReload,
+  onToast,
+}: {
+  album: AlbumDetail;
+  governance: AlbumArtworkGovernance;
+  history: AlbumArtworkEvent[];
+  historyError: string | null;
+  canManage: boolean;
+  onReload: () => Promise<boolean>;
+  onToast: (message: string) => void;
+}) {
+  const confirmedVersions = (album.localVersions ?? []).filter(
+    (version) =>
+      version.matchStatus === "USER_CONFIRMED" &&
+      Boolean(version.musicBrainzReleaseId),
+  );
+  const [selectedVersionId, setSelectedVersionId] = useState(
+    confirmedVersions[0]?.id ?? "",
+  );
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [working, setWorking] = useState(false);
+  const previousAlbumId = useRef(governance.libraryAlbumId);
+  useEffect(() => {
+    if (previousAlbumId.current === governance.libraryAlbumId) return;
+    previousAlbumId.current = governance.libraryAlbumId;
+    setSelectedVersionId(confirmedVersions[0]?.id ?? "");
+    setUploadFile(null);
+  }, [confirmedVersions, governance.libraryAlbumId]);
+
+  const run = async (
+    operation: () => Promise<unknown>,
+    successMessage: string,
+  ) => {
+    setWorking(true);
+    try {
+      await operation();
+      await onReload();
+      onToast(successMessage);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) await onReload();
+      onToast(error instanceof Error ? error.message : "封面治理操作失败");
+    } finally {
+      setWorking(false);
+    }
+  };
+  const revision = governance.artworkRevision;
+  const localCandidates = governance.candidates.filter((candidate) =>
+    candidate.source.startsWith("OBSERVED_"),
+  );
+  const importedCandidates = governance.candidates.filter(
+    (candidate) => candidate.source === "MUSICBRAINZ_CAA",
+  );
+  const uploadedCandidates = governance.candidates.filter(
+    (candidate) => candidate.source === "USER_UPLOAD",
+  );
+  const selectCandidate = (candidateId: string) =>
+    run(
+      () =>
+        api.selectAlbumArtwork(governance.libraryAlbumId, {
+          action: "SELECT",
+          candidateId,
+          requestId: createBrowserUuid(),
+          expectedArtworkRevision: revision,
+        }),
+      "封面已选中；源文件和既有排队任务未修改",
+    );
+
+  return (
+    <section className="surface-card artwork-governance" aria-label="封面治理">
+      <SectionTitle
+        title="封面治理"
+        meta={`revision ${revision} · ${canManage ? "管理员可管理" : "只读"}`}
+      />
+      <div className="artwork-governance-summary">
+        <div className="artwork-effective-preview">
+          {governance.effectiveArtwork.url ? (
+            <img
+              src={governance.effectiveArtwork.url}
+              alt={`${album.title} 当前有效封面`}
+            />
+          ) : (
+            <div className="artwork-empty">
+              <ImageOff />
+              <span>当前不显示封面</span>
+            </div>
+          )}
+        </div>
+        <div>
+          <strong>{artworkSelectionLabel(governance.selectionSource)}</strong>
+          <p>
+            {governance.effectiveArtwork.width ?? "–"} ×{" "}
+            {governance.effectiveArtwork.height ?? "–"}
+            {governance.selectedAssetSha256
+              ? ` · ${governance.selectedAssetSha256.slice(0, 12)}`
+              : ""}
+          </p>
+          <small>所有修改只作用于 COCEAN 缓存与治理层，不回写 NAS 文件。</small>
+          {canManage ? (
+            <div className="artwork-summary-actions">
+              <Button
+                variant="secondary"
+                disabled={working}
+                onClick={() =>
+                  void run(
+                    () =>
+                      api.selectAlbumArtwork(governance.libraryAlbumId, {
+                        action: "RESET",
+                        requestId: createBrowserUuid(),
+                        expectedArtworkRevision: revision,
+                      }),
+                    "已恢复自动封面选择",
+                  )
+                }
+              >
+                恢复自动
+              </Button>
+              <Button
+                variant="quiet"
+                disabled={working}
+                onClick={() =>
+                  void run(
+                    () =>
+                      api.selectAlbumArtwork(governance.libraryAlbumId, {
+                        action: "HIDE",
+                        requestId: createBrowserUuid(),
+                        expectedArtworkRevision: revision,
+                      }),
+                    "已隐藏这张唱片的封面",
+                  )
+                }
+              >
+                <ImageOff /> 隐藏封面
+              </Button>
+            </div>
+          ) : null}
+        </div>
+      </div>
+
+      <ArtworkCandidateSection
+        title="本地候选"
+        empty="扫描尚未发现可用的内嵌或目录封面"
+        candidates={localCandidates}
+        canManage={canManage}
+        working={working}
+        onSelect={selectCandidate}
+      />
+      <ArtworkCandidateSection
+        title="MusicBrainz / CAA"
+        empty="尚未导入已确认发行版的正面封面"
+        candidates={importedCandidates}
+        canManage={canManage}
+        working={working}
+        onSelect={selectCandidate}
+      />
+      {canManage ? (
+        <div className="artwork-import-actions">
+          <label>
+            <span>已确认的本地版本</span>
+            <select
+              value={selectedVersionId}
+              onChange={(event) => setSelectedVersionId(event.target.value)}
+            >
+              {!confirmedVersions.length ? (
+                <option value="">请先完成人工发行匹配</option>
+              ) : null}
+              {confirmedVersions.map((version) => (
+                <option value={version.id} key={version.id}>
+                  {version.title} · {version.musicBrainzReleaseId?.slice(0, 8)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <Button
+            variant="secondary"
+            disabled={working || !selectedVersionId}
+            onClick={() =>
+              void run(
+                () =>
+                  api.importMusicBrainzArtwork(governance.libraryAlbumId, {
+                    localVersionId: selectedVersionId,
+                    requestId: createBrowserUuid(),
+                    expectedArtworkRevision: revision,
+                  }),
+                "CAA 正面封面已校验、导入并选中",
+              )
+            }
+          >
+            <Download /> 导入 CAA 正面封面
+          </Button>
+        </div>
+      ) : null}
+
+      <ArtworkCandidateSection
+        title="管理员上传"
+        empty="尚未上传自定义封面"
+        candidates={uploadedCandidates}
+        canManage={canManage}
+        working={working}
+        onSelect={selectCandidate}
+      />
+      {canManage ? (
+        <div className="artwork-upload-row">
+          <input
+            aria-label="选择封面文件"
+            type="file"
+            accept="image/jpeg,image/png,image/webp"
+            onChange={(event) => setUploadFile(event.target.files?.[0] ?? null)}
+          />
+          <Button
+            variant="secondary"
+            disabled={working || !uploadFile}
+            onClick={() => {
+              if (!uploadFile) return;
+              void run(
+                () =>
+                  api.uploadAlbumArtwork(
+                    governance.libraryAlbumId,
+                    uploadFile,
+                    {
+                      requestId: createBrowserUuid(),
+                      expectedArtworkRevision: revision,
+                    },
+                  ),
+                "上传封面已校验并选中",
+              );
+            }}
+          >
+            <Upload /> 上传并选中
+          </Button>
+          <small>JPEG / PNG / WebP，最大 20 MiB；服务端会真实解码校验。</small>
+        </div>
+      ) : null}
+
+      <div className="artwork-history">
+        <h3>封面决定历史</h3>
+        {historyError ? (
+          <p className="error-copy">历史读取失败：{historyError}</p>
+        ) : null}
+        {!historyError && !history.length ? <p>还没有人工封面决定。</p> : null}
+        {history.map((event) => (
+          <div key={event.id} className="artwork-history-row">
+            <div>
+              <strong>{artworkEventLabel(event.type)}</strong>
+              <span>
+                {event.actor.displayName} ·{" "}
+                {new Date(event.createdAt).toLocaleString()}
+              </span>
+            </div>
+            {canManage && event.canUndo ? (
+              <Button
+                variant="quiet"
+                disabled={working}
+                onClick={() =>
+                  void run(
+                    () =>
+                      api.undoArtworkEvent(
+                        governance.libraryAlbumId,
+                        event.id,
+                        {
+                          requestId: createBrowserUuid(),
+                          expectedArtworkRevision: revision,
+                        },
+                      ),
+                    "封面决定已撤销，并记录补偿事件",
+                  )
+                }
+              >
+                撤销
+              </Button>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ArtworkCandidateSection({
+  title,
+  empty,
+  candidates,
+  canManage,
+  working,
+  onSelect,
+}: {
+  title: string;
+  empty: string;
+  candidates: AlbumArtworkGovernance["candidates"];
+  canManage: boolean;
+  working: boolean;
+  onSelect: (candidateId: string) => Promise<void>;
+}) {
+  return (
+    <div className="artwork-candidate-section">
+      <h3>{title}</h3>
+      {!candidates.length ? <p>{empty}</p> : null}
+      <div className="artwork-candidate-grid">
+        {candidates.map((candidate) => (
+          <article
+            key={candidate.id}
+            className={`artwork-candidate${candidate.selected ? " is-selected" : ""}`}
+          >
+            <img src={candidate.url} alt={`${title}封面候选`} />
+            <div>
+              <strong>{artworkCandidateSourceLabel(candidate.source)}</strong>
+              <span>
+                {candidate.width} × {candidate.height} · {candidate.mimeType} ·{" "}
+                {formatFileSize(candidate.sizeBytes)}
+              </span>
+              <small>
+                {candidate.localVersionId
+                  ? `版本 ${candidate.localVersionId.slice(0, 10)}`
+                  : "唱片级资产"}
+                {candidate.lowResolution ? " · 低清" : ""}
+                {!candidate.current ? " · 历史候选" : ""}
+              </small>
+              {candidate.relativePath ? (
+                <small title={candidate.relativePath}>
+                  路径 · {candidate.relativePath}
+                </small>
+              ) : null}
+            </div>
+            {canManage ? (
+              <Button
+                variant={candidate.selected ? "quiet" : "secondary"}
+                disabled={working || candidate.selected || !candidate.current}
+                onClick={() => void onSelect(candidate.id)}
+              >
+                {candidate.selected ? "当前使用" : "选择"}
+              </Button>
+            ) : null}
+          </article>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function artworkSelectionLabel(
+  source: AlbumArtworkGovernance["selectionSource"],
+): string {
+  return (
+    {
+      USER_SELECTED: "人工选择",
+      USER_HIDDEN: "人工隐藏",
+      AUTOMATIC_PRIMARY: "主版本自动封面",
+      AUTOMATIC_REPRESENTATIVE: "代表版本自动封面",
+      NONE: "没有可用封面",
+    } as const
+  )[source];
+}
+
+function artworkCandidateSourceLabel(
+  source: AlbumArtworkGovernance["candidates"][number]["source"],
+): string {
+  return {
+    OBSERVED_EMBEDDED: "内嵌封面",
+    OBSERVED_SIDECAR: "目录封面",
+    USER_UPLOAD: "管理员上传",
+    MUSICBRAINZ_CAA: "MusicBrainz CAA",
+  }[source];
+}
+
+function artworkEventLabel(type: AlbumArtworkEvent["type"]): string {
+  return {
+    SELECT: "选择封面",
+    HIDE: "隐藏封面",
+    RESET: "恢复自动",
+    UPLOAD: "上传封面",
+    IMPORT: "导入 CAA",
+    UNDO: "撤销补偿",
+  }[type];
 }
 
 const metadataLabels: Record<MetadataField, string> = {
