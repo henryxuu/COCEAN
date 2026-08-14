@@ -169,25 +169,6 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
   const modelReady = Boolean(
     modelConfigured && modelCapability?.enabled && modelCapability.verified,
   );
-  const modelStatusTone = generatingIntroduction
-    ? "is-working"
-    : modelReady
-      ? "is-ready"
-      : modelCapability?.verificationStatus === "FAILED"
-        ? "is-failed"
-        : "is-idle";
-  const modelStatusTitle = generatingIntroduction
-    ? "模型正在整理本地专辑事实"
-    : modelReady
-      ? `模型已就绪${modelCapability?.model ? ` · ${modelCapability.model}` : ""}`
-      : !modelConfigured
-        ? "可借助模型生成专辑介绍"
-        : !modelCapability?.enabled
-          ? "模型连接已保存，但尚未启用"
-          : "模型连接尚未验证";
-  const modelStatusDetail = modelReady
-    ? "介绍只使用本地标题、艺术家、年份、厂牌与曲目，不参与发行核验。"
-    : "前往设置完成连接验证与启用；模型不会修改标签，也不会参与发行定版。";
   const discGroups = groupTracksByDisc(item.tracks);
   const firstTrackId = discGroups[0]?.tracks[0]?.id;
   const listeningTrack =
@@ -365,7 +346,6 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
       <section className="detail-hero">
         <AlbumArtwork album={item} size="hero" />
         <div className="detail-hero-copy">
-          <p className="eyebrow">ALBUM</p>
           <h1>{item.title}</h1>
           <p className="album-meta">
             {item.albumArtist}
@@ -396,10 +376,6 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
               {introduction.data ? (
                 <>
                   <p>{introduction.data.content}</p>
-                  <small>
-                    由 {introduction.data.model} 基于本地专辑事实生成 ·
-                    不作为发行核验
-                  </small>
                 </>
               ) : (
                 <p>
@@ -408,139 +384,22 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
                 </p>
               )}
             </div>
-            {canManage ? (
-              <div className="model-assist-bar">
-                <span
-                  className={`model-breath-dot ${modelStatusTone}`}
-                  aria-hidden="true"
-                />
-                <div>
-                  <strong>{modelStatusTitle}</strong>
-                  <small>{modelStatusDetail}</small>
-                </div>
-                {modelReady ? (
-                  <Button
-                    variant="secondary"
-                    disabled={generatingIntroduction}
-                    onClick={() => void generateIntroduction()}
-                  >
-                    <Sparkles />
-                    {generatingIntroduction
-                      ? "正在生成"
-                      : introduction.data
-                        ? "重新生成"
-                        : "生成介绍"}
-                  </Button>
-                ) : (
-                  <Link
-                    className="button secondary model-setup-link"
-                    to="/settings#settings-assist"
-                  >
-                    {modelConfigured ? "检查模型" : "开通模型"}
-                  </Link>
-                )}
-              </div>
-            ) : null}
           </div>
-          <div className="hero-actions">
-            <Button disabled={!item.tracks.length} onClick={() => listen()}>
-              {listeningTrack ? <Pause /> : <Play />} Listen
-            </Button>
-            <Link className="button secondary" to={`/albums/${item.id}/match`}>
-              信息匹配
-            </Link>
-            {canManage && item.hasDigital && enabledTargets.length ? (
-              <>
-                <select
-                  className="delivery-target-select"
-                  aria-label="选择投送目标"
-                  value={deliveryTargetId}
-                  onChange={(event) => setDeliveryTargetId(event.target.value)}
-                >
-                  {enabledTargets.map((target) => (
-                    <option value={target.id} key={target.id}>
-                      {target.name} · {deliveryTargetTransportLabel(target)}
-                      {isFtpTarget(target) && !target.credentialConfigured
-                        ? " · 待凭据"
-                        : ""}
-                    </option>
-                  ))}
-                </select>
-                <Button
-                  disabled={delivering || selectedTargetNeedsCredential}
-                  onClick={() => void deliver()}
-                >
-                  <Send /> {delivering ? "正在创建" : "投送专辑"}
-                </Button>
-                {selectedTargetNeedsCredential ? (
-                  <Link className="text-link" to="/systems">
-                    补录 FTP 凭据
-                  </Link>
-                ) : null}
-              </>
-            ) : canManage && item.hasDigital ? (
-              <Link className="button secondary" to="/systems">
-                <Send /> 配置投送
-              </Link>
-            ) : null}
-          </div>
-        </div>
-        <aside className="release-card">
-          <h2>发行信息</h2>
-          <Fact label="厂牌" value={item.release.label} />
-          <Fact label="目录号" value={item.release.catalogNumber} />
-          <Fact label="条码" value={item.release.barcode} />
-          <Fact
-            label="地区 / 日期"
-            value={
-              [item.release.country, item.release.releaseDate]
-                .filter(Boolean)
-                .join(" · ") || null
-            }
+          <AlbumDetailHeroActions
+            canManage={canManage}
+            hasDigital={item.hasDigital}
+            hasTracks={item.tracks.length > 0}
+            listening={Boolean(listeningTrack)}
+            targets={enabledTargets}
+            selectedTargetId={deliveryTargetId}
+            delivering={delivering}
+            selectedTargetNeedsCredential={selectedTargetNeedsCredential}
+            onSelectTarget={setDeliveryTargetId}
+            onDeliver={deliver}
+            onListen={() => listen()}
           />
-          <span className="source-status">
-            <ShieldCheck /> {statusLabel(item.matchStatus)}
-          </span>
-          <small className="release-proof-note">
-            来自文件标签、外部候选与人工确认；大模型不参与定版。
-          </small>
-        </aside>
+        </div>
       </section>
-
-      {item.metadata ? (
-        <AlbumMetadataGovernance
-          metadata={item.metadata}
-          history={metadataHistory.data ?? []}
-          historyError={metadataHistory.error?.message ?? null}
-          canManage={canManage}
-          onReload={async () => {
-            const [latest] = await Promise.all([
-              album.reload(),
-              metadataHistory.reload(),
-            ]);
-            return latest !== null;
-          }}
-          onToast={toast.show}
-        />
-      ) : null}
-
-      {item.artworkGovernance ? (
-        <AlbumArtworkGovernancePanel
-          album={item}
-          governance={item.artworkGovernance}
-          history={artworkHistory.data ?? []}
-          historyError={artworkHistory.error?.message ?? null}
-          canManage={canManage}
-          onReload={async () => {
-            const [latest] = await Promise.all([
-              album.reload(),
-              artworkHistory.reload(),
-            ]);
-            return latest !== null;
-          }}
-          onToast={toast.show}
-        />
-      ) : null}
 
       <div className="detail-grid">
         <section className="surface-card owned-versions">
@@ -548,209 +407,214 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
           <AlbumLocalVersions
             versions={localVersions}
             versionCount={item.versionCount ?? 1}
+            metadata={item.metadata}
+            fallbackRelease={item.release}
           />
-          <AlbumIdentityGovernance
-            key={item.id}
-            album={item}
-            versions={localVersions}
-            canManage={canManage}
-            working={identityWorking}
-            searchResults={identitySearchResults}
-            searchError={identitySearchError}
-            targetDetail={identityTargetDetail}
-            targetError={identityTargetError}
-            onSearch={searchMergeTargets}
-            onSelectTarget={selectMergeTarget}
-            onApply={applyIdentityDecision}
-          />
-          {item.physicalCopies.map((copy) => (
-            <div className="version-row" key={copy.id}>
-              <span className="record-icon">◉</span>
-              <div>
-                <strong>
-                  <MediaTag medium={copy.medium} />
-                </strong>
-                <span>
-                  {[copy.label, copy.catalogNumber, copy.releaseYear]
-                    .filter(Boolean)
-                    .join(" · ") || "实体副本；具体压片信息可继续补充"}
-                </span>
-                {copy.storageLocation ? (
-                  <small>存放位置 · {copy.storageLocation}</small>
+          <details className="collection-disclosure">
+            <summary>
+              <span>实体收藏</span>
+              <small>
+                {item.physicalCopies.length
+                  ? `${item.physicalCopies.length} 条记录`
+                  : "可记录 CD、SACD 与黑胶"}
+              </small>
+            </summary>
+            {item.physicalCopies.map((copy) => (
+              <div className="version-row" key={copy.id}>
+                <span className="record-icon">◉</span>
+                <div>
+                  <strong>
+                    <MediaTag medium={copy.medium} />
+                  </strong>
+                  <span>
+                    {[copy.label, copy.catalogNumber, copy.releaseYear]
+                      .filter(Boolean)
+                      .join(" · ") || "实体副本；具体压片信息可继续补充"}
+                  </span>
+                  {copy.storageLocation ? (
+                    <small>存放位置 · {copy.storageLocation}</small>
+                  ) : null}
+                </div>
+                {canManage ? (
+                  <button
+                    className="version-delete"
+                    type="button"
+                    aria-label={`删除 ${copy.medium} 记录`}
+                    onClick={() => void removeCopy(copy.id)}
+                  >
+                    <Trash2 />
+                  </button>
                 ) : null}
               </div>
-              {canManage ? (
-                <button
-                  className="version-delete"
-                  type="button"
-                  aria-label={`删除 ${copy.medium} 记录`}
-                  onClick={() => void removeCopy(copy.id)}
-                >
-                  <Trash2 />
-                </button>
-              ) : null}
-            </div>
-          ))}
-          {canManage ? (
-            <div className="quick-media-add">
-              <small>添加实体介质</small>
-              <div>
-                <Button
-                  variant="quiet"
-                  onClick={() => void addPhysicalCopy("CD")}
-                >
-                  CD
-                </Button>
-                <Button
-                  variant="quiet"
-                  onClick={() => void addPhysicalCopy("SACD")}
-                >
-                  SACD
-                </Button>
-                <Button
-                  variant="quiet"
-                  onClick={() => void addPhysicalCopy("VINYL")}
-                >
-                  黑胶
-                </Button>
-                <Button
-                  variant="quiet"
-                  onClick={() => setCopyFormOpen((value) => !value)}
-                >
-                  <Plus /> 详细版本
-                </Button>
+            ))}
+            {canManage ? (
+              <div className="quick-media-add">
+                <small>添加实体介质</small>
+                <div>
+                  <Button
+                    variant="quiet"
+                    onClick={() => void addPhysicalCopy("CD")}
+                  >
+                    CD
+                  </Button>
+                  <Button
+                    variant="quiet"
+                    onClick={() => void addPhysicalCopy("SACD")}
+                  >
+                    SACD
+                  </Button>
+                  <Button
+                    variant="quiet"
+                    onClick={() => void addPhysicalCopy("VINYL")}
+                  >
+                    黑胶
+                  </Button>
+                  <Button
+                    variant="quiet"
+                    onClick={() => setCopyFormOpen((value) => !value)}
+                  >
+                    <Plus /> 详细版本
+                  </Button>
+                </div>
               </div>
-            </div>
-          ) : null}
-          {copyFormOpen && canManage ? (
-            <form className="physical-copy-form" onSubmit={addDetailedCopy}>
-              <label>
-                <span>介质</span>
-                <select
-                  value={copyDraft.medium}
-                  onChange={(event) =>
-                    setCopyDraft((value) => ({
-                      ...value,
-                      medium: event.target.value as PhysicalMedium,
-                    }))
-                  }
-                >
-                  <option value="CD">CD</option>
-                  <option value="SACD">SACD</option>
-                  <option value="VINYL">黑胶</option>
-                  <option value="CASSETTE">磁带</option>
-                  <option value="BLURAY_AUDIO">Blu-ray Audio</option>
-                  <option value="OTHER">其他</option>
-                </select>
-              </label>
-              <label>
-                <span>厂牌</span>
-                <input
-                  value={copyDraft.label}
-                  onChange={(event) =>
-                    setCopyDraft((value) => ({
-                      ...value,
-                      label: event.target.value,
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                <span>目录号</span>
-                <input
-                  value={copyDraft.catalogNumber}
-                  onChange={(event) =>
-                    setCopyDraft((value) => ({
-                      ...value,
-                      catalogNumber: event.target.value,
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                <span>条码</span>
-                <input
-                  value={copyDraft.barcode}
-                  onChange={(event) =>
-                    setCopyDraft((value) => ({
-                      ...value,
-                      barcode: event.target.value,
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                <span>地区</span>
-                <input
-                  value={copyDraft.country}
-                  onChange={(event) =>
-                    setCopyDraft((value) => ({
-                      ...value,
-                      country: event.target.value,
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                <span>年份</span>
-                <input
-                  type="number"
-                  min="1877"
-                  max="2200"
-                  value={copyDraft.releaseYear}
-                  onChange={(event) =>
-                    setCopyDraft((value) => ({
-                      ...value,
-                      releaseYear: event.target.value,
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                <span>数量</span>
-                <input
-                  type="number"
-                  min="1"
-                  max="999"
-                  value={copyDraft.quantity}
-                  onChange={(event) =>
-                    setCopyDraft((value) => ({
-                      ...value,
-                      quantity: event.target.value,
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                <span>存放位置</span>
-                <input
-                  value={copyDraft.storageLocation}
-                  onChange={(event) =>
-                    setCopyDraft((value) => ({
-                      ...value,
-                      storageLocation: event.target.value,
-                    }))
-                  }
-                />
-              </label>
-              <label className="copy-note">
-                <span>品相 / 备注</span>
-                <input
-                  value={copyDraft.conditionNote}
-                  onChange={(event) =>
-                    setCopyDraft((value) => ({
-                      ...value,
-                      conditionNote: event.target.value,
-                    }))
-                  }
-                />
-              </label>
-              <Button type="submit">保存版本</Button>
-            </form>
-          ) : null}
+            ) : null}
+            {copyFormOpen && canManage ? (
+              <form className="physical-copy-form" onSubmit={addDetailedCopy}>
+                <label>
+                  <span>介质</span>
+                  <select
+                    value={copyDraft.medium}
+                    onChange={(event) =>
+                      setCopyDraft((value) => ({
+                        ...value,
+                        medium: event.target.value as PhysicalMedium,
+                      }))
+                    }
+                  >
+                    <option value="CD">CD</option>
+                    <option value="SACD">SACD</option>
+                    <option value="VINYL">黑胶</option>
+                    <option value="CASSETTE">磁带</option>
+                    <option value="BLURAY_AUDIO">Blu-ray Audio</option>
+                    <option value="OTHER">其他</option>
+                  </select>
+                </label>
+                <label>
+                  <span>厂牌</span>
+                  <input
+                    value={copyDraft.label}
+                    onChange={(event) =>
+                      setCopyDraft((value) => ({
+                        ...value,
+                        label: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  <span>目录号</span>
+                  <input
+                    value={copyDraft.catalogNumber}
+                    onChange={(event) =>
+                      setCopyDraft((value) => ({
+                        ...value,
+                        catalogNumber: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  <span>条码</span>
+                  <input
+                    value={copyDraft.barcode}
+                    onChange={(event) =>
+                      setCopyDraft((value) => ({
+                        ...value,
+                        barcode: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  <span>地区</span>
+                  <input
+                    value={copyDraft.country}
+                    onChange={(event) =>
+                      setCopyDraft((value) => ({
+                        ...value,
+                        country: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  <span>年份</span>
+                  <input
+                    type="number"
+                    min="1877"
+                    max="2200"
+                    value={copyDraft.releaseYear}
+                    onChange={(event) =>
+                      setCopyDraft((value) => ({
+                        ...value,
+                        releaseYear: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  <span>数量</span>
+                  <input
+                    type="number"
+                    min="1"
+                    max="999"
+                    value={copyDraft.quantity}
+                    onChange={(event) =>
+                      setCopyDraft((value) => ({
+                        ...value,
+                        quantity: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  <span>存放位置</span>
+                  <input
+                    value={copyDraft.storageLocation}
+                    onChange={(event) =>
+                      setCopyDraft((value) => ({
+                        ...value,
+                        storageLocation: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label className="copy-note">
+                  <span>品相 / 备注</span>
+                  <input
+                    value={copyDraft.conditionNote}
+                    onChange={(event) =>
+                      setCopyDraft((value) => ({
+                        ...value,
+                        conditionNote: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <Button type="submit">保存版本</Button>
+              </form>
+            ) : null}
+          </details>
         </section>
-        <section className="surface-card delivery-history-card">
-          <SectionTitle title="投送记录" />
+        <details className="surface-card delivery-history-card">
+          <summary className="card-disclosure-summary">
+            <span>投送记录</span>
+            <small>
+              {deliveries.data?.length
+                ? `${deliveries.data.length} 次投送`
+                : "尚无投送记录"}
+            </small>
+          </summary>
           {deliveries.data?.length ? (
             <div className="delivery-history-list">
               {deliveries.data.map((job) => (
@@ -769,16 +633,149 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
               </div>
             </div>
           )}
-        </section>
+        </details>
       </div>
 
-      <AlbumIdentityHistory
-        decisions={identityHistory.data ?? []}
-        error={identityHistory.error?.message ?? null}
-        canManage={canManage}
-        working={identityWorking}
-        onUndo={undoIdentityDecision}
-      />
+      <section
+        id="album-management"
+        className="surface-card album-management"
+        aria-label="管理唱片"
+      >
+        <SectionTitle
+          title="管理唱片"
+          meta={canManage ? "资料、封面与版本" : "查看资料来源与记录"}
+        />
+        <p className="management-intro">
+          日常浏览只保留常用信息。需要修正资料、封面或版本关系时，再展开对应项目。
+        </p>
+        <div className="management-groups">
+          <details className="management-disclosure">
+            <summary>
+              <span>核对唱片资料</span>
+              <small>查找匹配的发行版本，补齐可信资料</small>
+            </summary>
+            <div className="management-shortcut">
+              <p>从候选发行中核对曲目、年份与版本，不会自动改动 NAS 文件。</p>
+              <Link
+                className="button secondary"
+                to={`/albums/${item.id}/match`}
+              >
+                开始核对
+              </Link>
+            </div>
+          </details>
+
+          {item.metadata ? (
+            <details className="management-disclosure">
+              <summary>
+                <span>编辑唱片资料</span>
+                <small>名称、艺术家、年份及各版本发行资料</small>
+              </summary>
+              <AlbumMetadataGovernance
+                metadata={item.metadata}
+                history={metadataHistory.data ?? []}
+                historyError={metadataHistory.error?.message ?? null}
+                canManage={canManage}
+                onReload={async () => {
+                  const [latest] = await Promise.all([
+                    album.reload(),
+                    metadataHistory.reload(),
+                  ]);
+                  return latest !== null;
+                }}
+                onToast={toast.show}
+              />
+            </details>
+          ) : null}
+
+          {item.artworkGovernance ? (
+            <details className="management-disclosure">
+              <summary>
+                <span>管理封面</span>
+                <small>比较本地封面、上传图片或恢复自动选择</small>
+              </summary>
+              <AlbumArtworkGovernancePanel
+                album={item}
+                governance={item.artworkGovernance}
+                history={artworkHistory.data ?? []}
+                historyError={artworkHistory.error?.message ?? null}
+                canManage={canManage}
+                onReload={async () => {
+                  const [latest] = await Promise.all([
+                    album.reload(),
+                    artworkHistory.reload(),
+                  ]);
+                  return latest !== null;
+                }}
+                onToast={toast.show}
+              />
+            </details>
+          ) : null}
+
+          <details className="management-disclosure">
+            <summary>
+              <span>合并或拆分版本</span>
+              <small>处理重复唱片、残缺版本与错误聚合</small>
+            </summary>
+            <AlbumIdentityGovernance
+              key={item.id}
+              album={item}
+              versions={localVersions}
+              canManage={canManage}
+              working={identityWorking}
+              searchResults={identitySearchResults}
+              searchError={identitySearchError}
+              targetDetail={identityTargetDetail}
+              targetError={identityTargetError}
+              onSearch={searchMergeTargets}
+              onSelectTarget={selectMergeTarget}
+              onApply={applyIdentityDecision}
+            />
+            <AlbumIdentityHistory
+              decisions={identityHistory.data ?? []}
+              error={identityHistory.error?.message ?? null}
+              canManage={canManage}
+              working={identityWorking}
+              onUndo={undoIdentityDecision}
+            />
+          </details>
+
+          {canManage ? (
+            <details className="management-disclosure">
+              <summary>
+                <span>唱片介绍</span>
+                <small>生成或更新用于浏览的简介</small>
+              </summary>
+              <div className="management-shortcut">
+                <p>
+                  介绍仅根据本地唱片事实整理，不参与版本识别，也不会修改标签。
+                </p>
+                {modelReady ? (
+                  <Button
+                    variant="secondary"
+                    disabled={generatingIntroduction}
+                    onClick={() => void generateIntroduction()}
+                  >
+                    <Sparkles />
+                    {generatingIntroduction
+                      ? "正在更新"
+                      : introduction.data
+                        ? "更新唱片介绍"
+                        : "生成唱片介绍"}
+                  </Button>
+                ) : (
+                  <Link
+                    className="button secondary"
+                    to="/settings#settings-assist"
+                  >
+                    {modelConfigured ? "检查介绍功能" : "配置介绍功能"}
+                  </Link>
+                )}
+              </div>
+            </details>
+          ) : null}
+        </div>
+      </section>
 
       <AlbumIntegrityIssues issues={item.issues ?? []} />
 
@@ -915,6 +912,90 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
   );
 }
 
+export function AlbumDetailHeroActions({
+  canManage,
+  hasDigital,
+  hasTracks,
+  listening,
+  targets,
+  selectedTargetId,
+  delivering,
+  selectedTargetNeedsCredential,
+  onSelectTarget,
+  onDeliver,
+  onListen,
+}: {
+  canManage: boolean;
+  hasDigital: boolean;
+  hasTracks: boolean;
+  listening: boolean;
+  targets: DeliveryTarget[];
+  selectedTargetId: string;
+  delivering: boolean;
+  selectedTargetNeedsCredential: boolean;
+  onSelectTarget: (targetId: string) => void;
+  onDeliver: () => void | Promise<void>;
+  onListen: () => void;
+}) {
+  return (
+    <div className="hero-actions">
+      {canManage && hasDigital && targets.length ? (
+        <details className="delivery-action-menu">
+          <summary>
+            <Send /> 投送到播放器
+          </summary>
+          <div className="delivery-action-popover">
+            <label>
+              <span>投送目标</span>
+              <select
+                className="delivery-target-select"
+                aria-label="选择投送目标"
+                value={selectedTargetId}
+                onChange={(event) => onSelectTarget(event.target.value)}
+              >
+                {targets.map((target) => (
+                  <option value={target.id} key={target.id}>
+                    {target.name} · {deliveryTargetTransportLabel(target)}
+                    {isFtpTarget(target) && !target.credentialConfigured
+                      ? " · 待凭据"
+                      : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <Button
+              disabled={delivering || selectedTargetNeedsCredential}
+              onClick={() => void onDeliver()}
+            >
+              <Send /> {delivering ? "正在创建" : "确认投送"}
+            </Button>
+            {selectedTargetNeedsCredential ? (
+              <a className="text-link" href="/systems">
+                补录 FTP 凭据
+              </a>
+            ) : null}
+          </div>
+        </details>
+      ) : canManage && hasDigital ? (
+        <a className="button primary" href="/systems">
+          <Send /> 配置投送
+        </a>
+      ) : null}
+      <Button variant="secondary" disabled={!hasTracks} onClick={onListen}>
+        {listening ? <Pause /> : <Play />} 试听
+      </Button>
+      {canManage ? (
+        <a
+          className="button secondary album-manage-link"
+          href="#album-management"
+        >
+          管理唱片
+        </a>
+      ) : null}
+    </div>
+  );
+}
+
 function readRecentDeliveryPlan(
   key: string,
   storage: LibraryStorage,
@@ -968,15 +1049,6 @@ function createBrowserUuid(): string {
     .join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
 }
 
-function Fact({ label, value }: { label: string; value: string | null }) {
-  return (
-    <div className="fact-row">
-      <span>{label}</span>
-      <strong>{value ?? "待确认"}</strong>
-    </div>
-  );
-}
-
 export function AlbumArtworkGovernancePanel({
   album,
   governance,
@@ -1023,7 +1095,7 @@ export function AlbumArtworkGovernancePanel({
       onToast(successMessage);
     } catch (error) {
       if (error instanceof ApiError && error.status === 409) await onReload();
-      onToast(error instanceof Error ? error.message : "封面治理操作失败");
+      onToast(error instanceof Error ? error.message : "封面操作失败");
     } finally {
       setWorking(false);
     }
@@ -1051,10 +1123,10 @@ export function AlbumArtworkGovernancePanel({
     );
 
   return (
-    <section className="surface-card artwork-governance" aria-label="封面治理">
+    <section className="surface-card artwork-governance" aria-label="管理封面">
       <SectionTitle
-        title="封面治理"
-        meta={`revision ${revision} · ${canManage ? "管理员可管理" : "只读"}`}
+        title="管理封面"
+        meta={canManage ? "可选择、上传或恢复自动封面" : "只读"}
       />
       <div className="artwork-governance-summary">
         <div className="artwork-effective-preview">
@@ -1530,17 +1602,17 @@ export function AlbumMetadataGovernance({
   return (
     <section
       className="surface-card metadata-governance"
-      aria-label="元数据治理"
+      aria-label="编辑唱片资料"
     >
       <SectionTitle
-        title="元数据"
-        meta={`revision ${metadata.metadataRevision} · ${canManage ? "管理员可编辑" : "只读"}`}
+        title="编辑唱片资料"
+        meta={canManage ? "修改只保存在 COCEAN" : "只读"}
       />
       <p className="quiet-row">
-        有效值按人工覆盖、外部确认、扫描标签、路径回退依次解析；操作仅修改
-        COCEAN 数据库，不改 NAS 文件。
+        COCEAN 会优先使用你的修改，其次使用已核对资料和文件标签；不会改写 NAS
+        文件。
       </p>
-      <h3>唱片级字段</h3>
+      <h3>整张唱片</h3>
       <div className="metadata-field-list">
         {albumRows.map((row) => (
           <MetadataFieldEditor
@@ -1574,9 +1646,9 @@ export function AlbumMetadataGovernance({
           />
         ))}
       </div>
-      {metadata.versions.map((version) => (
+      {metadata.versions.map((version, versionIndex) => (
         <div key={version.versionId} className="metadata-version-group">
-          <h3>版本级字段 · {shortStableId(version.versionId)}</h3>
+          <h3>本地版本 {versionIndex + 1}</h3>
           {versionRows
             .filter((row) => row.versionId === version.versionId)
             .map((row) => (
@@ -1621,11 +1693,11 @@ export function AlbumMetadataGovernance({
         </Button>
       ) : (
         <p className="identity-governance-readonly">
-          成员与 Demo 可以查看来源和历史；编辑、清空、恢复与撤销仅对管理员开放。
+          你可以查看资料来源和修改记录；只有管理员可以修改或撤销。
         </p>
       )}
       <div className="metadata-history">
-        <h3>最近元数据历史</h3>
+        <h3>最近修改</h3>
         {historyError ? <p className="error-row">{historyError}</p> : null}
         {history.map((event) => (
           <div className="version-row" key={event.id}>
@@ -1633,8 +1705,7 @@ export function AlbumMetadataGovernance({
             <div>
               <strong>{metadataEventLabel(event.type)}</strong>
               <span>
-                {event.actor.displayName} · {metadataEventCommands(event)} ·
-                revision {event.resultingMetadataRevision}
+                {event.actor.displayName} · {metadataEventCommands(event)}
               </span>
               <small>{new Date(event.createdAt).toLocaleString()}</small>
             </div>
@@ -1843,19 +1914,6 @@ function metadataEventLabel(type: AlbumMetadataEvent["type"]): string {
       ? "确认外部候选"
       : "字段修订";
 }
-function statusLabel(status: string) {
-  return (
-    (
-      {
-        UNMATCHED: "未匹配",
-        NEEDS_REVIEW: "待人工确认",
-        SOURCE_MATCHED: "文件含来源标识",
-        USER_CONFIRMED: "人工已确认",
-        TRACKS_INCOMPLETE: "曲目不完整",
-      } as Record<string, string>
-    )[status] ?? status
-  );
-}
 function formatDuration(value: number | null) {
   if (!value) return "–";
   const wholeSeconds = Math.max(1, Math.round(value));
@@ -1866,9 +1924,13 @@ function formatDuration(value: number | null) {
 export function AlbumLocalVersions({
   versions,
   versionCount,
+  metadata,
+  fallbackRelease,
 }: {
   versions: LocalVersionSummary[];
   versionCount: number;
+  metadata?: NonNullable<AlbumDetail["metadata"]> | null | undefined;
+  fallbackRelease?: AlbumDetail["release"];
 }) {
   return versions.map((version) => {
     const specification = version.mixedAudioSpecs
@@ -1888,6 +1950,33 @@ export function AlbumLocalVersions({
         : version.completeness === "NEEDS_REVIEW"
           ? "需要复核"
           : "完整";
+    const metadataVersion = metadata?.versions.find(
+      (candidate) => candidate.versionId === version.id,
+    );
+    const release = {
+      label:
+        metadataText(metadataVersion?.fields.label.effectiveValue) ??
+        (version.isPrimary ? fallbackRelease?.label : null),
+      catalogNumber:
+        metadataText(metadataVersion?.fields.catalogNumber.effectiveValue) ??
+        (version.isPrimary ? fallbackRelease?.catalogNumber : null),
+      barcode:
+        metadataText(metadataVersion?.fields.barcode.effectiveValue) ??
+        (version.isPrimary ? fallbackRelease?.barcode : null),
+      country:
+        metadataText(metadataVersion?.fields.country.effectiveValue) ??
+        (version.isPrimary ? fallbackRelease?.country : null),
+      releaseDate:
+        metadataText(metadataVersion?.fields.releaseDate.effectiveValue) ??
+        (version.isPrimary ? fallbackRelease?.releaseDate : null),
+    };
+    const releaseSummary = [
+      release.label,
+      release.catalogNumber,
+      [release.country, release.releaseDate].filter(Boolean).join(" "),
+    ]
+      .filter(Boolean)
+      .join(" · ");
     return (
       <div className="version-row" key={version.id}>
         <FileAudio2 />
@@ -1897,24 +1986,32 @@ export function AlbumLocalVersions({
             {specification} · {version.trackCount} 首 · {version.fileCount}{" "}
             个文件 · {formatFileSize(version.sizeBytes)}
           </span>
-          <small>
-            {version.sourceRoot ? (
-              <>
-                {version.sourceRoot.containerPath}
-                {version.relativePath ? `/${version.relativePath}` : ""} ·{" "}
-                {version.sourceRoot.readOnly ? "只读" : "托管"}
-              </>
-            ) : (
-              "实体收藏"
-            )}
+          <small className="version-release-summary">
+            {releaseSummary || "发行资料待补充"}
           </small>
-          <small>
-            {version.sourceVersionCount} 个来源副本 · 折叠{" "}
-            {version.duplicateFileCount} 个重复文件
-          </small>
-          <small>
-            {relationship} · {completeness}
-          </small>
+          <details className="version-technical-details">
+            <summary>文件与识别详情</summary>
+            <small>
+              {version.sourceRoot ? (
+                <>
+                  {version.sourceRoot.containerPath}
+                  {version.relativePath
+                    ? `/${version.relativePath}`
+                    : ""} · {version.sourceRoot.readOnly ? "只读" : "托管"}
+                </>
+              ) : (
+                "实体收藏"
+              )}
+            </small>
+            {release.barcode ? <small>条码 · {release.barcode}</small> : null}
+            <small>
+              {version.sourceVersionCount} 个来源副本 · 已归并{" "}
+              {version.duplicateFileCount} 个重复文件
+            </small>
+            <small>
+              {relationship} · {completeness}
+            </small>
+          </details>
           {version.issues.map((issue) => (
             <small key={`${version.id}-${issue.code}`} className="issue-tag">
               {libraryIssueLabel(issue.code)}
@@ -1924,6 +2021,12 @@ export function AlbumLocalVersions({
       </div>
     );
   });
+}
+
+function metadataText(value: string | number | null | undefined) {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  return text || null;
 }
 
 export function AlbumIdentityGovernance({
@@ -1973,16 +2076,16 @@ export function AlbumIdentityGovernance({
   if (!canManage)
     return (
       <div className="identity-governance-readonly">
-        <strong>身份治理为只读</strong>
+        <strong>版本关系为只读</strong>
         <small>
-          成员可以查看人工关系和历史；只有管理员可以确认、拆分、合并或设置主版本。
+          你可以查看版本关系和记录；只有管理员可以确认、拆分、合并或设置主版本。
         </small>
       </div>
     );
   return (
-    <div className="identity-governance" aria-label="唱片身份治理">
+    <div className="identity-governance" aria-label="版本关系">
       <div className="identity-governance-heading">
-        <strong>身份治理</strong>
+        <strong>版本关系</strong>
         <small>{confirmation}</small>
       </div>
       <div className="identity-governance-actions">
@@ -2241,20 +2344,20 @@ export function AlbumIdentityHistory({
     UNDO: "撤销补偿",
   };
   return (
-    <section className="surface-card identity-history" aria-label="身份历史">
-      <SectionTitle title="身份历史" />
+    <section
+      className="surface-card identity-history"
+      aria-label="版本修改记录"
+    >
+      <SectionTitle title="版本修改记录" />
       {error ? (
-        <p className="error-row">身份历史加载失败：{error}</p>
+        <p className="error-row">版本修改记录加载失败：{error}</p>
       ) : decisions.length ? (
         decisions.map((decision) => (
           <div className="version-row" key={decision.id}>
             <Clock3 />
             <div>
               <strong>{labels[decision.type]}</strong>
-              <span>
-                {decision.actor.displayName} · revision{" "}
-                {decision.resultingRevision}
-              </span>
+              <span>{decision.actor.displayName}</span>
               <small>{formatDeliveryTime(decision.createdAt)}</small>
               <small>{identityDecisionSummary(decision)}</small>
             </div>
@@ -2270,7 +2373,9 @@ export function AlbumIdentityHistory({
           </div>
         ))
       ) : (
-        <p className="quiet-row">尚无人工身份决定；自动候选不会被静默确认。</p>
+        <p className="quiet-row">
+          尚无人工修改；系统不会自动确认有疑问的版本。
+        </p>
       )}
     </section>
   );

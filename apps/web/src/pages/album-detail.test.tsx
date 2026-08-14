@@ -9,6 +9,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
   AlbumDeliveryRecord,
+  AlbumDetailHeroActions,
   AlbumArtworkGovernancePanel,
   AlbumIdentityGovernance,
   AlbumIdentityHistory,
@@ -23,6 +24,50 @@ import {
   createLatestRequestTracker,
   legacyLocalVersions,
 } from "./album-detail.js";
+
+describe("Album 详情主操作", () => {
+  it("以投送为主要入口，并将目标选择默认折叠", () => {
+    const html = renderToStaticMarkup(
+      <AlbumDetailHeroActions
+        canManage
+        hasDigital
+        hasTracks
+        listening={false}
+        targets={[
+          {
+            id: "sp3000m",
+            deviceId: null,
+            name: "SP3000M",
+            kind: "NETWORK",
+            transport: "AK_FILE_DROP",
+            location: "172.16.1.10",
+            username: "owner",
+            credentialConfigured: true,
+            enabled: true,
+            verifiedAt: "2026-08-14T00:00:00.000Z",
+            createdAt: "2026-08-14T00:00:00.000Z",
+            updatedAt: "2026-08-14T00:00:00.000Z",
+          },
+        ]}
+        selectedTargetId="sp3000m"
+        delivering={false}
+        selectedTargetNeedsCredential={false}
+        onSelectTarget={() => undefined}
+        onDeliver={() => undefined}
+        onListen={() => undefined}
+      />,
+    );
+    expect(html).toContain("投送到播放器");
+    expect(html).toContain("试听");
+    expect(html).toContain("管理唱片");
+    expect(html).toContain('<details class="delivery-action-menu">');
+    expect(html).not.toContain(
+      '<details class="delivery-action-menu" open="">',
+    );
+    expect(html).not.toContain("Listen");
+    expect(html).not.toContain("信息匹配");
+  });
+});
 
 describe("Album 详情投送记录", () => {
   it("从持久化目标清单明确显示 8 首音频与封面完成 9/9", () => {
@@ -80,7 +125,18 @@ describe("Album 详情本地版本", () => {
     ];
 
     const html = renderToStaticMarkup(
-      <AlbumLocalVersions versions={versions} versionCount={2} />,
+      <AlbumLocalVersions
+        versions={versions}
+        versionCount={2}
+        fallbackRelease={{
+          label: "Decca",
+          catalogNumber: "SXL 2001",
+          barcode: "0123456789012",
+          country: "GB",
+          releaseDate: "1961-01-01",
+          musicBrainzReleaseId: null,
+        }}
+      />,
     );
     expect(html).toContain("主版本");
     expect(html).toContain("本地版本");
@@ -89,6 +145,12 @@ describe("Album 详情本地版本", () => {
     expect(html).toContain("2 首");
     expect(html).toContain("自动候选 · 待确认");
     expect(html).toContain("曲目不完整");
+    expect(html).toContain("Decca · SXL 2001 · GB 1961-01-01");
+    expect(html).toContain("条码 · 0123456789012");
+    expect(html).toContain('<details class="version-technical-details">');
+    expect(html).not.toContain(
+      '<details class="version-technical-details" open="">',
+    );
     expect(html).toContain("/library/music/Artist/Album/01.flac");
   });
 });
@@ -145,15 +207,15 @@ describe("Album 元数据治理", () => {
         onToast={() => undefined}
       />,
     );
-    expect(html).toContain("唱片级字段");
-    expect(html).toContain("版本级字段");
+    expect(html).toContain("整张唱片");
+    expect(html).toContain("本地版本 1");
     expect(html).toContain("来源：人工覆盖");
     expect(html).toContain("观察值：扫描标题");
     expect(html).toContain("保存修改（0 个字段）");
     expect(html).toContain("清空有效值");
     expect(html).toContain("移除人工覆盖 / 恢复下一层可信值");
     expect(html).toContain("撤销");
-    expect(html).toContain("仅修改 COCEAN 数据库");
+    expect(html).toContain("不会改写 NAS 文件");
   });
 
   it("成员只看到来源与历史，不出现写入操作", () => {
@@ -167,7 +229,7 @@ describe("Album 元数据治理", () => {
         onToast={() => undefined}
       />,
     );
-    expect(html).toContain("成员与 Demo 可以查看来源和历史");
+    expect(html).toContain("你可以查看资料来源和修改记录");
     expect(html).not.toContain("保存修改（");
     expect(html).not.toContain("清空有效值");
     expect(html).not.toContain(">撤销<");
@@ -275,7 +337,7 @@ describe("Album 封面治理", () => {
         onToast={() => undefined}
       />,
     );
-    expect(html).toContain("封面治理");
+    expect(html).toContain("管理封面");
     expect(html).toContain("内嵌封面");
     expect(html).not.toContain("导入 CAA 正面封面");
     expect(html).not.toContain("上传并选中");
@@ -451,7 +513,7 @@ describe("Album 详情身份治理", () => {
         onUndo={() => undefined}
       />,
     );
-    expect(history).toContain("身份历史加载失败");
+    expect(history).toContain("版本修改记录加载失败");
     expect(history).not.toContain("尚无人工身份决定");
   });
 
@@ -467,7 +529,7 @@ describe("Album 详情身份治理", () => {
         onApply={() => undefined}
       />,
     );
-    expect(readonly).toContain("身份治理为只读");
+    expect(readonly).toContain("版本关系为只读");
     expect(readonly).not.toContain("确认同一唱片");
     const history = renderToStaticMarkup(
       <AlbumIdentityHistory
@@ -622,7 +684,7 @@ describe("Album 详情完整性与兼容展示", () => {
     expect(html).toContain("2 首");
     expect(html).toContain("3 个文件");
     expect(html).toContain("3 个来源副本");
-    expect(html).toContain("折叠 1 个重复文件");
+    expect(html).toContain("已归并 1 个重复文件");
     expect(html).toContain("曲目不完整");
   });
 });
