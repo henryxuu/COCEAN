@@ -76,6 +76,8 @@ services:
       COCEAN_DATABASE_PATH: /var/lib/cocean/cocean.sqlite
       COCEAN_CACHE_ROOT: /var/cache/cocean
       COCEAN_MUSIC_ROOT: /library/music
+      COCEAN_MUSIC_ROOT_POLICY: "${COCEAN_MUSIC_ROOT_POLICY:-WATCH_ONLY}"
+      COCEAN_QUARANTINE_ROOT: /library/quarantine
       COCEAN_STILL_CATALOG_PATH: /var/lib/cocean/still-catalog.json
       COCEAN_AUTH_BOOTSTRAP_FILE: /run/secrets/cocean_owner_bootstrap
       COCEAN_CREDENTIAL_KEY_PATH: /var/lib/cocean/credential.key
@@ -150,6 +152,8 @@ services:
       COCEAN_DATABASE_PATH: /var/lib/cocean/cocean.sqlite
       COCEAN_CACHE_ROOT: /var/cache/cocean
       COCEAN_MUSIC_ROOT: /library/music
+      COCEAN_MUSIC_ROOT_POLICY: "${COCEAN_MUSIC_ROOT_POLICY:-WATCH_ONLY}"
+      COCEAN_QUARANTINE_ROOT: /library/quarantine
       COCEAN_WORKER_POLL_MS: "${COCEAN_WORKER_POLL_MS:-1500}"
       COCEAN_WORKER_ONCE: "false"
       COCEAN_FFPROBE_PATH: "${COCEAN_FFPROBE_PATH:-/usr/bin/ffprobe}"
@@ -175,7 +179,12 @@ services:
       - type: bind
         source: "${COCEAN_MUSIC_DIR:?set COCEAN_MUSIC_DIR in .env}"
         target: /library/music
-        read_only: true
+        read_only: "${COCEAN_MUSIC_READ_ONLY:-true}"
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${COCEAN_QUARANTINE_DIR:?set COCEAN_QUARANTINE_DIR in .env}"
+        target: /library/quarantine
         bind:
           create_host_path: false
       - type: bind

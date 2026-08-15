@@ -1119,4 +1119,139 @@ export const migrations = [
         BEGIN SELECT RAISE(ABORT, 'library artwork event group ledger is append-only'); END;
     `,
   },
+  {
+    version: 20,
+    name: "library_lifecycle_governance",
+    sql: `
+      ALTER TABLE library_albums ADD COLUMN visibility TEXT NOT NULL DEFAULT 'VISIBLE'
+        CHECK(visibility IN ('VISIBLE','HIDDEN'));
+      ALTER TABLE library_albums ADD COLUMN visibility_revision INTEGER NOT NULL DEFAULT 0
+        CHECK(visibility_revision >= 0);
+      ALTER TABLE library_albums ADD COLUMN visibility_updated_at TEXT;
+
+      CREATE TABLE library_visibility_events (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        library_album_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK(event_type IN ('HIDE','RESTORE')),
+        actor_id TEXT NOT NULL,
+        actor_display_name TEXT NOT NULL,
+        expected_visibility_revision INTEGER NOT NULL CHECK(expected_visibility_revision >= 0),
+        resulting_visibility_revision INTEGER NOT NULL CHECK(resulting_visibility_revision >= 0),
+        before_visibility TEXT NOT NULL CHECK(before_visibility IN ('VISIBLE','HIDDEN')),
+        after_visibility TEXT NOT NULL CHECK(after_visibility IN ('VISIBLE','HIDDEN')),
+        input_json TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX library_visibility_events_album_idx
+        ON library_visibility_events(library_album_id,created_at DESC,id DESC);
+      CREATE TRIGGER library_visibility_events_no_update
+        BEFORE UPDATE ON library_visibility_events
+        BEGIN SELECT RAISE(ABORT, 'library visibility event ledger is append-only'); END;
+      CREATE TRIGGER library_visibility_events_no_delete
+        BEFORE DELETE ON library_visibility_events
+        BEGIN SELECT RAISE(ABORT, 'library visibility event ledger is append-only'); END;
+
+      CREATE TABLE library_change_plans (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        action TEXT NOT NULL CHECK(action IN ('QUARANTINE_VERSION','RESTORE_VERSION')),
+        status TEXT NOT NULL CHECK(status IN (
+          'PREVIEWED','QUEUED','RUNNING','SUCCEEDED','FAILED','RECOVERY_REQUIRED','CANCELLED'
+        )),
+        library_album_id TEXT NOT NULL,
+        local_version_id TEXT NOT NULL,
+        root_id TEXT NOT NULL,
+        root_container_path TEXT NOT NULL,
+        quarantine_root_path TEXT NOT NULL,
+        source_plan_id TEXT,
+        expected_library_revision INTEGER NOT NULL CHECK(expected_library_revision >= 0),
+        input_json TEXT NOT NULL,
+        executable INTEGER NOT NULL CHECK(executable IN (0,1)),
+        blockers_json TEXT NOT NULL DEFAULT '[]',
+        file_count INTEGER NOT NULL CHECK(file_count >= 0),
+        total_bytes INTEGER NOT NULL CHECK(total_bytes >= 0),
+        actor_id TEXT NOT NULL,
+        actor_display_name TEXT NOT NULL,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        confirmed_at TEXT,
+        started_at TEXT,
+        finished_at TEXT
+      );
+      CREATE INDEX library_change_plans_album_idx
+        ON library_change_plans(library_album_id,created_at DESC,id DESC);
+      CREATE INDEX library_change_plans_status_idx
+        ON library_change_plans(status,created_at,id);
+      CREATE UNIQUE INDEX library_change_plans_one_active_version_idx
+        ON library_change_plans(local_version_id)
+        WHERE status IN ('PREVIEWED','QUEUED','RUNNING','RECOVERY_REQUIRED');
+      CREATE TRIGGER delivery_jobs_block_active_lifecycle
+        BEFORE INSERT ON delivery_jobs
+        WHEN NEW.status IN ('QUEUED','RUNNING') AND EXISTS (
+          SELECT 1 FROM library_change_plans p
+          WHERE p.local_version_id=NEW.album_id
+            AND p.status IN ('PREVIEWED','QUEUED','RUNNING','RECOVERY_REQUIRED')
+        )
+        BEGIN SELECT RAISE(ABORT, 'active library lifecycle plan exists'); END;
+      CREATE TRIGGER library_change_plans_no_delete
+        BEFORE DELETE ON library_change_plans
+        BEGIN SELECT RAISE(ABORT, 'library change plan ledger cannot be deleted'); END;
+      CREATE TRIGGER library_change_plans_frozen_identity
+        BEFORE UPDATE OF id,request_id,action,library_album_id,local_version_id,root_id,
+          root_container_path,quarantine_root_path,source_plan_id,
+          expected_library_revision,file_count,total_bytes,actor_id,
+          actor_display_name,input_json,created_at ON library_change_plans
+        BEGIN SELECT RAISE(ABORT, 'library change plan identity is frozen'); END;
+
+      CREATE TABLE library_change_plan_items (
+        plan_id TEXT NOT NULL REFERENCES library_change_plans(id),
+        ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+        media_file_id TEXT,
+        source_relative_path TEXT NOT NULL,
+        quarantine_relative_path TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+        sha256 TEXT CHECK(sha256 IS NULL OR length(sha256)=64),
+        status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN (
+          'PENDING','SOURCE','QUARANTINED','RESTORED','CONFLICT','MISSING','FAILED'
+        )),
+        final_size_bytes INTEGER,
+        final_sha256 TEXT,
+        error TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(plan_id,ordinal),
+        UNIQUE(plan_id,source_relative_path),
+        UNIQUE(plan_id,quarantine_relative_path)
+      );
+      CREATE TRIGGER library_change_plan_items_frozen_evidence
+        BEFORE UPDATE OF plan_id,ordinal,media_file_id,source_relative_path,
+          quarantine_relative_path,size_bytes,sha256 ON library_change_plan_items
+        BEGIN SELECT RAISE(ABORT, 'library change plan item evidence is frozen'); END;
+      CREATE TRIGGER library_change_plan_items_no_delete
+        BEFORE DELETE ON library_change_plan_items
+        BEGIN SELECT RAISE(ABORT, 'library change plan item ledger cannot be deleted'); END;
+
+      CREATE TABLE library_change_events (
+        id TEXT PRIMARY KEY,
+        request_id TEXT UNIQUE,
+        plan_id TEXT NOT NULL REFERENCES library_change_plans(id),
+        event_type TEXT NOT NULL CHECK(event_type IN (
+          'PREVIEW','CONFIRM','START','ITEM_UPDATE','COMPLETE','FAIL','RECOVERY_REQUIRED','CANCEL'
+        )),
+        actor_id TEXT NOT NULL,
+        actor_display_name TEXT NOT NULL,
+        details_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX library_change_events_plan_idx
+        ON library_change_events(plan_id,created_at,id);
+      CREATE TRIGGER library_change_events_no_update
+        BEFORE UPDATE ON library_change_events
+        BEGIN SELECT RAISE(ABORT, 'library change event ledger is append-only'); END;
+      CREATE TRIGGER library_change_events_no_delete
+        BEFORE DELETE ON library_change_events
+        BEGIN SELECT RAISE(ABORT, 'library change event ledger is append-only'); END;
+    `,
+  },
 ] as const;

@@ -9,6 +9,7 @@ import {
   type DeliveryTarget,
   type LibraryIdentityDecision,
   type LibraryIdentityDecisionCommand,
+  type LibraryChangePlan,
   type LocalVersionSummary,
   type MetadataCommand,
   type MetadataField,
@@ -30,6 +31,9 @@ import {
   Trash2,
   TriangleAlert,
   Upload,
+  Archive,
+  EyeOff,
+  RotateCcw,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -83,12 +87,21 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
   const metadataHistory = useAsync(() => api.metadataHistory(id), [id]);
   const artworkHistory = useAsync(() => api.artworkHistory(id), [id]);
   const capabilities = useAsync(() => api.capabilities(), []);
+  const lifecyclePlans = useAsync(
+    () => (canManage ? api.lifecyclePlans() : Promise.resolve([])),
+    [canManage],
+  );
   const [listeningTrackId, setListeningTrackId] = useState<string | null>(null);
   const [deliveryTargetId, setDeliveryTargetId] = useState("");
   const [delivering, setDelivering] = useState(false);
   const [generatingIntroduction, setGeneratingIntroduction] = useState(false);
   const [copyFormOpen, setCopyFormOpen] = useState(false);
   const [identityWorking, setIdentityWorking] = useState(false);
+  const [visibilityWorking, setVisibilityWorking] = useState(false);
+  const [lifecycleWorking, setLifecycleWorking] = useState(false);
+  const [lifecyclePreview, setLifecyclePreview] =
+    useState<LibraryChangePlan | null>(null);
+  const [lifecycleConfirmed, setLifecycleConfirmed] = useState(false);
   const [identitySearchResults, setIdentitySearchResults] = useState<
     AlbumSummary[]
   >([]);
@@ -145,6 +158,16 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
     setIdentityTargetDetail(null);
     setIdentityTargetError(null);
   }, [id]);
+  useEffect(() => {
+    if (lifecyclePreview || !album.data) return;
+    const recoverable = lifecyclePlans.data?.find(
+      (plan) =>
+        plan.action === "QUARANTINE_VERSION" &&
+        plan.status === "PREVIEWED" &&
+        plan.libraryAlbumId === album.data?.id,
+    );
+    if (recoverable) setLifecyclePreview(recoverable);
+  }, [album.data, lifecyclePlans.data, lifecyclePreview]);
   if (album.loading)
     return (
       <div className="page">
@@ -184,6 +207,72 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
       toast.show(`${medium === "VINYL" ? "黑胶" : medium} 已加入我的版本`);
     } catch {
       toast.show("实体唱片记录保存失败");
+    }
+  };
+  const changeVisibility = async () => {
+    setVisibilityWorking(true);
+    try {
+      await api.setAlbumVisibility(item.id, {
+        action: item.visibility === "HIDDEN" ? "RESTORE" : "HIDE",
+        requestId: createBrowserUuid(),
+        expectedVisibilityRevision: item.visibilityRevision ?? 0,
+      });
+      await album.reload();
+      toast.show(
+        item.visibility === "HIDDEN"
+          ? "唱片已恢复到唱片库"
+          : "唱片已从日常浏览中隐藏",
+      );
+    } catch (error) {
+      toast.show(error instanceof Error ? error.message : "显示状态更新失败");
+    } finally {
+      setVisibilityWorking(false);
+    }
+  };
+  const previewQuarantine = async (localVersionId: string) => {
+    setLifecycleWorking(true);
+    setLifecycleConfirmed(false);
+    try {
+      if (lifecyclePreview?.status === "PREVIEWED")
+        await api.cancelLifecyclePlan(lifecyclePreview.id, createBrowserUuid());
+      const plan = await api.createQuarantinePlan(item.id, {
+        requestId: createBrowserUuid(),
+        expectedLibraryRevision: item.revision ?? 0,
+        localVersionId,
+      });
+      setLifecyclePreview(plan);
+      await lifecyclePlans.reload();
+    } catch (error) {
+      toast.show(error instanceof Error ? error.message : "无法生成隔离预览");
+    } finally {
+      setLifecycleWorking(false);
+    }
+  };
+  const confirmQuarantine = async () => {
+    if (!lifecyclePreview || !lifecycleConfirmed) return;
+    setLifecycleWorking(true);
+    try {
+      await api.confirmLifecyclePlan(lifecyclePreview.id, createBrowserUuid());
+      setLifecyclePreview(null);
+      setLifecycleConfirmed(false);
+      await Promise.all([album.reload(), lifecyclePlans.reload()]);
+      toast.show("已提交隔离任务；源文件会先校验，再移入 COCEAN 隔离区");
+    } catch (error) {
+      toast.show(error instanceof Error ? error.message : "隔离任务提交失败");
+    } finally {
+      setLifecycleWorking(false);
+    }
+  };
+  const cancelLifecyclePreview = async () => {
+    const plan = lifecyclePreview;
+    if (!plan) return;
+    try {
+      await api.cancelLifecyclePlan(plan.id, createBrowserUuid());
+      setLifecyclePreview(null);
+      setLifecycleConfirmed(false);
+      await lifecyclePlans.reload();
+    } catch (error) {
+      toast.show(error instanceof Error ? error.message : "预览取消失败");
     }
   };
   const addDetailedCopy = async (event: React.FormEvent) => {
@@ -649,6 +738,134 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
           日常浏览只保留常用信息。需要修正资料、封面或版本关系时，再展开对应项目。
         </p>
         <div className="management-groups">
+          <details className="management-disclosure">
+            <summary>
+              <span>显示与存放</span>
+              <small>隐藏唱片，或将托管目录中的本地版本移入隔离区</small>
+            </summary>
+            <div className="lifecycle-governance">
+              <div className="lifecycle-visibility-row">
+                <div>
+                  <strong>
+                    {item.visibility === "HIDDEN" ? "已隐藏" : "在唱片库中显示"}
+                  </strong>
+                  <p>隐藏只影响日常浏览和搜索，不会移动或删除 NAS 文件。</p>
+                </div>
+                {canManage ? (
+                  <Button
+                    variant="secondary"
+                    disabled={visibilityWorking}
+                    onClick={() => void changeVisibility()}
+                  >
+                    {item.visibility === "HIDDEN" ? <RotateCcw /> : <EyeOff />}
+                    {item.visibility === "HIDDEN" ? "恢复显示" : "隐藏唱片"}
+                  </Button>
+                ) : (
+                  <small>只有管理员可以更改显示状态</small>
+                )}
+              </div>
+
+              <div className="lifecycle-version-list">
+                <div className="lifecycle-section-heading">
+                  <div>
+                    <strong>本地文件存放</strong>
+                    <p>
+                      隔离不是永久删除；文件会保留在 COCEAN 隔离区，可随时恢复。
+                    </p>
+                  </div>
+                  <Link to="/quarantine">查看隔离区</Link>
+                </div>
+                {localVersions.map((version) => (
+                  <div className="lifecycle-version-row" key={version.id}>
+                    <Archive aria-hidden="true" />
+                    <div>
+                      <strong>
+                        {version.isPrimary ? "主版本" : "本地版本"} ·{" "}
+                        {version.fileCount} 个文件
+                      </strong>
+                      <span>
+                        {version.sourceRoot?.name ?? "实体收藏"} ·{" "}
+                        {lifecycleStatusLabel(version.lifecycleStatus)}
+                      </span>
+                      <small>
+                        {version.sourceRoot?.readOnly
+                          ? "只读观察目录：COCEAN 不会改动这里的文件"
+                          : version.sourceRoot
+                            ? "托管目录：可先预览清单，再确认隔离"
+                            : "没有可移动的本地文件"}
+                      </small>
+                    </div>
+                    {canManage &&
+                    version.sourceRoot &&
+                    !version.sourceRoot.readOnly &&
+                    (version.lifecycleStatus ?? "ACTIVE") === "ACTIVE" ? (
+                      <Button
+                        variant="secondary"
+                        disabled={lifecycleWorking}
+                        onClick={() => void previewQuarantine(version.id)}
+                      >
+                        预览隔离
+                      </Button>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+
+              {lifecyclePreview ? (
+                <div
+                  className="lifecycle-preview"
+                  role="region"
+                  aria-label="隔离预览"
+                >
+                  <div>
+                    <strong>隔离前确认</strong>
+                    <p>
+                      将移动 {lifecyclePreview.fileCount} 个文件，共{" "}
+                      {formatFileSize(lifecyclePreview.totalBytes)}。
+                      文件身份和目标位置已冻结，执行时如有变化会停止。
+                    </p>
+                  </div>
+                  {lifecyclePreview.blockers.length ? (
+                    <div className="lifecycle-blockers" role="alert">
+                      {lifecyclePreview.blockers.map((blocker) => (
+                        <span key={blocker.code}>{blocker.message}</span>
+                      ))}
+                    </div>
+                  ) : (
+                    <label className="lifecycle-confirmation">
+                      <input
+                        type="checkbox"
+                        checked={lifecycleConfirmed}
+                        onChange={(event) =>
+                          setLifecycleConfirmed(event.target.checked)
+                        }
+                      />
+                      我确认移动的是这个本地版本；原曲库目录不会保留这些文件
+                    </label>
+                  )}
+                  <div className="lifecycle-preview-actions">
+                    <Button
+                      variant="quiet"
+                      onClick={() => void cancelLifecyclePreview()}
+                    >
+                      取消
+                    </Button>
+                    <Button
+                      disabled={
+                        lifecycleWorking ||
+                        !lifecyclePreview.executable ||
+                        !lifecycleConfirmed
+                      }
+                      onClick={() => void confirmQuarantine()}
+                    >
+                      确认移入隔离区
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          </details>
+
           <details className="management-disclosure">
             <summary>
               <span>核对唱片资料</span>
@@ -1913,6 +2130,21 @@ function metadataEventLabel(type: AlbumMetadataEvent["type"]): string {
     : type === "CONFIRM_EXTERNAL"
       ? "确认外部候选"
       : "字段修订";
+}
+
+function lifecycleStatusLabel(
+  status: LocalVersionSummary["lifecycleStatus"],
+): string {
+  if (!status) return "在曲库中";
+  return (
+    {
+      ACTIVE: "在曲库中",
+      QUARANTINING: "正在移入隔离区",
+      QUARANTINED: "已隔离",
+      RESTORING: "正在恢复",
+      RECOVERY_REQUIRED: "需要人工检查",
+    }[status] ?? status
+  );
 }
 function formatDuration(value: number | null) {
   if (!value) return "–";

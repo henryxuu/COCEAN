@@ -2,6 +2,7 @@ import type { AlbumSummary, AuthUser, PhysicalMedium } from "@cocean/contracts";
 import { formatFullAudioSpec } from "@cocean/contracts";
 import {
   AudioLines,
+  Archive,
   CircleDot,
   Disc3,
   FolderSearch2,
@@ -19,6 +20,7 @@ import { NavLink } from "react-router-dom";
 const navigation = [
   { to: "/", label: "今日", icon: CircleDot, end: true },
   { to: "/library", label: "唱片库", icon: Library },
+  { to: "/quarantine", label: "隔离区", icon: Archive },
   { to: "/discover", label: "找歌", icon: Sparkles },
   { to: "/systems", label: "我的系统", icon: AudioLines },
   { to: "/tasks", label: "任务", icon: ListTodo },
@@ -69,7 +71,7 @@ export function PageShell({
         </NavLink>
         <div className="nas-status">
           <span>COCEAN NAS</span>
-          <strong>Music · 只读策略</strong>
+          <strong>Music · 安全策略</strong>
         </div>
       </aside>
       <main className="main-content">{children}</main>
@@ -100,7 +102,9 @@ export function PageShell({
 export function BrandLockup() {
   return (
     <NavLink to="/" className="brand-lockup" aria-label="COCEAN 首页">
-      <span className="brand-mark" aria-hidden="true">C</span>
+      <span className="brand-mark" aria-hidden="true">
+        C
+      </span>
       <strong>COCEAN</strong>
     </NavLink>
   );

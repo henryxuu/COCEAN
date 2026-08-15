@@ -17,6 +17,10 @@ import type {
   DeviceCategory,
   DeviceOwnership,
   LibraryStats,
+  LibraryChangePlan,
+  AlbumVisibilityCommand,
+  AlbumVisibilityMutationResult,
+  AlbumVisibilityEvent,
   LibraryIdentityDecision,
   LibraryIdentityDecisionCommand,
   LibraryIdentityDecisionResult,
@@ -131,6 +135,7 @@ export interface AlbumPageInput {
   issue?: import("@cocean/contracts").LibraryIssueCode | "ALL";
   limit?: number;
   offset?: number;
+  visibility?: "VISIBLE" | "HIDDEN" | "ALL";
 }
 
 export interface PagedResult<T> {
@@ -152,7 +157,10 @@ export function buildDemoAlbumPage(input: AlbumPageInput = {}): AlbumPage {
           : true) &&
       (!input.issue ||
         input.issue === "ALL" ||
-        album.issues?.some((issue) => issue.code === input.issue)),
+        album.issues?.some((issue) => issue.code === input.issue)) &&
+      (!input.visibility ||
+        input.visibility === "ALL" ||
+        (album.visibility ?? "VISIBLE") === input.visibility),
   );
   const offset = input.offset ?? 0;
   const limit = input.limit ?? 96;
@@ -223,6 +231,7 @@ export const api = {
       issue: input.issue ?? "ALL",
       limit: String(input.limit ?? 96),
       offset: String(input.offset ?? 0),
+      visibility: input.visibility ?? "VISIBLE",
     });
     return withDemo(
       () => request(`/api/v1/albums?${params.toString()}`),
@@ -234,6 +243,79 @@ export const api = {
       () => request(`/api/v1/albums/${encodeURIComponent(id)}`),
       () => demoAlbumDetail(id),
     );
+  },
+  setAlbumVisibility(
+    albumId: string,
+    command: AlbumVisibilityCommand,
+  ): Promise<AlbumVisibilityMutationResult> {
+    return request(`/api/v1/albums/${encodeURIComponent(albumId)}/visibility`, {
+      method: "PATCH",
+      body: JSON.stringify(command),
+    });
+  },
+  albumVisibilityHistory(albumId: string): Promise<AlbumVisibilityEvent[]> {
+    return request<{ items: AlbumVisibilityEvent[] }>(
+      `/api/v1/albums/${encodeURIComponent(albumId)}/visibility-history`,
+    ).then((result) => result.items);
+  },
+  createQuarantinePlan(
+    albumId: string,
+    input: {
+      requestId: string;
+      expectedLibraryRevision: number;
+      localVersionId: string;
+    },
+  ): Promise<LibraryChangePlan> {
+    return request(
+      `/api/v1/albums/${encodeURIComponent(albumId)}/lifecycle-plans`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  },
+  confirmLifecyclePlan(
+    planId: string,
+    requestId: string,
+  ): Promise<LibraryChangePlan> {
+    return request(
+      `/api/v1/lifecycle-plans/${encodeURIComponent(planId)}/confirm`,
+      { method: "POST", body: JSON.stringify({ requestId }) },
+    );
+  },
+  cancelLifecyclePlan(
+    planId: string,
+    requestId: string,
+  ): Promise<LibraryChangePlan> {
+    return request(
+      `/api/v1/lifecycle-plans/${encodeURIComponent(planId)}/cancel`,
+      { method: "POST", body: JSON.stringify({ requestId }) },
+    );
+  },
+  retryLifecyclePlan(
+    planId: string,
+    requestId: string,
+  ): Promise<LibraryChangePlan> {
+    return request(
+      `/api/v1/lifecycle-plans/${encodeURIComponent(planId)}/retry`,
+      { method: "POST", body: JSON.stringify({ requestId }) },
+    );
+  },
+  createRestorePlan(
+    sourcePlanId: string,
+    requestId: string,
+  ): Promise<LibraryChangePlan> {
+    return request(
+      `/api/v1/lifecycle-plans/${encodeURIComponent(sourcePlanId)}/restore`,
+      { method: "POST", body: JSON.stringify({ requestId }) },
+    );
+  },
+  lifecyclePlans(): Promise<LibraryChangePlan[]> {
+    return request<{ items: LibraryChangePlan[] }>(
+      "/api/v1/lifecycle-plans",
+    ).then((result) => result.items);
+  },
+  quarantinedVersions(): Promise<LibraryChangePlan[]> {
+    return request<{ items: LibraryChangePlan[] }>(
+      "/api/v1/lifecycle-plans/quarantine",
+    ).then((result) => result.items);
   },
   albumArtwork(albumId: string): Promise<AlbumArtworkGovernance> {
     return request(`/api/v1/albums/${encodeURIComponent(albumId)}/artwork`);

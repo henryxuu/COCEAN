@@ -10,7 +10,7 @@ COMPOSE="$REPO_ROOT/infra/compose/fnos/compose.yaml"
 TEMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cocean-preflight-test.XXXXXX")
 trap 'rm -rf "$TEMP_ROOT"' 0 1 2 15
 
-mkdir -p "$TEMP_ROOT/music" "$TEMP_ROOT/data" "$TEMP_ROOT/cache" "$TEMP_ROOT/inbox" "$TEMP_ROOT/delivery" "$TEMP_ROOT/secrets"
+mkdir -p "$TEMP_ROOT/music" "$TEMP_ROOT/quarantine" "$TEMP_ROOT/data" "$TEMP_ROOT/cache" "$TEMP_ROOT/inbox" "$TEMP_ROOT/delivery" "$TEMP_ROOT/secrets"
 printf '%s\n' 'owner:a-strong-test-password' >"$TEMP_ROOT/secrets/web-auth"
 chmod 600 "$TEMP_ROOT/secrets/web-auth"
 ENV_FILE="$TEMP_ROOT/fnos.env"
@@ -22,6 +22,9 @@ COCEAN_VERSION=0.1.0
 PUID=1000
 PGID=1000
 COCEAN_MUSIC_DIR=$TEMP_ROOT/music
+COCEAN_QUARANTINE_DIR=$TEMP_ROOT/quarantine
+COCEAN_MUSIC_ROOT_POLICY=WATCH_ONLY
+COCEAN_MUSIC_READ_ONLY=true
 COCEAN_DATA_DIR=$TEMP_ROOT/data
 COCEAN_CACHE_DIR=$TEMP_ROOT/cache
 COCEAN_INBOX_DIR=$TEMP_ROOT/inbox
@@ -52,6 +55,28 @@ BAD_UID="$TEMP_ROOT/bad-uid.env"
 sed 's/^PUID=1000$/PUID=0/' "$ENV_FILE" >"$BAD_UID"
 if run_preflight "$BAD_UID" >/dev/null 2>&1; then
   printf 'preflight accepted root PUID\n' >&2
+  exit 1
+fi
+
+BAD_MANAGED="$TEMP_ROOT/bad-managed.env"
+sed 's/^COCEAN_MUSIC_ROOT_POLICY=WATCH_ONLY$/COCEAN_MUSIC_ROOT_POLICY=MANAGED/' "$ENV_FILE" >"$BAD_MANAGED"
+if run_preflight "$BAD_MANAGED" >/dev/null 2>&1; then
+  printf 'preflight accepted MANAGED with a read-only Music mount\n' >&2
+  exit 1
+fi
+
+VALID_MANAGED="$TEMP_ROOT/valid-managed.env"
+sed -e 's/^COCEAN_MUSIC_ROOT_POLICY=WATCH_ONLY$/COCEAN_MUSIC_ROOT_POLICY=MANAGED/' \
+  -e 's/^COCEAN_MUSIC_READ_ONLY=true$/COCEAN_MUSIC_READ_ONLY=false/' \
+  "$ENV_FILE" >"$VALID_MANAGED"
+PROBE_LOG="$TEMP_ROOT/docker-run.log"
+FAKE_DOCKER_LOG="$PROBE_LOG" run_preflight "$VALID_MANAGED" >/dev/null
+grep -F '.cocean-managed-preflight-' "$PROBE_LOG" >/dev/null || {
+  printf 'preflight skipped the MANAGED Music write probe\n' >&2
+  exit 1
+}
+if FAKE_MANAGED_PROBE_FAIL=1 run_preflight "$VALID_MANAGED" >/dev/null 2>&1; then
+  printf 'preflight accepted a failed MANAGED Music write probe\n' >&2
   exit 1
 fi
 

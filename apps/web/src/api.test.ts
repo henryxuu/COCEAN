@@ -25,6 +25,53 @@ describe("web API client", () => {
     ).toBe("LOW_RES_ARTWORK");
   });
 
+  it("binds visibility and lifecycle governance commands to exact routes", async () => {
+    const requests: Array<{ input: string; init: RequestInit | undefined }> =
+      [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        requests.push({ input: String(input), init });
+        return new Response(JSON.stringify({ items: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+    await api.albumPage({ visibility: "HIDDEN" });
+    await api.setAlbumVisibility("album/a", {
+      action: "HIDE",
+      requestId: "hide-one",
+      expectedVisibilityRevision: 2,
+    });
+    await api.createQuarantinePlan("album/a", {
+      requestId: "preview-one",
+      expectedLibraryRevision: 4,
+      localVersionId: "version/b",
+    });
+    await api.confirmLifecyclePlan("plan/c", "confirm-one");
+    await api.retryLifecyclePlan("plan/c", "retry-one");
+    expect(
+      new URL(requests[0]!.input, "http://cocean.test").searchParams.get(
+        "visibility",
+      ),
+    ).toBe("HIDDEN");
+    expect(requests[1]).toEqual(
+      expect.objectContaining({
+        input: "/api/v1/albums/album%2Fa/visibility",
+        init: expect.objectContaining({ method: "PATCH" }),
+      }),
+    );
+    expect(JSON.parse(String(requests[2]!.init?.body))).toEqual({
+      requestId: "preview-one",
+      expectedLibraryRevision: 4,
+      localVersionId: "version/b",
+    });
+    expect(requests[2]!.input).toBe("/api/v1/albums/album%2Fa/lifecycle-plans");
+    expect(requests[3]!.input).toBe("/api/v1/lifecycle-plans/plan%2Fc/confirm");
+    expect(requests[4]!.input).toBe("/api/v1/lifecycle-plans/plan%2Fc/retry");
+  });
+
   it("applies concrete issue filtering to demo album pages", () => {
     const page = buildDemoAlbumPage({ issue: "MISSING_ARTWORK" });
     expect(page.total).toBe(1);

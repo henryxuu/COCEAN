@@ -77,19 +77,40 @@ end
 %w[server worker].each do |name|
   music = volume_for(services.fetch(name, {}), "/library/music")
   errors << "#{name}: /library/music bind missing" unless music
-  errors << "#{name}: /library/music must be read-only" unless music && music["read_only"] == true
+  expected_read_only = name == "server" ? true : "${COCEAN_MUSIC_READ_ONLY:-true}"
+  errors << "#{name}: /library/music mount policy mismatch" unless music && music["read_only"] == expected_read_only
 end
 
 services.each do |name, service|
   Array(service["volumes"]).each do |volume|
     next unless volume.is_a?(Hash) && volume["target"] == "/library/music"
 
-    errors << "#{name}: every /library/music mount must be read-only" unless volume["read_only"] == true
+    next if name == "worker"
+
+    errors << "#{name}: every non-worker /library/music mount must be read-only" unless volume["read_only"] == true
   end
 end
 
 worker_inbox = volume_for(services.fetch("worker", {}), "/library/inbox")
 errors << "worker: writable /library/inbox bind missing" unless worker_inbox && worker_inbox["read_only"] != true
+worker_quarantine = volume_for(services.fetch("worker", {}), "/library/quarantine")
+errors << "worker: writable /library/quarantine bind missing" unless worker_quarantine && worker_quarantine["read_only"] != true
+unless worker_quarantine && worker_quarantine["source"].to_s.include?("COCEAN_QUARANTINE_DIR")
+  errors << "worker: /library/quarantine must use COCEAN_QUARANTINE_DIR"
+end
+unless worker_quarantine && worker_quarantine.dig("bind", "create_host_path") == false
+  errors << "worker: quarantine must refuse implicit host-path creation"
+end
+
+%w[server worker].each do |name|
+  environment = services.fetch(name, {}).fetch("environment", {})
+  unless environment["COCEAN_MUSIC_ROOT_POLICY"] == "${COCEAN_MUSIC_ROOT_POLICY:-WATCH_ONLY}"
+    errors << "#{name}: Music root policy mapping mismatch"
+  end
+  unless environment["COCEAN_QUARANTINE_ROOT"] == "/library/quarantine"
+    errors << "#{name}: quarantine root mapping mismatch"
+  end
+end
 
 %w[server worker].each do |name|
   database_path = services.fetch(name, {}).fetch("environment", {})["COCEAN_DATABASE_PATH"]
@@ -105,7 +126,8 @@ end
   "worker" => {
     "/var/lib/cocean" => "COCEAN_DATA_DIR",
     "/var/cache/cocean" => "COCEAN_CACHE_DIR",
-    "/library/inbox" => "COCEAN_INBOX_DIR"
+    "/library/inbox" => "COCEAN_INBOX_DIR",
+    "/library/quarantine" => "COCEAN_QUARANTINE_DIR"
   }
 }.each do |name, expected|
   expected.each do |target, source_name|

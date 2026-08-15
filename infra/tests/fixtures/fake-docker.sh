@@ -66,6 +66,11 @@ case "${1:-}" in
     exit 0
     ;;
   run)
+    case "$*" in
+      *'.cocean-managed-preflight-'*)
+        [ "${FAKE_MANAGED_PROBE_FAIL:-0}" -eq 0 ] || exit 1
+        ;;
+    esac
     [ "${FAKE_DOCKER_RUN_FAIL:-0}" -eq 0 ]
     ;;
   *)

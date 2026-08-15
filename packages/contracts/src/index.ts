@@ -4,6 +4,7 @@ export * from "./auth.js";
 export * from "./catalog.js";
 export * from "./gear.js";
 export * from "./library.js";
+export * from "./lifecycle.js";
 export * from "./matching.js";
 export * from "./recommendation.js";
 export * from "./scan.js";

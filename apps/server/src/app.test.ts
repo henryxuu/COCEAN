@@ -24,6 +24,8 @@ function testConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
     port: 8787,
     databasePath: ":memory:",
     musicRoot: "/path/that/does/not/exist",
+    musicRootPolicy: "WATCH_ONLY",
+    quarantineRoot: "/path/that/does/not/exist/quarantine",
     cacheRoot: "./cache",
     webRoot: null,
     musicBrainzEnabled: false,
@@ -2097,6 +2099,116 @@ describe("COCEAN HTTP API", () => {
       [first.json().id, second.json().id, newestSibling.json().id].sort(),
     );
   });
+
+  it("governs album visibility and lifecycle plans with role-safe views", async () => {
+    const database = new CoceanDatabase(":memory:", {
+      musicRootPolicy: "MANAGED",
+    });
+    const { albumId, versionId } = seedLifecycleApiAlbum(database);
+    const app = await buildApp({
+      config: testConfig({ musicRootPolicy: "MANAGED" }),
+      database,
+      deliveryExecution: false,
+    });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const admin = adminCookie(database);
+    const member = sessionCookieFor(database, "MEMBER");
+    const hidden = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/albums/${albumId}/visibility`,
+      headers: { cookie: admin },
+      payload: {
+        action: "HIDE",
+        requestId: "api-hide",
+        expectedVisibilityRevision: 0,
+      },
+    });
+    expect(hidden.statusCode, hidden.body).toBe(200);
+    expect(hidden.json()).toEqual(
+      expect.objectContaining({ visibility: "HIDDEN" }),
+    );
+    expect(
+      (await app.inject({ method: "GET", url: "/api/v1/albums" })).json().items,
+    ).toEqual([]);
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: "/api/v1/albums?visibility=HIDDEN",
+          headers: { cookie: member },
+        })
+      ).json().items,
+    ).toEqual([expect.objectContaining({ id: albumId })]);
+    expect(
+      (await app.inject({ method: "GET", url: `/api/v1/albums/${albumId}` }))
+        .statusCode,
+    ).toBe(404);
+    const history = await app.inject({
+      method: "GET",
+      url: `/api/v1/albums/${albumId}/visibility-history`,
+      headers: { cookie: member },
+    });
+    expect(history.json().items[0]).not.toHaveProperty("actor");
+    expect(history.json().items[0]).not.toHaveProperty("requestId");
+
+    const plan = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/lifecycle-plans`,
+      headers: { cookie: admin },
+      payload: {
+        requestId: "api-lifecycle-preview",
+        expectedLibraryRevision: database.getAlbumSummary(albumId)!.revision,
+        localVersionId: versionId,
+      },
+    });
+    expect(plan.statusCode, plan.body).toBe(201);
+    expect(plan.json()).toEqual(
+      expect.objectContaining({ executable: true, status: "PREVIEWED" }),
+    );
+    const memberView = await app.inject({
+      method: "GET",
+      url: `/api/v1/lifecycle-plans/${plan.json().id}`,
+      headers: { cookie: member },
+    });
+    expect(memberView.statusCode, memberView.body).toBe(200);
+    expect(memberView.json()).not.toHaveProperty("items");
+    expect(memberView.json()).not.toHaveProperty("actor");
+    expect(memberView.json()).not.toHaveProperty("requestId");
+    const confirmed = await app.inject({
+      method: "POST",
+      url: `/api/v1/lifecycle-plans/${plan.json().id}/confirm`,
+      headers: { cookie: admin },
+      payload: { requestId: "api-lifecycle-confirm" },
+    });
+    expect(confirmed.statusCode, confirmed.body).toBe(202);
+    expect(confirmed.json()).toEqual(
+      expect.objectContaining({ status: "QUEUED" }),
+    );
+    database.claimNextLibraryChangePlan();
+    database.finishLibraryChangePlan(
+      plan.json().id,
+      "RECOVERY_REQUIRED",
+      "/library/music/private/path.flac is conflicted",
+    );
+    const redacted = await app.inject({
+      method: "GET",
+      url: `/api/v1/lifecycle-plans/${plan.json().id}`,
+      headers: { cookie: member },
+    });
+    expect(redacted.json().error).toBe("任务需要管理员处理");
+    expect(redacted.body).not.toContain("/library/music");
+    const retried = await app.inject({
+      method: "POST",
+      url: `/api/v1/lifecycle-plans/${plan.json().id}/retry`,
+      headers: { cookie: admin },
+      payload: { requestId: "api-lifecycle-retry" },
+    });
+    expect(retried.statusCode, retried.body).toBe(202);
+    expect(retried.json().status).toBe("QUEUED");
+  });
 });
 
 function adminCookie(database: CoceanDatabase): string {
@@ -2138,6 +2250,96 @@ function sessionCookieFor(
   database.createUser(user, "unused-test-password-hash");
   const { token } = createSession(database, user, 1);
   return `cocean_session=${token}`;
+}
+
+function seedLifecycleApiAlbum(database: CoceanDatabase): {
+  albumId: string;
+  versionId: string;
+} {
+  const scanId = "api-lifecycle-scan";
+  database.createScanJob({
+    id: scanId,
+    rootId: "music",
+    mode: "FULL",
+    status: "RUNNING",
+    totalFiles: 1,
+    processedFiles: 1,
+    parsedFiles: 1,
+    failedFiles: 0,
+    reusedFiles: 0,
+    createdAt: "2026-08-15T00:00:00.000Z",
+    startedAt: "2026-08-15T00:00:00.000Z",
+    finishedAt: null,
+    error: null,
+    cancelRequestedAt: null,
+  });
+  const versionId = "api-lifecycle-version";
+  database.upsertMediaFile("api-lifecycle-file", "music", scanId, {
+    absolutePath: "/library/music/Artist/Album/01.flac",
+    relativePath: "Artist/Album/01.flac",
+    extension: ".flac",
+    sizeBytes: 5,
+    modifiedAtMs: 1,
+    fileSha256: createHash("sha256").update("audio").digest("hex"),
+    audio: {
+      kind: "PCM",
+      codec: "flac",
+      container: "flac",
+      lossless: true,
+      bitDepth: 24,
+      sampleRate: 96_000,
+      bitrate: null,
+      channels: 2,
+      dsdRate: null,
+    },
+    durationSeconds: 1,
+    tags: {
+      album: "Album",
+      albumArtist: "Artist",
+      title: "Track",
+      artists: ["Artist"],
+      year: 2026,
+      date: "2026",
+      genre: [],
+      composer: [],
+      label: [],
+      catalogNumber: null,
+      barcode: null,
+      musicBrainzReleaseId: null,
+      discNumber: 1,
+      discTotal: 1,
+      trackNumber: 1,
+      trackTotal: 1,
+    },
+    rawTags: [],
+    artwork: [],
+    warnings: [],
+  });
+  database.replaceAlbumsForRoot("music", [
+    {
+      id: versionId,
+      rootId: "music",
+      groupKey: "api-lifecycle",
+      title: "Album",
+      albumArtist: "Artist",
+      year: 2026,
+      discCount: 1,
+      fileIds: ["api-lifecycle-file"],
+      audioSummary: null,
+      mixedAudioSpecs: false,
+      artwork: {
+        source: "NONE",
+        url: null,
+        mimeType: null,
+        width: null,
+        height: null,
+      },
+      matchStatus: "NEEDS_REVIEW",
+      aggregationIssues: [],
+    },
+  ]);
+  database.finishScanJob(scanId);
+  return { albumId: database.getAlbumSummary(versionId)!.id, versionId };
 }
 
 function artworkMultipart(

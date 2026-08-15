@@ -1,5 +1,9 @@
 import { z } from "zod";
 import { audioSpecSchema } from "./audio.js";
+import {
+  albumVisibilitySchema,
+  localVersionLifecycleSchema,
+} from "./lifecycle.js";
 
 export const physicalMediumSchema = z.enum([
   "CD",
@@ -320,6 +324,7 @@ export const localVersionSummarySchema = z.object({
   sizeBytes: z.number().int().nonnegative(),
   completeness: z.enum(["COMPLETE", "INCOMPLETE", "NEEDS_REVIEW"]),
   issues: z.array(libraryIssueSchema),
+  lifecycleStatus: localVersionLifecycleSchema.optional(),
 });
 export type LocalVersionSummary = z.infer<typeof localVersionSummarySchema>;
 
@@ -480,6 +485,8 @@ export const albumSummarySchema = z.object({
   metadataRevision: z.number().int().nonnegative().optional(),
   versionCount: z.number().int().positive().optional(),
   issues: z.array(libraryIssueSchema).optional(),
+  visibility: albumVisibilitySchema.optional(),
+  visibilityRevision: z.number().int().nonnegative().optional(),
 });
 export type AlbumSummary = z.infer<typeof albumSummarySchema>;
 

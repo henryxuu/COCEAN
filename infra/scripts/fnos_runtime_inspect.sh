@@ -111,15 +111,21 @@ do
     fail "$service memory ceiling does not match $variable"
 done
 
-for service in server worker; do
-  id=$(container_id "$service")
-  music_rw=$(inspect_value '{{range .Mounts}}{{if eq .Destination "/library/music"}}{{.RW}}{{end}}{{end}}' "$id") || \
-    fail "$service Music mount cannot be inspected"
-  [ "$music_rw" = false ] || fail "$service Music mount is absent or writable"
-done
-
+music_root_policy=$(env_value COCEAN_MUSIC_ROOT_POLICY)
+[ -n "$music_root_policy" ] || music_root_policy=WATCH_ONLY
 server_id=$(container_id server)
+server_music_rw=$(inspect_value '{{range .Mounts}}{{if eq .Destination "/library/music"}}{{.RW}}{{end}}{{end}}' "$server_id") || \
+  fail "server Music mount cannot be inspected"
+[ "$server_music_rw" = false ] || fail "server Music mount is absent or writable"
 worker_id=$(container_id worker)
+worker_music_rw=$(inspect_value '{{range .Mounts}}{{if eq .Destination "/library/music"}}{{.RW}}{{end}}{{end}}' "$worker_id") || \
+  fail "worker Music mount cannot be inspected"
+if [ "$music_root_policy" = MANAGED ]; then
+  [ "$worker_music_rw" = true ] || fail "worker Music mount is absent or read-only for MANAGED policy"
+else
+  [ "$worker_music_rw" = false ] || fail "worker Music mount is absent or writable for WATCH_ONLY policy"
+fi
+
 server_networks=$(inspect_value '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}' "$server_id") || \
   fail "Server networks cannot be inspected"
 worker_networks=$(inspect_value '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}' "$worker_id") || \

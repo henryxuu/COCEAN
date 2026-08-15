@@ -4,7 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it } from "vitest";
 import { libraryScrollKey } from "../library-state.js";
 import { AlbumDetailBreadcrumb } from "./album-detail.js";
-import { LibraryAlbumCard, LibraryPage } from "./library.js";
+import { libraryAlbumQuery, LibraryAlbumCard, LibraryPage } from "./library.js";
 
 describe("唱片库页面返回接线", () => {
   it("页面渲染直接服从当前 URL 的查询、筛选、排序与页码", () => {
@@ -25,6 +25,27 @@ describe("唱片库页面返回接线", () => {
     expect(html).toContain(
       '<option value="MISSING_ARTWORK" selected="">缺少封面</option>',
     );
+  });
+
+  it("管理员可从唱片库切换到已隐藏管理视图", () => {
+    const html = renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/library?visibility=HIDDEN"]}>
+        <LibraryPage canManage />
+      </MemoryRouter>,
+    );
+    expect(html).toContain(
+      '<button class="filter-pill is-active">已隐藏</button>',
+    );
+    expect(
+      libraryAlbumQuery({
+        query: "",
+        filter: "ALL",
+        sort: "ARTIST",
+        issue: "ALL",
+        visibility: "HIDDEN",
+        page: 0,
+      }),
+    ).toEqual(expect.objectContaining({ visibility: "HIDDEN" }));
   });
 
   it("AlbumCard href 携带完整路由，普通/辅助/右键导航都会保存同一路由与 1200px", () => {

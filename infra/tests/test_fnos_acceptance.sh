@@ -10,7 +10,7 @@ COMPOSE="$REPO_ROOT/infra/compose/fnos/compose.yaml"
 TEMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cocean-acceptance-test.XXXXXX")
 trap 'rm -rf "$TEMP_ROOT"' 0 1 2 15
 
-mkdir -p "$TEMP_ROOT/music" "$TEMP_ROOT/data" "$TEMP_ROOT/cache" "$TEMP_ROOT/inbox" "$TEMP_ROOT/delivery" "$TEMP_ROOT/secrets"
+mkdir -p "$TEMP_ROOT/music" "$TEMP_ROOT/quarantine" "$TEMP_ROOT/data" "$TEMP_ROOT/cache" "$TEMP_ROOT/inbox" "$TEMP_ROOT/delivery" "$TEMP_ROOT/secrets"
 printf '%s\n' 'owner:a-strong-test-password' >"$TEMP_ROOT/secrets/web-auth"
 chmod 600 "$TEMP_ROOT/secrets/web-auth"
 ENV_FILE="$TEMP_ROOT/fnos.env"
@@ -22,6 +22,9 @@ COCEAN_VERSION=0.1.0
 PUID=1000
 PGID=1000
 COCEAN_MUSIC_DIR=$TEMP_ROOT/music
+COCEAN_QUARANTINE_DIR=$TEMP_ROOT/quarantine
+COCEAN_MUSIC_ROOT_POLICY=WATCH_ONLY
+COCEAN_MUSIC_READ_ONLY=true
 COCEAN_DATA_DIR=$TEMP_ROOT/data
 COCEAN_CACHE_DIR=$TEMP_ROOT/cache
 COCEAN_INBOX_DIR=$TEMP_ROOT/inbox

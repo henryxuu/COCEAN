@@ -17,10 +17,14 @@ import {
   type ReleaseSearchInput,
 } from "@cocean/catalog-sources";
 import {
+  albumVisibilityCommandSchema,
   catalogRecommendationResponseSchema,
   artworkDecisionCommandSchema,
+  confirmLibraryChangePlanCommandSchema,
   confirmReleaseCandidateCommandSchema,
   coceanSettingsSchema,
+  createQuarantinePlanCommandSchema,
+  createRestorePlanCommandSchema,
   deviceCategorySchema,
   deviceOwnershipSchema,
   libraryIdentityDecisionCommandSchema,
@@ -32,6 +36,7 @@ import {
   undoAlbumArtworkCommandSchema,
   undoLibraryIdentityDecisionCommandSchema,
   updateAlbumMetadataCommandSchema,
+  type LibraryChangePlan,
   type ReleaseCandidate,
 } from "@cocean/contracts";
 import {
@@ -39,6 +44,7 @@ import {
   AlbumArtworkDecisionError,
   CoceanDatabase,
   LibraryIdentityDecisionError,
+  LibraryLifecycleError,
 } from "@cocean/database";
 import { parseRuntimeStillCatalog } from "@cocean/still-catalog";
 import { z } from "zod";
@@ -93,6 +99,7 @@ const albumQuerySchema = z.object({
     .default("ALL"),
   limit: z.coerce.number().int().min(1).max(500).default(100),
   offset: z.coerce.number().int().min(0).default(0),
+  visibility: z.enum(["VISIBLE", "HIDDEN", "ALL"]).default("VISIBLE"),
 });
 const physicalAlbumInputSchema = z.object({
   title: z.string().trim().min(1).max(300),
@@ -237,6 +244,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     options.database ??
     new CoceanDatabase(options.config.databasePath, {
       musicRoot: options.config.musicRoot,
+      musicRootPolicy: options.config.musicRootPolicy,
+      quarantineRoot: options.config.quarantineRoot,
     });
   await bootstrapOwner(
     database,
@@ -731,6 +740,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
 
   app.get("/api/v1/albums", async (request) => {
     const query = albumQuerySchema.parse(request.query);
+    const session = readSession(database, request.headers.cookie);
+    const visibility = session ? query.visibility : "VISIBLE";
     return {
       items: database.listAlbums({
         limit: query.limit,
@@ -738,6 +749,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         filter: query.filter,
         sort: query.sort,
         issue: query.issue,
+        visibility,
         ...(query.search ? { search: query.search } : {}),
       }),
       limit: query.limit,
@@ -745,6 +757,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       total: database.countAlbums({
         filter: query.filter,
         issue: query.issue,
+        visibility,
         ...(query.search ? { search: query.search } : {}),
       }),
     };
@@ -809,7 +822,12 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       return reply
         .code(404)
         .send({ error: "ALBUM_NOT_FOUND", message: "没有找到这张专辑" });
-    if (!readSession(database, request.headers.cookie)) {
+    const session = readSession(database, request.headers.cookie);
+    if (!session && album.visibility === "HIDDEN")
+      return reply
+        .code(404)
+        .send({ error: "ALBUM_NOT_FOUND", message: "没有找到这张专辑" });
+    if (!session) {
       const {
         metadata: _metadata,
         artworkGovernance: _artworkGovernance,
@@ -818,6 +836,161 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       return publicAlbum;
     }
     return album;
+  });
+
+  app.patch("/api/v1/albums/:id/visibility", async (request, reply) => {
+    const admin = requireAdmin(request, reply);
+    if (!admin) return;
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const command = albumVisibilityCommandSchema.parse(request.body ?? {});
+    try {
+      return database.applyAlbumVisibility(id, command, {
+        id: admin.user.id,
+        displayName: admin.user.displayName,
+      });
+    } catch (error) {
+      return handleLifecycleError(error, reply);
+    }
+  });
+
+  app.get("/api/v1/albums/:id/visibility-history", async (request, reply) => {
+    const session = requireSession(request, reply);
+    if (!session) return;
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    if (!database.libraryAlbumIdentityExists(id))
+      return reply
+        .code(404)
+        .send({ error: "ALBUM_NOT_FOUND", message: "没有找到这张专辑" });
+    const items = database.listAlbumVisibilityHistory(id);
+    return {
+      items:
+        session.user.role === "ADMIN"
+          ? items
+          : items.map(
+              ({ actor: _actor, requestId: _requestId, ...event }) => event,
+            ),
+    };
+  });
+
+  app.post("/api/v1/albums/:id/lifecycle-plans", async (request, reply) => {
+    const admin = requireAdmin(request, reply);
+    if (!admin) return;
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const command = createQuarantinePlanCommandSchema.parse(request.body ?? {});
+    try {
+      const plan = database.createQuarantinePlan(id, command, {
+        id: admin.user.id,
+        displayName: admin.user.displayName,
+      });
+      return reply.code(201).send(plan);
+    } catch (error) {
+      return handleLifecycleError(error, reply);
+    }
+  });
+
+  app.post("/api/v1/lifecycle-plans/:id/confirm", async (request, reply) => {
+    const admin = requireAdmin(request, reply);
+    if (!admin) return;
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const command = confirmLibraryChangePlanCommandSchema.parse(
+      request.body ?? {},
+    );
+    try {
+      const plan = database.confirmLibraryChangePlan(id, command.requestId, {
+        id: admin.user.id,
+        displayName: admin.user.displayName,
+      });
+      return reply.code(202).send(plan);
+    } catch (error) {
+      return handleLifecycleError(error, reply);
+    }
+  });
+
+  app.post("/api/v1/lifecycle-plans/:id/cancel", async (request, reply) => {
+    const admin = requireAdmin(request, reply);
+    if (!admin) return;
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const command = confirmLibraryChangePlanCommandSchema.parse(
+      request.body ?? {},
+    );
+    try {
+      return database.cancelLibraryChangePlan(id, command.requestId, {
+        id: admin.user.id,
+        displayName: admin.user.displayName,
+      });
+    } catch (error) {
+      return handleLifecycleError(error, reply);
+    }
+  });
+
+  app.post("/api/v1/lifecycle-plans/:id/retry", async (request, reply) => {
+    const admin = requireAdmin(request, reply);
+    if (!admin) return;
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const command = confirmLibraryChangePlanCommandSchema.parse(
+      request.body ?? {},
+    );
+    try {
+      return reply.code(202).send(
+        database.retryLibraryChangePlan(id, command.requestId, {
+          id: admin.user.id,
+          displayName: admin.user.displayName,
+        }),
+      );
+    } catch (error) {
+      return handleLifecycleError(error, reply);
+    }
+  });
+
+  app.post("/api/v1/lifecycle-plans/:id/restore", async (request, reply) => {
+    const admin = requireAdmin(request, reply);
+    if (!admin) return;
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const command = createRestorePlanCommandSchema.parse(request.body ?? {});
+    try {
+      const plan = database.createRestorePlan(id, command.requestId, {
+        id: admin.user.id,
+        displayName: admin.user.displayName,
+      });
+      return reply.code(201).send(plan);
+    } catch (error) {
+      return handleLifecycleError(error, reply);
+    }
+  });
+
+  app.get("/api/v1/lifecycle-plans/quarantine", async (request, reply) => {
+    const session = requireSession(request, reply);
+    if (!session) return;
+    return {
+      items: database
+        .listQuarantinedLibraryVersions()
+        .map((plan) => lifecyclePlanView(plan, session.user.role)),
+    };
+  });
+
+  app.get("/api/v1/lifecycle-plans", async (request, reply) => {
+    const session = requireSession(request, reply);
+    if (!session) return;
+    const query = z
+      .object({ limit: z.coerce.number().int().min(1).max(100).default(100) })
+      .parse(request.query);
+    return {
+      items: database
+        .listLibraryChangePlans({ limit: query.limit })
+        .map((plan) => lifecyclePlanView(plan, session.user.role)),
+    };
+  });
+
+  app.get("/api/v1/lifecycle-plans/:id", async (request, reply) => {
+    const session = requireSession(request, reply);
+    if (!session) return;
+    const { id } = z.object({ id: z.string() }).parse(request.params);
+    const plan = database.getLibraryChangePlan(id);
+    if (!plan)
+      return reply
+        .code(404)
+        .send({ error: "LIFECYCLE_PLAN_NOT_FOUND", message: "管理计划不存在" });
+    return lifecyclePlanView(plan, session.user.role);
   });
 
   app.get("/api/v1/albums/:id/artwork", async (request, reply) => {
@@ -1456,6 +1629,11 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         error: "NO_DIGITAL_FILES",
         message: "这张专辑只有实体记录，没有可投送的数字文件",
       });
+    if (database.hasActiveLibraryChangePlan(albumId))
+      return reply.code(409).send({
+        error: "LIBRARY_LIFECYCLE_ACTIVE",
+        message: "这张唱片正在执行文件管理操作，请完成或处理后再投送",
+      });
     if (!stored?.target.enabled)
       return reply.code(400).send({
         error: "DELIVERY_TARGET_UNAVAILABLE",
@@ -1515,6 +1693,14 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         return reply.code(409).send({
           error: "DELIVERY_ALREADY_ACTIVE",
           message: "这张专辑正在投送到该目标，请等待现有任务完成",
+        });
+      if (
+        error instanceof Error &&
+        error.message.includes("active library lifecycle plan exists")
+      )
+        return reply.code(409).send({
+          error: "LIBRARY_LIFECYCLE_ACTIVE",
+          message: "这张唱片正在执行文件管理操作，请稍后再投送",
         });
       throw error;
     }
@@ -2148,6 +2334,43 @@ function handleArtworkDecisionError(
       .code(error.statusCode)
       .send({ error: error.code, message: error.message });
   throw error;
+}
+
+function handleLifecycleError(
+  error: unknown,
+  reply: FastifyReply,
+): FastifyReply {
+  if (error instanceof LibraryLifecycleError)
+    return reply
+      .code(error.code === "INVALID_LIFECYCLE_COMMAND" ? 400 : 409)
+      .send({ error: error.code, message: error.message });
+  throw error;
+}
+
+function lifecyclePlanView(
+  plan: LibraryChangePlan,
+  role: "ADMIN" | "MEMBER",
+): LibraryChangePlan | Record<string, unknown> {
+  if (role === "ADMIN") return plan;
+  const {
+    requestId: _requestId,
+    actor: _actor,
+    items,
+    root,
+    ...summary
+  } = plan;
+  return {
+    ...summary,
+    error: plan.error ? "任务需要管理员处理" : null,
+    blockers: plan.blockers.map((blocker) => ({
+      code: blocker.code,
+      message: "需要管理员处理",
+    })),
+    root: { id: root.id, name: root.name, policy: root.policy },
+    completedFiles: items.filter((item) =>
+      ["QUARANTINED", "RESTORED"].includes(item.status),
+    ).length,
+  };
 }
 
 function modelCompletionEndpoint(baseUrl: string): URL {

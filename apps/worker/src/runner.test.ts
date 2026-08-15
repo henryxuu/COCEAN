@@ -1014,6 +1014,8 @@ function config(root: string): WorkerConfig {
     databasePath: ":memory:",
     cacheRoot: join(root, ".cache"),
     musicRoot: root,
+    musicRootPolicy: "WATCH_ONLY",
+    quarantineRoot: join(root, ".quarantine"),
     pollMs: 1500,
     ffprobePath: "ffprobe",
     ffprobeTimeoutMs: 30_000,
