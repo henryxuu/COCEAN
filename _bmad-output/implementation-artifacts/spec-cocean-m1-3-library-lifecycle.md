@@ -74,6 +74,9 @@ context:
 - 2026-08-15：三路对抗评审后补强冻结 Root 身份、运行时权限/任务/actor 复验、未知目标拒绝、双端冲突、恢复断点收敛、排队取消与预览过期。
 - 2026-08-15：补齐隐藏管理视图、全局隔离区、状态/时间/失败筛选、异常计划重新核验、隐藏拆分继承、身份/投送互斥、MEMBER 错误脱敏与 MANAGED 运行检查。
 - 2026-08-15：增加真实 FNOS 双栈验收手册；生产只做 schema 20 + WATCH_ONLY，首次 MANAGED 文件写仅在完全隔离的临时 QA 栈执行。
+- 2026-08-15：隔离 QA 实机发现复制/恢复后纳秒时间戳漂移；改用零覆盖复制后 `/bin/touch -r` 并在删除源前复验 mtime，`f759fa7` 已通过真实隔离/恢复清单闭环。
+- 2026-08-15：真实 MANAGED QA 已覆盖目标占用、预览后事实漂移、符号链接、双端存在和双端缺失，均进入 `RECOVERY_REQUIRED` 且未覆盖未知内容；精确修复 QA 现场后可重试并恢复。
+- 2026-08-16：首轮生产 WATCH_ONLY Runner 的 schema 20 升级与运行边界通过，API Gate 因自动扫描占用返回 HTTP 409 后失败关闭；管理员在最终哈希窗口内独立整理 Music，导致旧 Music 清单与设备清单自然失效，未将其归因于 COCEAN 写入。
 - 保留限制：Node 路径 API 无法提供 Linux `openat2`/`unlinkat` 级目录句柄原子性；已采用 realpath、逐级符号链接、COPYFILE_EXCL、哈希与 inode 复验缩小窗口，真实 MANAGED 部署仍需受控单写者验收。
 
 ## Verification
@@ -83,9 +86,13 @@ context:
 - `pnpm check` -- 全仓类型、测试与生产构建通过；Contracts 5、Recommendation 14、Catalog Recommendation 3、Catalog Sources 2、Media Scanner 38（默认跳过真实媒体 10）、Still 2、Database 64、Worker 78、Server 56、Web 59。
 - `sh packages/media-scanner/tests/run-generated-integration.sh` -- 生成媒体 10/10，通过并清理 fixture。
 - `sh infra/tests/run.sh` -- Python acceptance 24/24、preflight/finalize mock、WATCH_ONLY/MANAGED runtime mount mock 与 7 服务 Compose 合同通过。
-- `docs/deployment/FNOS_M1_3_LIFECYCLE_ACCEPTANCE.md` -- 已定义生产只读升级、隔离 QA 栈、正向隔离/恢复、失败关闭矩阵与证据收口；待单独授权后执行。
+- `docs/deployment/FNOS_M1_3_LIFECYCLE_ACCEPTANCE.md` -- 已定义生产只读升级、隔离 QA 栈、正向隔离/恢复、失败关闭矩阵与证据收口；真实 FNOS 已获得单独授权并正在执行。
+- 真实 MANAGED QA -- 镜像 `0.2.0-m1.3-f759fa7` 三服务 healthy；schema 20 备份 `m1-3-qa-f759fa7-final-20260815` 创建/复核一致；2 个音频隔离与恢复成功，Album ID、LocalVersion ID 和封面身份稳定；原始 Music 基线 3/3 在路径、大小、SHA-256 与 `mtime_ns` 上完全一致。
+- 真实失败关闭矩阵 -- 目标占用 `80d1dd98-5324-4035-8a30-949f99ce5dce`、事实漂移 `111ac7f2-90af-45cf-bad4-54a2c05a9ca0`、符号链接 `96f35960-52db-4104-afa1-54ce6aa91d9b`、双端存在 `b4094fbd-3ead-4477-b402-c9131f460488`、双端缺失 `bbcb986e-8871-423a-aa7f-213c4ec636e4` 均实机失败关闭；人工只移除或恢复精确 QA 测试节点后重试成功，最终 Music 基线仍为 3/3 不变。
+- 首轮生产证据 -- WATCH_ONLY Music 原清单 10,669 条，SHA-256 `b3e9dccc5bf284631fa524f45ebff810f2cdf3883ef73a9963a3fd40612587fe`；SP3000M 原摘要 235 条，digest `21b398004f251fa9a768cde888c4fbcad2fb0c77933c50f49660d7d357c8f285`。首轮 Runner 因 HTTP 409 与独立人工整理导致的清单变化失败关闭，不据此声明生产验收通过。
+- 整理后安全节点 -- 三个核心服务已按原不可变镜像恢复且 healthy，运行检查再次证明 `WATCH_ONLY`、Music 只读与 Provider absent；schema 20 在线备份 `m1-3-post-user-sort-20260816T001500Z` 创建/复核一致；SP3000M 新只读摘要为 306 条、digest `0b19de25996a5704100b289cb5d7753e5c1b11eab02721a22e9bebe1ef067c26`，Music 新基线正在独立计算。
 - `git diff --check` 与 Prettier -- 补丁和格式通过。
-- 未执行真实 FNOS schema 20、真实 Music MANAGED/隔离/恢复；这些仍属于 Ask First，不能由本地 Gate 替代。
+- 真实生产续验仍未完成；在补丁 Runner PASS、生产 Music/SP3000M 新基线前后一致及 schema/integrity/外键复核前，真实 FNOS 验收保持未完成。
 
 ## Suggested Review Order
 

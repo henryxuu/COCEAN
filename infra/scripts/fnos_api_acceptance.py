@@ -270,6 +270,19 @@ class ApiClient:
         payload: dict[str, object] | None = None,
         expected: tuple[int, ...] = (200,),
     ) -> dict[str, Any]:
+        _, decoded = self.request_json_response(
+            method, path, label, payload, expected
+        )
+        return decoded
+
+    def request_json_response(
+        self,
+        method: str,
+        path: str,
+        label: str,
+        payload: dict[str, object] | None = None,
+        expected: tuple[int, ...] = (200,),
+    ) -> tuple[int, dict[str, Any]]:
         body = None
         headers = {"Accept": "application/json"}
         if payload is not None:
@@ -286,7 +299,16 @@ class ApiClient:
                     raise AcceptanceError(f"{label} escaped the configured API origin")
                 raw = response.read(2 * 1024 * 1024 + 1)
         except urllib.error.HTTPError as error:
-            raise AcceptanceError(f"{label} returned HTTP {error.code}") from None
+            status = error.code
+            if status not in expected:
+                raise AcceptanceError(f"{label} returned HTTP {status}") from None
+            final = urllib.parse.urlsplit(error.geturl())
+            if (final.scheme, final.hostname, final.port) != self.origin:
+                raise AcceptanceError(f"{label} escaped the configured API origin")
+            try:
+                raw = error.read(2 * 1024 * 1024 + 1)
+            finally:
+                error.close()
         except (urllib.error.URLError, TimeoutError, OSError):
             raise AcceptanceError(f"{label} could not be reached") from None
         if status not in expected:
@@ -297,7 +319,7 @@ class ApiClient:
             decoded = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise AcceptanceError(f"{label} returned invalid JSON") from None
-        return require_object(decoded, label)
+        return status, require_object(decoded, label)
 
     def request_bytes(
         self,
@@ -339,6 +361,9 @@ class AcceptanceRun:
             arguments.exclude_directories_json
         )
         self.existing_scan_id = parse_optional_scan_id(arguments.existing_scan_id)
+        self.scan_acquisition_source = (
+            "explicit-reuse" if self.existing_scan_id is not None else "pending"
+        )
         self.allowed_unsupported_extensions = parse_allowed_unsupported_extensions(
             arguments.allowed_unsupported_extensions_json
         )
@@ -374,6 +399,7 @@ class AcceptanceRun:
                 "manifestHash": arguments.manifest_hash,
                 "listenCoverage": arguments.listen_mode,
                 "reusedExistingScan": self.existing_scan_id is not None,
+                "scanAcquisitionSource": self.scan_acquisition_source,
             },
             "gates": [],
         }
@@ -402,10 +428,7 @@ class AcceptanceRun:
         ):
             raise AcceptanceError("readiness did not confirm the Music root policy")
 
-        if self.existing_scan_id is None:
-            scan = self.gate("scan-create", self.create_scan)
-        else:
-            scan = self.gate("scan-reuse", self.get_existing_scan)
+        scan = self.gate("scan-acquire", self.acquire_scan)
         scan = self.gate("scan-complete", lambda: self.wait_for_scan(scan))
         failures, by_code, by_stage = self.gate(
             "scan-failure-pagination", lambda: self.fetch_failures(scan)
@@ -464,7 +487,8 @@ class AcceptanceRun:
         scan_status = safe_dimension(scan.get("status"))
         self.report["scan"] = {
             "status": scan_status,
-            "reusedExistingScan": self.existing_scan_id is not None,
+            "reusedExistingScan": self.scan_acquisition_source != "created",
+            "acquisitionSource": self.scan_acquisition_source,
             "totalFiles": total_files,
             "processedFiles": processed_files,
             "parsedFiles": parsed_files,
@@ -752,18 +776,62 @@ class AcceptanceRun:
             "symlinkPaths": symlink_paths,
         }
 
-    def create_scan(self) -> dict[str, Any]:
-        scan = self.client.request_json(
-            "POST",
-            "/api/v1/scans",
-            "scan create",
-            {"rootId": "music"},
-            expected=(202,),
+    def acquire_scan(self) -> dict[str, Any]:
+        if self.existing_scan_id is not None:
+            scan = self.get_existing_scan()
+            self.record_scan_acquisition("explicit-reuse")
+            return scan
+
+        for attempt in range(2):
+            status, response = self.client.request_json_response(
+                "POST",
+                "/api/v1/scans",
+                "scan create",
+                {"rootId": "music"},
+                expected=(202, 409),
+            )
+            if status == 202:
+                self.validate_scan_identity(response)
+                self.validate_scan_mode(response)
+                if response.get("status") != "QUEUED":
+                    raise AcceptanceError("scan create returned an invalid initial job")
+                self.record_scan_acquisition("created")
+                return response
+            if response.get("error") != "SCAN_ALREADY_ACTIVE":
+                raise AcceptanceError("scan create returned an unexpected conflict")
+            active = self.find_active_music_scan()
+            if active is not None:
+                self.record_scan_acquisition("conflict-reuse")
+                return active
+            if attempt == 0:
+                continue
+        raise AcceptanceError("scan conflict could not be resolved safely")
+
+    def find_active_music_scan(self) -> dict[str, Any] | None:
+        page = self.client.request_json(
+            "GET", "/api/v1/scans?limit=100", "active scan lookup"
         )
-        self.validate_scan_identity(scan)
-        if scan.get("rootId") != "music" or scan.get("status") != "QUEUED":
-            raise AcceptanceError("scan create returned an invalid initial job")
-        return scan
+        items = require_list(page.get("items"), "active scan items")
+        candidates: list[dict[str, Any]] = []
+        for item in items:
+            candidate = require_object(item, "active scan item")
+            if candidate.get("rootId") != "music" or candidate.get("status") not in {
+                "QUEUED",
+                "RUNNING",
+            }:
+                continue
+            self.validate_scan_identity(candidate)
+            self.validate_scan_mode(candidate)
+            candidates.append(candidate)
+        if len(candidates) > 1:
+            raise AcceptanceError("active scan lookup returned ambiguous candidates")
+        return candidates[0] if candidates else None
+
+    def record_scan_acquisition(self, source: str) -> None:
+        self.scan_acquisition_source = source
+        policy = require_object(self.report.get("policy"), "acceptance policy")
+        policy["reusedExistingScan"] = source != "created"
+        policy["scanAcquisitionSource"] = source
 
     def get_existing_scan(self) -> dict[str, Any]:
         scan_id = self.existing_scan_id
@@ -774,6 +842,7 @@ class AcceptanceRun:
             "GET", f"/api/v1/scans/{encoded}", "existing scan"
         )
         self.validate_scan_identity(scan, scan_id)
+        self.validate_scan_mode(scan)
         if scan.get("status") not in TERMINAL_SCAN_STATUSES | {"QUEUED", "RUNNING"}:
             raise AcceptanceError("existing scan returned an unknown status")
         return scan
@@ -790,6 +859,11 @@ class AcceptanceRun:
         if scan.get("rootId") != "music":
             raise AcceptanceError("scan root identity is not music")
         return scan_id
+
+    @staticmethod
+    def validate_scan_mode(scan: dict[str, Any]) -> None:
+        if scan.get("mode") not in {"FULL", "INCREMENTAL"}:
+            raise AcceptanceError("scan returned an unknown mode")
 
     def wait_for_scan(self, initial: dict[str, Any]) -> dict[str, Any]:
         scan_id_raw = self.validate_scan_identity(initial)
