@@ -12,6 +12,7 @@ import { LoginPage } from "./pages/login.js";
 import { SettingsPage } from "./pages/settings.js";
 import { SystemsPage } from "./pages/systems.js";
 import { TasksPage } from "./pages/tasks.js";
+import { QuarantinePage } from "./pages/quarantine.js";
 import { applyTheme } from "./theme.js";
 
 export function App() {
@@ -91,6 +92,10 @@ export function App() {
         />
         <Route path="/system" element={<SystemsPage canManage={canManage} />} />
         <Route path="/tasks" element={<TasksPage canManage={canManage} />} />
+        <Route
+          path="/quarantine"
+          element={<QuarantinePage canManage={canManage} />}
+        />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

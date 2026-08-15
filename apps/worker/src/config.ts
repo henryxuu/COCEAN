@@ -4,6 +4,8 @@ const schema = z.object({
   databasePath: z.string().default("./data/cocean.sqlite"),
   cacheRoot: z.string().default("./cache"),
   musicRoot: z.string().default("/library/music"),
+  musicRootPolicy: z.enum(["WATCH_ONLY", "MANAGED"]).default("WATCH_ONLY"),
+  quarantineRoot: z.string().default("/library/quarantine"),
   pollMs: z.coerce.number().int().min(250).max(60_000).default(1500),
   ffprobePath: z.string().default("ffprobe"),
   ffprobeTimeoutMs: z.coerce
@@ -72,6 +74,8 @@ export function loadWorkerConfig(
     databasePath: env.COCEAN_DATABASE_PATH,
     cacheRoot: env.COCEAN_CACHE_ROOT,
     musicRoot: env.COCEAN_MUSIC_ROOT,
+    musicRootPolicy: env.COCEAN_MUSIC_ROOT_POLICY,
+    quarantineRoot: env.COCEAN_QUARANTINE_ROOT,
     pollMs: env.COCEAN_WORKER_POLL_MS,
     ffprobePath: env.COCEAN_FFPROBE_PATH,
     ffprobeTimeoutMs: env.COCEAN_FFPROBE_TIMEOUT_MS,

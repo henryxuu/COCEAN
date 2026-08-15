@@ -11,6 +11,7 @@ for script in "$REPO_ROOT"/infra/scripts/*.sh "$REPO_ROOT"/infra/tests/*.sh; do
 done
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$TEST_DIR" -p 'test_*.py' -v
 sh "$TEST_DIR/test_fnos_preflight.sh"
+sh "$TEST_DIR/test_fnos_runtime_inspect.sh"
 sh "$TEST_DIR/test_fnos_acceptance.sh"
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/infra/scripts/fnos_api_acceptance.py" --help >/dev/null
 sh "$REPO_ROOT/infra/scripts/fnos_preflight.sh" --help >/dev/null

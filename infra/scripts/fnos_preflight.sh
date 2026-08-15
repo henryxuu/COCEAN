@@ -210,11 +210,28 @@ http_bind=$(require_value COCEAN_HTTP_BIND)
 case "$http_bind" in *[!0-9A-Fa-f.:%_-]*|'') fail 64 "COCEAN_HTTP_BIND is invalid" ;; esac
 
 music_dir=$(require_value COCEAN_MUSIC_DIR)
+quarantine_dir=$(require_value COCEAN_QUARANTINE_DIR)
 data_dir=$(require_value COCEAN_DATA_DIR)
 cache_dir=$(require_value COCEAN_CACHE_DIR)
 inbox_dir=$(require_value COCEAN_INBOX_DIR)
 delivery_dir=$(require_value COCEAN_DELIVERY_DIR)
 web_auth_file=$(require_value COCEAN_WEB_AUTH_FILE)
+
+music_root_policy=$(env_value COCEAN_MUSIC_ROOT_POLICY)
+[ -n "$music_root_policy" ] || music_root_policy=WATCH_ONLY
+music_read_only=$(env_value COCEAN_MUSIC_READ_ONLY)
+[ -n "$music_read_only" ] || music_read_only=true
+case "$music_root_policy:$music_read_only" in
+  WATCH_ONLY:true|MANAGED:false) ;;
+  WATCH_ONLY:false)
+    fail 64 "WATCH_ONLY requires COCEAN_MUSIC_READ_ONLY=true"
+    ;;
+  MANAGED:true)
+    fail 64 "MANAGED requires COCEAN_MUSIC_READ_ONLY=false"
+    ;;
+  *) fail 64 "Music root policy or read-only flag is invalid" ;;
+esac
+ok "Music root policy and mount mode are consistent"
 
 canonical_directory() {
   label=$1
@@ -232,6 +249,7 @@ canonical_directory() {
 }
 
 music_real=$(canonical_directory Music "$music_dir")
+quarantine_real=$(canonical_directory quarantine "$quarantine_dir")
 data_real=$(canonical_directory data "$data_dir")
 cache_real=$(canonical_directory cache "$cache_dir")
 inbox_real=$(canonical_directory inbox "$inbox_dir")
@@ -324,6 +342,7 @@ paths_overlap() {
 
 set -- \
   "Music|$music_real" \
+  "quarantine|$quarantine_real" \
   "data|$data_real" \
   "cache|$cache_real" \
   "inbox|$inbox_real" \
@@ -341,9 +360,9 @@ while [ "$#" -gt 1 ]; do
     fi
   done
 done
-ok "Music, data, cache, inbox and delivery are distinct existing directories"
+ok "Music, quarantine, data, cache, inbox and delivery are distinct existing directories"
 
-for protected_root in "$music_real" "$data_real" "$cache_real" "$inbox_real" "$delivery_real"; do
+for protected_root in "$music_real" "$quarantine_real" "$data_real" "$cache_real" "$inbox_real" "$delivery_real"; do
   case "$web_auth_real" in
     "$protected_root"|"$protected_root"/*)
       fail 73 "Web authentication secret must be outside Music and application data directories"
@@ -429,21 +448,36 @@ python_image=$(require_value PYTHON_IMAGE)
 if ! "$DOCKER_BIN" run --rm --network none --read-only \
   --user "$puid:$pgid" --cap-drop ALL --security-opt no-new-privileges \
   --mount "type=bind,src=$music_real,dst=/check/music,readonly" \
+  --mount "type=bind,src=$quarantine_real,dst=/check/quarantine" \
   --mount "type=bind,src=$data_real,dst=/check/data" \
   --mount "type=bind,src=$cache_real,dst=/check/cache" \
   --mount "type=bind,src=$inbox_real,dst=/check/inbox" \
   --mount "type=bind,src=$delivery_real,dst=/check/delivery" \
   "$python_image" sh -eu -c '
     test -r /check/music && test -x /check/music
-    for directory in /check/data /check/cache /check/inbox /check/delivery; do
+    for directory in /check/quarantine /check/data /check/cache /check/inbox /check/delivery; do
       test -r "$directory" && test -x "$directory" && test -w "$directory"
       sentinel="$directory/.cocean-preflight-$$"
       : >"$sentinel"
       rm -f "$sentinel"
     done
   ' >/dev/null 2>&1; then
-  fail 73 "PUID/PGID cannot read Music and write data/cache/inbox/delivery"
+  fail 73 "PUID/PGID cannot read Music and write quarantine/data/cache/inbox/delivery"
 fi
 ok "containerized PUID/PGID permission probe passed"
+
+if [ "$music_root_policy" = MANAGED ]; then
+  if ! "$DOCKER_BIN" run --rm --network none --read-only \
+    --user "$puid:$pgid" --cap-drop ALL --security-opt no-new-privileges \
+    --mount "type=bind,src=$music_real,dst=/check/music" \
+    "$python_image" sh -eu -c '
+      sentinel=/check/music/.cocean-managed-preflight-$$
+      : >"$sentinel"
+      rm -f "$sentinel"
+    ' >/dev/null 2>&1; then
+    fail 73 "MANAGED Music is not writable by the configured PUID/PGID"
+  fi
+  ok "MANAGED Music write permission is proven"
+fi
 
 printf 'preflight: PASS\n'

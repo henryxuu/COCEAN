@@ -12,6 +12,9 @@ import type {
   AlbumMetadata,
   AlbumMetadataEvent,
   AlbumMetadataMutationResult,
+  AlbumVisibilityCommand,
+  AlbumVisibilityEvent,
+  AlbumVisibilityMutationResult,
   AlbumSummary,
   Artwork,
   ArtworkDecisionCommand,
@@ -27,6 +30,10 @@ import type {
   LibraryIdentityDecisionCommand,
   LibraryIdentityDecisionResult,
   LibraryStats,
+  LibraryChangeBlocker,
+  LibraryChangePlan,
+  LibraryChangePlanItem,
+  LibraryChangePlanStatus,
   MetadataCommand,
   MetadataField,
   MetadataFieldState,
@@ -147,6 +154,19 @@ export class AlbumArtworkDecisionError extends Error {
   ) {
     super(message);
     this.name = "AlbumArtworkDecisionError";
+  }
+}
+
+export class LibraryLifecycleError extends Error {
+  constructor(
+    public readonly code:
+      | "INVALID_LIFECYCLE_COMMAND"
+      | "LIFECYCLE_CONFLICT"
+      | "LIFECYCLE_NOT_EXECUTABLE",
+    message: string,
+  ) {
+    super(message);
+    this.name = "LibraryLifecycleError";
   }
 }
 
@@ -288,6 +308,8 @@ interface ScanEvidenceCounts {
 
 export interface DatabaseOptions {
   musicRoot?: string;
+  musicRootPolicy?: "WATCH_ONLY" | "MANAGED";
+  quarantineRoot?: string;
 }
 
 export interface AlbumDirectoryFingerprint {
@@ -390,9 +412,13 @@ export interface FrozenAlbumDeliveryBundle extends Omit<
 export class CoceanDatabase {
   readonly raw: Sqlite;
   private readonly musicRoot: string;
+  private readonly musicRootPolicy: "WATCH_ONLY" | "MANAGED";
+  private readonly quarantineRoot: string;
 
   constructor(databasePath: string, options: DatabaseOptions = {}) {
     this.musicRoot = options.musicRoot ?? "/library/music";
+    this.musicRootPolicy = options.musicRootPolicy ?? "WATCH_ONLY";
+    this.quarantineRoot = options.quarantineRoot ?? "/library/quarantine";
     if (databasePath !== ":memory:")
       mkdirSync(dirname(databasePath), { recursive: true });
     this.raw = new BetterSqlite3(databasePath);
@@ -475,9 +501,15 @@ export class CoceanDatabase {
       .prepare(
         `INSERT OR IGNORE INTO library_roots
           (id, name, host_path_hint, container_path, policy, enabled, created_at, updated_at)
-         VALUES ('music', 'Music', NULL, ?, 'WATCH_ONLY', 1, ?, ?)`,
+         VALUES ('music', 'Music', NULL, ?, ?, 1, ?, ?)`,
       )
-      .run(this.musicRoot, now, now);
+      .run(this.musicRoot, this.musicRootPolicy, now, now);
+    this.raw
+      .prepare(
+        `UPDATE library_roots SET container_path=?, policy=?, updated_at=?
+         WHERE id='music' AND system=0`,
+      )
+      .run(this.musicRoot, this.musicRootPolicy, now);
     if (
       !this.raw.prepare("SELECT 1 FROM app_settings WHERE key = 'main'").get()
     ) {
@@ -2087,6 +2119,9 @@ export class CoceanDatabase {
       .prepare(
         `SELECT * FROM library_albums
          WHERE decision_source='USER' OR primary_version_source='USER'
+            OR visibility='HIDDEN'
+            OR EXISTS (SELECT 1 FROM library_change_plans lcp
+                       WHERE lcp.library_album_id=library_albums.id)
             OR EXISTS (SELECT 1 FROM library_metadata_values mv
                        WHERE mv.scope_type='ALBUM' AND mv.owner_id=library_albums.id)
             OR EXISTS (SELECT 1 FROM library_metadata_event_groups meg
@@ -2108,6 +2143,9 @@ export class CoceanDatabase {
              WHERE library_album_id IN (
                SELECT id FROM library_albums
                WHERE decision_source='USER' OR primary_version_source='USER'
+                  OR visibility='HIDDEN'
+                  OR EXISTS (SELECT 1 FROM library_change_plans lcp
+                             WHERE lcp.library_album_id=library_albums.id)
                   OR EXISTS (SELECT 1 FROM library_metadata_values mv
                              WHERE mv.scope_type='ALBUM' AND mv.owner_id=library_albums.id)
                   OR EXISTS (SELECT 1 FROM library_metadata_event_groups meg
@@ -2156,6 +2194,9 @@ export class CoceanDatabase {
            AND library_album_id NOT IN (
              SELECT id FROM library_albums
              WHERE primary_version_source='USER' OR decision_source='USER'
+                OR visibility='HIDDEN'
+                OR EXISTS (SELECT 1 FROM library_change_plans lcp
+                           WHERE lcp.library_album_id=library_albums.id)
                 OR EXISTS (SELECT 1 FROM library_metadata_values mv
                            WHERE mv.scope_type='ALBUM' AND mv.owner_id=library_albums.id)
                 OR EXISTS (SELECT 1 FROM library_metadata_event_groups meg
@@ -2176,6 +2217,18 @@ export class CoceanDatabase {
       const groupId = String(protectedGroup.id);
       for (const member of additions)
         addMember.run(groupId, member.id, now, now);
+      const currentPrimary = nullableString(protectedGroup.primary_version_id);
+      if (!currentPrimary || !albumById.has(currentPrimary)) {
+        const primary = [...additions].sort(comparePrimaryVersions)[0];
+        if (primary)
+          this.raw
+            .prepare(
+              `UPDATE library_albums
+               SET title=?,album_artist=?,primary_version_id=?,revision=revision+1,updated_at=?
+               WHERE id=?`,
+            )
+            .run(primary.title, primary.album_artist, primary.id, now, groupId);
+      }
       groups.delete(key);
     }
     for (const [key, members] of groups) {
@@ -2246,12 +2299,51 @@ export class CoceanDatabase {
       const members = memberIds
         .map((id) => albumById.get(id))
         .filter((album): album is Record<string, unknown> => Boolean(album));
-      const primaryId = String(group.primary_version_id);
-      if (!memberIds.includes(primaryId))
-        throw new LibraryIdentityDecisionError(
-          "IDENTITY_DECISION_CONFLICT",
-          "人工主版本必须始终属于其稳定唱片",
+      let primaryId = nullableString(
+        (
+          this.raw
+            .prepare("SELECT primary_version_id FROM library_albums WHERE id=?")
+            .get(groupId) as { primary_version_id: string | null }
+        ).primary_version_id,
+      );
+      if (!memberIds.length) {
+        const governedByLifecycle = Boolean(
+          this.raw
+            .prepare(
+              "SELECT 1 FROM library_change_plans WHERE library_album_id=? LIMIT 1",
+            )
+            .get(groupId),
         );
+        if (governedByLifecycle || group.visibility === "HIDDEN") {
+          const previousMemberIds = baseline.members.get(groupId) ?? [];
+          if (previousMemberIds.length || primaryId)
+            this.raw
+              .prepare(
+                `UPDATE library_albums SET primary_version_id=NULL,
+                   revision=revision+1,updated_at=? WHERE id=?`,
+              )
+              .run(now, groupId);
+          this.raw
+            .prepare("DELETE FROM library_issues WHERE library_album_id=?")
+            .run(groupId);
+          continue;
+        }
+      }
+      if (!primaryId || !memberIds.includes(primaryId)) {
+        if (group.decision_source === "AUTOMATIC" && members.length) {
+          primaryId = String([...members].sort(comparePrimaryVersions)[0]!.id);
+          this.raw
+            .prepare(
+              `UPDATE library_albums SET primary_version_id=?,revision=revision+1,updated_at=?
+               WHERE id=?`,
+            )
+            .run(primaryId, now, groupId);
+        } else
+          throw new LibraryIdentityDecisionError(
+            "IDENTITY_DECISION_CONFLICT",
+            "人工主版本必须始终属于其稳定唱片",
+          );
+      }
       const oldMemberIds = baseline.members.get(groupId) ?? memberIds;
       if (
         oldMemberIds.length !== memberIds.length ||
@@ -2279,6 +2371,9 @@ export class CoceanDatabase {
       .prepare(
         `DELETE FROM library_albums WHERE decision_source='AUTOMATIC'
       AND primary_version_source='AUTOMATIC'
+      AND visibility='VISIBLE'
+      AND NOT EXISTS (SELECT 1 FROM library_change_plans lcp
+                      WHERE lcp.library_album_id=library_albums.id)
       AND NOT EXISTS (SELECT 1 FROM library_album_members lm WHERE lm.library_album_id=library_albums.id)`,
       )
       .run();
@@ -2480,6 +2575,14 @@ export class CoceanDatabase {
         );
       const source = this.libraryIdentityGroup(sourceId);
       this.assertIdentityRevision(source, command.revision);
+      if (
+        (command.type === "MERGE" || command.type === "SPLIT") &&
+        this.groupsHaveActiveLifecyclePlans([sourceId])
+      )
+        throw new LibraryIdentityDecisionError(
+          "IDENTITY_DECISION_CONFLICT",
+          "唱片正在执行文件管理操作，请完成或处理后再调整版本关系",
+        );
       const now = new Date().toISOString();
       const sourceMetadataSignature =
         this.albumMetadataEffectiveSignature(sourceId);
@@ -2538,6 +2641,27 @@ export class CoceanDatabase {
           );
         const target = this.libraryIdentityGroup(targetId);
         this.assertIdentityRevision(target, command.targetRevision);
+        if (this.groupsHaveActiveLifecyclePlans([targetId]))
+          throw new LibraryIdentityDecisionError(
+            "IDENTITY_DECISION_CONFLICT",
+            "合并目标正在执行文件管理操作，请稍后再试",
+          );
+        const visibilityRows = this.raw
+          .prepare(
+            "SELECT id,visibility FROM library_albums WHERE id IN (?,?) ORDER BY id",
+          )
+          .all(sourceId, targetId) as Array<{
+          id: string;
+          visibility: "VISIBLE" | "HIDDEN";
+        }>;
+        if (
+          visibilityRows.length !== 2 ||
+          visibilityRows[0]!.visibility !== visibilityRows[1]!.visibility
+        )
+          throw new LibraryIdentityDecisionError(
+            "IDENTITY_DECISION_CONFLICT",
+            "两张唱片的显示状态不同，请先统一显示状态再合并",
+          );
         mergeTargetMetadataSignature =
           this.albumMetadataEffectiveSignature(targetId);
         const mergedVersionIds = this.libraryIdentityMemberIds([
@@ -2646,6 +2770,16 @@ export class CoceanDatabase {
           (partition) => partition.versionIds.includes(source.primaryVersionId),
         );
         const existingIssues = before.groups[0]?.issues ?? [];
+        const sourceVisibility = this.raw
+          .prepare(
+            `SELECT visibility,visibility_revision,visibility_updated_at
+             FROM library_albums WHERE id=?`,
+          )
+          .get(sourceId) as {
+          visibility: "VISIBLE" | "HIDDEN";
+          visibility_revision: number;
+          visibility_updated_at: string | null;
+        };
         this.raw
           .prepare("DELETE FROM library_issues WHERE library_album_id=?")
           .run(sourceId);
@@ -2692,8 +2826,9 @@ export class CoceanDatabase {
               .prepare(
                 `INSERT INTO library_albums
                    (id,identity_key,title,album_artist,primary_version_id,decision_source,
-                    primary_version_source,revision,created_at,updated_at)
-                 VALUES (?,?,?,?,?,'USER',?,1,?,?)`,
+                    primary_version_source,revision,visibility,visibility_revision,
+                    visibility_updated_at,created_at,updated_at)
+                 VALUES (?,?,?,?,?,'USER',?,1,?,?,?,?,?)`,
               )
               .run(
                 groupId,
@@ -2702,6 +2837,9 @@ export class CoceanDatabase {
                 primary.album_artist,
                 primaryVersionId,
                 partition.primaryVersionId ? "USER" : "AUTOMATIC",
+                sourceVisibility.visibility,
+                sourceVisibility.visibility_revision,
+                sourceVisibility.visibility_updated_at,
                 now,
                 now,
               );
@@ -5464,12 +5602,1255 @@ export class CoceanDatabase {
     };
   }
 
+  applyAlbumVisibility(
+    albumId: string,
+    command: AlbumVisibilityCommand,
+    actor: LibraryIdentityActor,
+  ): AlbumVisibilityMutationResult {
+    const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+    if (!libraryAlbumId)
+      throw new LibraryLifecycleError(
+        "INVALID_LIFECYCLE_COMMAND",
+        "唱片不存在",
+      );
+    const inputJson = JSON.stringify({ libraryAlbumId, ...command });
+    return this.raw.transaction(() => {
+      const replay = this.raw
+        .prepare("SELECT * FROM library_visibility_events WHERE request_id=?")
+        .get(command.requestId) as Record<string, unknown> | undefined;
+      if (replay) {
+        if (String(replay.input_json) !== inputJson)
+          throw new LibraryLifecycleError(
+            "LIFECYCLE_CONFLICT",
+            "requestId 已用于不同的显示状态请求",
+          );
+        return parseJson<AlbumVisibilityMutationResult>(
+          replay.result_json,
+          this.visibilityResultFromEvent(replay),
+        );
+      }
+      const row = this.raw
+        .prepare(
+          "SELECT visibility,visibility_revision FROM library_albums WHERE id=?",
+        )
+        .get(libraryAlbumId) as
+        | { visibility: "VISIBLE" | "HIDDEN"; visibility_revision: number }
+        | undefined;
+      if (!row)
+        throw new LibraryLifecycleError(
+          "INVALID_LIFECYCLE_COMMAND",
+          "唱片不存在",
+        );
+      if (
+        Number(row.visibility_revision) !== command.expectedVisibilityRevision
+      )
+        throw new LibraryLifecycleError(
+          "LIFECYCLE_CONFLICT",
+          "显示状态已变化，请刷新后重试",
+        );
+      const after = command.action === "HIDE" ? "HIDDEN" : "VISIBLE";
+      if (row.visibility === after)
+        throw new LibraryLifecycleError(
+          "INVALID_LIFECYCLE_COMMAND",
+          after === "HIDDEN" ? "唱片已经隐藏" : "唱片已经显示",
+        );
+      const createdAt = new Date().toISOString();
+      const resultingRevision = command.expectedVisibilityRevision + 1;
+      const changed = this.raw
+        .prepare(
+          `UPDATE library_albums
+           SET visibility=?,visibility_revision=?,visibility_updated_at=?,updated_at=?
+           WHERE id=? AND visibility_revision=?`,
+        )
+        .run(
+          after,
+          resultingRevision,
+          createdAt,
+          createdAt,
+          libraryAlbumId,
+          command.expectedVisibilityRevision,
+        );
+      if (changed.changes !== 1)
+        throw new LibraryLifecycleError(
+          "LIFECYCLE_CONFLICT",
+          "显示状态已变化，请刷新后重试",
+        );
+      const event: AlbumVisibilityEvent = {
+        id: randomUUID(),
+        requestId: command.requestId,
+        libraryAlbumId,
+        type: command.action,
+        actor,
+        expectedVisibilityRevision: command.expectedVisibilityRevision,
+        resultingVisibilityRevision: resultingRevision,
+        before: row.visibility,
+        after,
+        createdAt,
+      };
+      const result: AlbumVisibilityMutationResult = {
+        libraryAlbumId,
+        visibility: after,
+        visibilityRevision: resultingRevision,
+        event,
+      };
+      this.raw
+        .prepare(
+          `INSERT INTO library_visibility_events
+           (id,request_id,library_album_id,event_type,actor_id,actor_display_name,
+            expected_visibility_revision,resulting_visibility_revision,
+            before_visibility,after_visibility,input_json,result_json,created_at)
+           VALUES (@id,@requestId,@libraryAlbumId,@type,@actorId,@actorDisplayName,
+            @expectedVisibilityRevision,@resultingVisibilityRevision,
+            @before,@after,@inputJson,@resultJson,@createdAt)`,
+        )
+        .run({
+          ...event,
+          actorId: actor.id,
+          actorDisplayName: actor.displayName,
+          inputJson,
+          resultJson: JSON.stringify(result),
+        });
+      return result;
+    })();
+  }
+
+  listAlbumVisibilityHistory(albumId: string): AlbumVisibilityEvent[] {
+    const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+    if (!libraryAlbumId) return [];
+    return this.raw
+      .prepare(
+        `SELECT * FROM library_visibility_events
+         WHERE library_album_id=? OR library_album_id IN (
+           SELECT alias_id FROM library_album_aliases WHERE library_album_id=?
+         ) ORDER BY created_at DESC,id DESC LIMIT 100`,
+      )
+      .all(libraryAlbumId, libraryAlbumId)
+      .map((row) =>
+        this.mapAlbumVisibilityEvent(row as Record<string, unknown>),
+      );
+  }
+
+  private visibilityResultFromEvent(
+    row: Record<string, unknown>,
+  ): AlbumVisibilityMutationResult {
+    const event = this.mapAlbumVisibilityEvent(row);
+    return {
+      libraryAlbumId: event.libraryAlbumId,
+      visibility: event.after,
+      visibilityRevision: event.resultingVisibilityRevision,
+      event,
+    };
+  }
+
+  private mapAlbumVisibilityEvent(
+    row: Record<string, unknown>,
+  ): AlbumVisibilityEvent {
+    return {
+      id: String(row.id),
+      requestId: String(row.request_id),
+      libraryAlbumId: String(row.library_album_id),
+      type: row.event_type as AlbumVisibilityEvent["type"],
+      actor: {
+        id: String(row.actor_id),
+        displayName: String(row.actor_display_name),
+      },
+      expectedVisibilityRevision: Number(row.expected_visibility_revision),
+      resultingVisibilityRevision: Number(row.resulting_visibility_revision),
+      before: row.before_visibility as AlbumVisibilityEvent["before"],
+      after: row.after_visibility as AlbumVisibilityEvent["after"],
+      createdAt: String(row.created_at),
+    };
+  }
+
+  createQuarantinePlan(
+    albumId: string,
+    command: {
+      requestId: string;
+      expectedLibraryRevision: number;
+      localVersionId: string;
+    },
+    actor: LibraryIdentityActor,
+  ): LibraryChangePlan {
+    const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+    if (!libraryAlbumId)
+      throw new LibraryLifecycleError(
+        "INVALID_LIFECYCLE_COMMAND",
+        "唱片不存在",
+      );
+    const inputJson = JSON.stringify({
+      action: "QUARANTINE_VERSION",
+      libraryAlbumId,
+      ...command,
+    });
+    return this.raw.transaction(() => {
+      const replay = this.lifecyclePlanReplay(command.requestId, inputJson);
+      if (replay) return replay;
+      const version = this.lifecycleVersionEvidence(
+        libraryAlbumId,
+        command.localVersionId,
+      );
+      if (!version)
+        throw new LibraryLifecycleError(
+          "INVALID_LIFECYCLE_COMMAND",
+          "所选本地版本不属于这张唱片",
+        );
+      if (version.libraryRevision !== command.expectedLibraryRevision)
+        throw new LibraryLifecycleError(
+          "LIFECYCLE_CONFLICT",
+          "唱片版本关系已变化，请刷新后重新预览",
+        );
+      this.expireLifecyclePreviews(command.localVersionId);
+      if (this.hasActiveLifecyclePlan(command.localVersionId))
+        throw new LibraryLifecycleError(
+          "LIFECYCLE_CONFLICT",
+          "这个本地版本已有进行中的管理操作",
+        );
+      const planId = randomUUID();
+      const files = this.lifecycleVersionFiles(command.localVersionId);
+      if (files.length === 0)
+        throw new LibraryLifecycleError(
+          "INVALID_LIFECYCLE_COMMAND",
+          "所选本地版本没有可管理的音频文件",
+        );
+      const blockers = this.lifecycleBlockers(version.rootId, files, [
+        command.localVersionId,
+      ]);
+      const now = new Date().toISOString();
+      this.insertLifecyclePlan({
+        id: planId,
+        requestId: command.requestId,
+        action: "QUARANTINE_VERSION",
+        status: "PREVIEWED",
+        libraryAlbumId,
+        localVersionId: command.localVersionId,
+        rootId: version.rootId,
+        rootContainerPath: version.rootContainerPath,
+        quarantineRootPath: this.quarantineRoot,
+        sourcePlanId: null,
+        expectedLibraryRevision: command.expectedLibraryRevision,
+        inputJson,
+        blockers,
+        fileCount: files.length,
+        totalBytes: files.reduce((total, file) => total + file.sizeBytes, 0),
+        actor,
+        createdAt: now,
+      });
+      const insertItem = this.raw.prepare(
+        `INSERT INTO library_change_plan_items
+         (plan_id,ordinal,media_file_id,source_relative_path,
+          quarantine_relative_path,size_bytes,sha256,status,updated_at)
+         VALUES (?,?,?,?,?,?,?,'PENDING',?)`,
+      );
+      files.forEach((file, ordinal) => {
+        insertItem.run(
+          planId,
+          ordinal,
+          file.id,
+          file.relativePath,
+          lifecycleQuarantinePath(planId, file.relativePath),
+          file.sizeBytes,
+          file.sha256,
+          now,
+        );
+      });
+      this.insertLibraryChangeEvent(
+        planId,
+        "PREVIEW",
+        actor,
+        { executable: blockers.length === 0, blockers },
+        command.requestId,
+        now,
+      );
+      return this.requireLibraryChangePlan(planId);
+    })();
+  }
+
+  createRestorePlan(
+    sourcePlanId: string,
+    requestId: string,
+    actor: LibraryIdentityActor,
+  ): LibraryChangePlan {
+    const inputJson = JSON.stringify({
+      action: "RESTORE_VERSION",
+      sourcePlanId,
+      requestId,
+    });
+    return this.raw.transaction(() => {
+      const replay = this.lifecyclePlanReplay(requestId, inputJson);
+      if (replay) return replay;
+      const source = this.getLibraryChangePlan(sourcePlanId);
+      if (
+        !source ||
+        source.action !== "QUARANTINE_VERSION" ||
+        source.status !== "SUCCEEDED"
+      )
+        throw new LibraryLifecycleError(
+          "INVALID_LIFECYCLE_COMMAND",
+          "只有已完成隔离的版本可以恢复",
+        );
+      this.expireLifecyclePreviews(source.localVersionId);
+      const existing = this.raw
+        .prepare(
+          `SELECT id FROM library_change_plans
+           WHERE source_plan_id=? AND action='RESTORE_VERSION'
+             AND status IN ('PREVIEWED','QUEUED','RUNNING','SUCCEEDED','RECOVERY_REQUIRED')
+           ORDER BY created_at DESC,id DESC LIMIT 1`,
+        )
+        .get(sourcePlanId) as { id: string } | undefined;
+      if (existing)
+        throw new LibraryLifecycleError(
+          "LIFECYCLE_CONFLICT",
+          "这个隔离版本已有恢复操作",
+        );
+      if (this.hasActiveLifecyclePlan(source.localVersionId))
+        throw new LibraryLifecycleError(
+          "LIFECYCLE_CONFLICT",
+          "这个本地版本已有进行中的管理操作",
+        );
+      const currentLibraryAlbumId = this.resolveLibraryAlbumId(
+        source.libraryAlbumId,
+      );
+      const album = this.raw
+        .prepare("SELECT revision FROM library_albums WHERE id=?")
+        .get(currentLibraryAlbumId ?? "") as { revision: number } | undefined;
+      if (!album)
+        throw new LibraryLifecycleError(
+          "INVALID_LIFECYCLE_COMMAND",
+          "唱片不存在",
+        );
+      const sourceItems = source.items;
+      const sourceIdentity = this.raw
+        .prepare(
+          `SELECT root_container_path,quarantine_root_path
+           FROM library_change_plans WHERE id=?`,
+        )
+        .get(sourcePlanId) as {
+        root_container_path: string;
+        quarantine_root_path: string;
+      };
+      const files = sourceItems.map((item) => ({
+        id: item.mediaFileId,
+        rootId: source.root.id,
+        relativePath: item.sourceRelativePath,
+        sizeBytes: item.sizeBytes,
+        sha256: item.sha256,
+      }));
+      const blockers = this.lifecycleBlockers(source.root.id, files, [
+        source.localVersionId,
+      ]);
+      const currentRoot = this.raw
+        .prepare("SELECT container_path FROM library_roots WHERE id=?")
+        .get(source.root.id) as { container_path: string } | undefined;
+      if (
+        currentRoot?.container_path !== sourceIdentity.root_container_path ||
+        this.quarantineRoot !== sourceIdentity.quarantine_root_path
+      )
+        blockers.push({
+          code: "PLAN_STALE",
+          message: "来源或隔离目录身份已变化，不能按旧清单恢复",
+        });
+      const planId = randomUUID();
+      const now = new Date().toISOString();
+      this.insertLifecyclePlan({
+        id: planId,
+        requestId,
+        action: "RESTORE_VERSION",
+        status: "PREVIEWED",
+        libraryAlbumId: currentLibraryAlbumId!,
+        localVersionId: source.localVersionId,
+        rootId: source.root.id,
+        rootContainerPath: sourceIdentity.root_container_path,
+        quarantineRootPath: sourceIdentity.quarantine_root_path,
+        sourcePlanId,
+        expectedLibraryRevision: Number(album.revision),
+        inputJson,
+        blockers,
+        fileCount: source.fileCount,
+        totalBytes: source.totalBytes,
+        actor,
+        createdAt: now,
+      });
+      const insertItem = this.raw.prepare(
+        `INSERT INTO library_change_plan_items
+         (plan_id,ordinal,media_file_id,source_relative_path,
+          quarantine_relative_path,size_bytes,sha256,status,updated_at)
+         VALUES (?,?,?,?,?,?,?,'PENDING',?)`,
+      );
+      sourceItems.forEach((item) =>
+        insertItem.run(
+          planId,
+          item.ordinal,
+          item.mediaFileId,
+          item.sourceRelativePath,
+          item.quarantineRelativePath,
+          item.sizeBytes,
+          item.sha256,
+          now,
+        ),
+      );
+      this.insertLibraryChangeEvent(
+        planId,
+        "PREVIEW",
+        actor,
+        { executable: blockers.length === 0, blockers, sourcePlanId },
+        requestId,
+        now,
+      );
+      return this.requireLibraryChangePlan(planId);
+    })();
+  }
+
+  confirmLibraryChangePlan(
+    planId: string,
+    requestId: string,
+    actor: LibraryIdentityActor,
+  ): LibraryChangePlan {
+    const detailsJson = JSON.stringify({ planId, requestId });
+    return this.raw.transaction(() => {
+      const replay = this.raw
+        .prepare(
+          "SELECT plan_id,event_type,details_json FROM library_change_events WHERE request_id=?",
+        )
+        .get(requestId) as
+        | { plan_id: string; event_type: string; details_json: string }
+        | undefined;
+      if (replay) {
+        if (
+          replay.plan_id !== planId ||
+          replay.event_type !== "CONFIRM" ||
+          replay.details_json !== detailsJson
+        )
+          throw new LibraryLifecycleError(
+            "LIFECYCLE_CONFLICT",
+            "requestId 已用于不同的确认请求",
+          );
+        return this.requireLibraryChangePlan(planId);
+      }
+      const plan = this.requireLibraryChangePlan(planId);
+      if (plan.status !== "PREVIEWED")
+        throw new LibraryLifecycleError(
+          "LIFECYCLE_CONFLICT",
+          "计划已确认或不再可确认",
+        );
+      if (!plan.executable)
+        throw new LibraryLifecycleError(
+          "LIFECYCLE_NOT_EXECUTABLE",
+          plan.blockers.map((blocker) => blocker.message).join("；") ||
+            "计划不可执行",
+        );
+      const blockers = this.revalidateLifecyclePlan(plan);
+      if (blockers.length)
+        throw new LibraryLifecycleError(
+          "LIFECYCLE_NOT_EXECUTABLE",
+          blockers.map((blocker) => blocker.message).join("；"),
+        );
+      const now = new Date().toISOString();
+      const changed = this.raw
+        .prepare(
+          `UPDATE library_change_plans
+           SET status='QUEUED',confirmed_at=? WHERE id=? AND status='PREVIEWED'`,
+        )
+        .run(now, planId);
+      if (changed.changes !== 1)
+        throw new LibraryLifecycleError("LIFECYCLE_CONFLICT", "计划状态已变化");
+      this.insertLibraryChangeEvent(
+        planId,
+        "CONFIRM",
+        actor,
+        { planId, requestId },
+        requestId,
+        now,
+      );
+      return this.requireLibraryChangePlan(planId);
+    })();
+  }
+
+  cancelLibraryChangePlan(
+    planId: string,
+    requestId: string,
+    actor: LibraryIdentityActor,
+  ): LibraryChangePlan {
+    const detailsJson = JSON.stringify({ planId, requestId });
+    return this.raw.transaction(() => {
+      const replay = this.raw
+        .prepare(
+          "SELECT plan_id,event_type,details_json FROM library_change_events WHERE request_id=?",
+        )
+        .get(requestId) as
+        | { plan_id: string; event_type: string; details_json: string }
+        | undefined;
+      if (replay) {
+        if (
+          replay.plan_id !== planId ||
+          replay.event_type !== "CANCEL" ||
+          replay.details_json !== detailsJson
+        )
+          throw new LibraryLifecycleError(
+            "LIFECYCLE_CONFLICT",
+            "requestId 已用于不同的取消请求",
+          );
+        return this.requireLibraryChangePlan(planId);
+      }
+      const plan = this.requireLibraryChangePlan(planId);
+      if (plan.status !== "PREVIEWED" && plan.status !== "QUEUED")
+        throw new LibraryLifecycleError(
+          "LIFECYCLE_CONFLICT",
+          "只有尚未执行的计划可以取消",
+        );
+      const now = new Date().toISOString();
+      this.raw
+        .prepare(
+          `UPDATE library_change_plans SET status='CANCELLED',finished_at=?
+           WHERE id=? AND status IN ('PREVIEWED','QUEUED')`,
+        )
+        .run(now, planId);
+      this.insertLibraryChangeEvent(
+        planId,
+        "CANCEL",
+        actor,
+        { planId, requestId },
+        requestId,
+        now,
+      );
+      return this.requireLibraryChangePlan(planId);
+    })();
+  }
+
+  retryLibraryChangePlan(
+    planId: string,
+    requestId: string,
+    actor: LibraryIdentityActor,
+  ): LibraryChangePlan {
+    const detailsJson = JSON.stringify({ planId, requestId, retry: true });
+    return this.raw.transaction(() => {
+      const replay = this.raw
+        .prepare(
+          "SELECT plan_id,event_type,details_json FROM library_change_events WHERE request_id=?",
+        )
+        .get(requestId) as
+        | { plan_id: string; event_type: string; details_json: string }
+        | undefined;
+      if (replay) {
+        if (
+          replay.plan_id !== planId ||
+          replay.event_type !== "CONFIRM" ||
+          replay.details_json !== detailsJson
+        )
+          throw new LibraryLifecycleError(
+            "LIFECYCLE_CONFLICT",
+            "requestId 已用于不同的重试请求",
+          );
+        return this.requireLibraryChangePlan(planId);
+      }
+      const plan = this.requireLibraryChangePlan(planId);
+      if (plan.status !== "RECOVERY_REQUIRED")
+        throw new LibraryLifecycleError(
+          "LIFECYCLE_CONFLICT",
+          "只有需要人工处理的计划可以重新核验",
+        );
+      const originalActor = this.getUser(plan.actor.id);
+      if (
+        !originalActor ||
+        !originalActor.enabled ||
+        originalActor.role !== "ADMIN"
+      )
+        throw new LibraryLifecycleError(
+          "LIFECYCLE_NOT_EXECUTABLE",
+          "原发起人已不再是启用的管理员",
+        );
+      const now = new Date().toISOString();
+      const changed = this.raw
+        .prepare(
+          `UPDATE library_change_plans SET status='QUEUED',error=NULL,
+             started_at=NULL,finished_at=NULL WHERE id=? AND status='RECOVERY_REQUIRED'`,
+        )
+        .run(planId);
+      if (changed.changes !== 1)
+        throw new LibraryLifecycleError("LIFECYCLE_CONFLICT", "计划状态已变化");
+      this.insertLibraryChangeEvent(
+        planId,
+        "CONFIRM",
+        actor,
+        { planId, requestId, retry: true },
+        requestId,
+        now,
+      );
+      return this.requireLibraryChangePlan(planId);
+    })();
+  }
+
+  getLibraryChangePlan(planId: string): LibraryChangePlan | null {
+    const row = this.raw
+      .prepare(
+        `SELECT p.*,r.name AS root_name,r.policy AS root_policy
+         FROM library_change_plans p JOIN library_roots r ON r.id=p.root_id
+         WHERE p.id=?`,
+      )
+      .get(planId) as Record<string, unknown> | undefined;
+    return row ? this.mapLibraryChangePlan(row) : null;
+  }
+
+  getLibraryChangePlanExecution(planId: string): {
+    plan: LibraryChangePlan;
+    rootContainerPath: string;
+    quarantineRootPath: string;
+  } | null {
+    const plan = this.getLibraryChangePlan(planId);
+    if (!plan) return null;
+    const row = this.raw
+      .prepare(
+        `SELECT root_container_path,quarantine_root_path
+         FROM library_change_plans WHERE id=?`,
+      )
+      .get(planId) as {
+      root_container_path: string;
+      quarantine_root_path: string;
+    };
+    return {
+      plan,
+      rootContainerPath: row.root_container_path,
+      quarantineRootPath: row.quarantine_root_path,
+    };
+  }
+
+  revalidateRunningLibraryChangePlan(planId: string): LibraryChangeBlocker[] {
+    const plan = this.requireLibraryChangePlan(planId);
+    if (plan.status !== "RUNNING")
+      throw new LibraryLifecycleError(
+        "LIFECYCLE_CONFLICT",
+        "只有运行中的计划可以执行最终复验",
+      );
+    return this.revalidateLifecyclePlan(plan);
+  }
+
+  requireLibraryChangePlan(planId: string): LibraryChangePlan {
+    const plan = this.getLibraryChangePlan(planId);
+    if (!plan)
+      throw new LibraryLifecycleError(
+        "INVALID_LIFECYCLE_COMMAND",
+        "管理计划不存在",
+      );
+    return plan;
+  }
+
+  listLibraryChangePlans(
+    options: { limit?: number } = {},
+  ): LibraryChangePlan[] {
+    const limit = Math.min(Math.max(options.limit ?? 100, 1), 100);
+    return this.raw
+      .prepare(
+        `WITH head AS (
+           SELECT id FROM library_change_plans
+           ORDER BY created_at DESC,id DESC LIMIT ?
+         )
+         SELECT p.*,r.name AS root_name,r.policy AS root_policy
+         FROM library_change_plans p JOIN library_roots r ON r.id=p.root_id
+         WHERE p.id IN (SELECT id FROM head) OR p.status='RECOVERY_REQUIRED'
+         ORDER BY p.created_at DESC,p.id DESC`,
+      )
+      .all(limit)
+      .map((row) => this.mapLibraryChangePlan(row as Record<string, unknown>));
+  }
+
+  listQuarantinedLibraryVersions(limit = 100): LibraryChangePlan[] {
+    return this.raw
+      .prepare(
+        `SELECT p.*,r.name AS root_name,r.policy AS root_policy
+         FROM library_change_plans p JOIN library_roots r ON r.id=p.root_id
+         WHERE p.action='QUARANTINE_VERSION' AND p.status='SUCCEEDED'
+           AND NOT EXISTS (
+             SELECT 1 FROM library_change_plans restore
+             WHERE restore.source_plan_id=p.id AND restore.action='RESTORE_VERSION'
+               AND restore.status='SUCCEEDED'
+           )
+         ORDER BY p.finished_at DESC,p.id DESC LIMIT ?`,
+      )
+      .all(Math.min(Math.max(limit, 1), 100))
+      .map((row) => this.mapLibraryChangePlan(row as Record<string, unknown>));
+  }
+
+  claimNextLibraryChangePlan(): LibraryChangePlan | null {
+    return this.raw.transaction(() => {
+      const row = this.raw
+        .prepare(
+          `SELECT id FROM library_change_plans
+           WHERE status='QUEUED' ORDER BY confirmed_at,created_at,id LIMIT 1`,
+        )
+        .get() as { id: string } | undefined;
+      if (!row) return null;
+      const now = new Date().toISOString();
+      const changed = this.raw
+        .prepare(
+          `UPDATE library_change_plans SET status='RUNNING',started_at=?,error=NULL
+           WHERE id=? AND status='QUEUED'`,
+        )
+        .run(now, row.id);
+      if (changed.changes !== 1) return null;
+      const plan = this.requireLibraryChangePlan(row.id);
+      this.insertLibraryChangeEvent(
+        row.id,
+        "START",
+        plan.actor,
+        { action: plan.action },
+        null,
+        now,
+      );
+      return this.requireLibraryChangePlan(row.id);
+    })();
+  }
+
+  updateLibraryChangePlanItem(
+    planId: string,
+    ordinal: number,
+    update: {
+      status: LibraryChangePlanItem["status"];
+      finalSizeBytes?: number | null;
+      finalSha256?: string | null;
+      error?: string | null;
+    },
+  ): LibraryChangePlan {
+    return this.raw.transaction(() => {
+      const plan = this.requireLibraryChangePlan(planId);
+      if (plan.status !== "RUNNING")
+        throw new LibraryLifecycleError(
+          "LIFECYCLE_CONFLICT",
+          "只有运行中的计划可以更新文件状态",
+        );
+      const now = new Date().toISOString();
+      const changed = this.raw
+        .prepare(
+          `UPDATE library_change_plan_items
+           SET status=@status,final_size_bytes=@finalSizeBytes,
+               final_sha256=@finalSha256,error=@error,updated_at=@updatedAt
+           WHERE plan_id=@planId AND ordinal=@ordinal`,
+        )
+        .run({
+          planId,
+          ordinal,
+          status: update.status,
+          finalSizeBytes: update.finalSizeBytes ?? null,
+          finalSha256: update.finalSha256 ?? null,
+          error: update.error ?? null,
+          updatedAt: now,
+        });
+      if (changed.changes !== 1)
+        throw new LibraryLifecycleError(
+          "INVALID_LIFECYCLE_COMMAND",
+          "计划文件不存在",
+        );
+      this.insertLibraryChangeEvent(
+        planId,
+        "ITEM_UPDATE",
+        plan.actor,
+        { ordinal, ...update },
+        null,
+        now,
+      );
+      return this.requireLibraryChangePlan(planId);
+    })();
+  }
+
+  finishLibraryChangePlan(
+    planId: string,
+    status: "SUCCEEDED" | "FAILED" | "RECOVERY_REQUIRED",
+    error: string | null = null,
+  ): LibraryChangePlan {
+    return this.raw.transaction(() => {
+      const plan = this.requireLibraryChangePlan(planId);
+      if (plan.status !== "RUNNING")
+        throw new LibraryLifecycleError(
+          "LIFECYCLE_CONFLICT",
+          "只有运行中的计划可以结束",
+        );
+      if (
+        status === "SUCCEEDED" &&
+        plan.items.some((item) =>
+          plan.action === "QUARANTINE_VERSION"
+            ? item.status !== "QUARANTINED"
+            : item.status !== "RESTORED",
+        )
+      )
+        throw new LibraryLifecycleError(
+          "LIFECYCLE_NOT_EXECUTABLE",
+          "仍有文件未完成，不能标记成功",
+        );
+      const now = new Date().toISOString();
+      this.raw
+        .prepare(
+          `UPDATE library_change_plans SET status=?,error=?,finished_at=?
+           WHERE id=? AND status='RUNNING'`,
+        )
+        .run(status, error, now, planId);
+      const eventType =
+        status === "SUCCEEDED"
+          ? "COMPLETE"
+          : status === "RECOVERY_REQUIRED"
+            ? "RECOVERY_REQUIRED"
+            : "FAIL";
+      this.insertLibraryChangeEvent(
+        planId,
+        eventType,
+        plan.actor,
+        { status, error },
+        null,
+        now,
+      );
+      if (status === "SUCCEEDED")
+        this.enqueueLifecycleReconciliationScan(plan.root.id, now);
+      return this.requireLibraryChangePlan(planId);
+    })();
+  }
+
+  recoverRunningLibraryChangePlans(): number {
+    return this.raw.transaction(() => {
+      const rows = this.raw
+        .prepare(
+          `SELECT id FROM library_change_plans WHERE status='RUNNING'
+           ORDER BY started_at,id`,
+        )
+        .all() as Array<{ id: string }>;
+      const now = new Date().toISOString();
+      for (const row of rows) {
+        const plan = this.requireLibraryChangePlan(row.id);
+        this.raw
+          .prepare(
+            `UPDATE library_change_plans SET status='QUEUED',started_at=NULL,
+             error='Worker 中断，已按冻结清单排队恢复' WHERE id=? AND status='RUNNING'`,
+          )
+          .run(row.id);
+        this.insertLibraryChangeEvent(
+          row.id,
+          "RECOVERY_REQUIRED",
+          plan.actor,
+          { recoveredTo: "QUEUED", reason: "WORKER_RESTART" },
+          null,
+          now,
+        );
+      }
+      return rows.length;
+    })();
+  }
+
+  private lifecyclePlanReplay(
+    requestId: string,
+    inputJson: string,
+  ): LibraryChangePlan | null {
+    const row = this.raw
+      .prepare(
+        "SELECT id,input_json FROM library_change_plans WHERE request_id=?",
+      )
+      .get(requestId) as { id: string; input_json: string } | undefined;
+    if (!row) return null;
+    if (row.input_json !== inputJson)
+      throw new LibraryLifecycleError(
+        "LIFECYCLE_CONFLICT",
+        "requestId 已用于不同的管理计划",
+      );
+    return this.requireLibraryChangePlan(row.id);
+  }
+
+  private lifecycleVersionEvidence(
+    libraryAlbumId: string,
+    localVersionId: string,
+  ): {
+    rootId: string;
+    rootName: string;
+    rootPolicy: "WATCH_ONLY" | "MANAGED";
+    rootContainerPath: string;
+    libraryRevision: number;
+  } | null {
+    const row = this.raw
+      .prepare(
+        `SELECT a.root_id AS rootId,r.name AS rootName,r.policy AS rootPolicy,
+                r.container_path AS rootContainerPath,
+                la.revision AS libraryRevision
+         FROM library_album_members lm
+         JOIN library_albums la ON la.id=lm.library_album_id
+         JOIN albums a ON a.id=lm.album_id
+         JOIN library_roots r ON r.id=a.root_id
+         WHERE lm.library_album_id=? AND lm.album_id=?`,
+      )
+      .get(libraryAlbumId, localVersionId) as
+      | {
+          rootId: string;
+          rootName: string;
+          rootPolicy: "WATCH_ONLY" | "MANAGED";
+          rootContainerPath: string;
+          libraryRevision: number;
+        }
+      | undefined;
+    return row ?? null;
+  }
+
+  private lifecycleVersionFiles(localVersionId: string): Array<{
+    id: string;
+    rootId: string;
+    relativePath: string;
+    sizeBytes: number;
+    sha256: string | null;
+  }> {
+    return (
+      this.raw
+        .prepare(
+          `SELECT mf.id,mf.root_id,mf.relative_path,mf.size_bytes,mf.file_sha256
+           FROM album_files af JOIN media_files mf ON mf.id=af.media_file_id
+           WHERE af.album_id=? ORDER BY mf.relative_path,mf.id`,
+        )
+        .all(localVersionId) as Record<string, unknown>[]
+    ).map((row) => ({
+      id: String(row.id),
+      rootId: String(row.root_id),
+      relativePath: String(row.relative_path),
+      sizeBytes: Number(row.size_bytes),
+      sha256: nullableString(row.file_sha256)?.toLowerCase() ?? null,
+    }));
+  }
+
+  private lifecycleBlockers(
+    rootId: string,
+    files: Array<{
+      rootId: string;
+      sha256: string | null;
+    }>,
+    localVersionIds: string[],
+  ): LibraryChangeBlocker[] {
+    const blockers: LibraryChangeBlocker[] = [];
+    const root = this.raw
+      .prepare("SELECT policy,enabled FROM library_roots WHERE id=?")
+      .get(rootId) as
+      { policy: "WATCH_ONLY" | "MANAGED"; enabled: number } | undefined;
+    if (!root || !root.enabled)
+      blockers.push({
+        code: "SOURCE_UNAVAILABLE",
+        message: "来源目录当前不可用",
+      });
+    else if (root.policy !== "MANAGED")
+      blockers.push({
+        code: "WATCH_ONLY_ROOT",
+        message: "这个目录是只读观察目录，不能移动文件",
+      });
+    if (files.some((file) => file.rootId !== rootId))
+      blockers.push({
+        code: "CROSS_ROOT_VERSION",
+        message: "本地版本跨越多个来源目录，不能隔离",
+      });
+    if (files.some((file) => !file.sha256))
+      blockers.push({
+        code: "MISSING_SHA256",
+        message: "部分文件缺少完整校验值，请先重新扫描",
+      });
+    if (
+      this.raw
+        .prepare(
+          `SELECT 1 FROM scan_jobs WHERE root_id=?
+           AND status IN ('QUEUED','RUNNING') LIMIT 1`,
+        )
+        .get(rootId)
+    )
+      blockers.push({
+        code: "ACTIVE_SCAN",
+        message: "来源目录正在扫描，请稍后重试",
+      });
+    if (
+      localVersionIds.some((versionId) =>
+        this.raw
+          .prepare(
+            `SELECT 1 FROM delivery_jobs WHERE album_id=?
+             AND status IN ('QUEUED','RUNNING') LIMIT 1`,
+          )
+          .get(versionId),
+      )
+    )
+      blockers.push({
+        code: "ACTIVE_DELIVERY",
+        message: "这个版本正在投送，请稍后重试",
+      });
+    return blockers;
+  }
+
+  private hasActiveLifecyclePlan(localVersionId: string): boolean {
+    return Boolean(
+      this.raw
+        .prepare(
+          `SELECT 1 FROM library_change_plans WHERE local_version_id=?
+           AND status IN ('PREVIEWED','QUEUED','RUNNING','RECOVERY_REQUIRED') LIMIT 1`,
+        )
+        .get(localVersionId),
+    );
+  }
+
+  private groupsHaveActiveLifecyclePlans(groupIds: string[]): boolean {
+    if (!groupIds.length) return false;
+    const placeholders = groupIds.map(() => "?").join(",");
+    return Boolean(
+      this.raw
+        .prepare(
+          `SELECT 1 FROM library_change_plans p
+           WHERE p.local_version_id IN (
+             SELECT album_id FROM library_album_members
+             WHERE library_album_id IN (${placeholders})
+           ) AND p.status IN ('PREVIEWED','QUEUED','RUNNING','RECOVERY_REQUIRED')
+           LIMIT 1`,
+        )
+        .get(...groupIds),
+    );
+  }
+
+  hasActiveLibraryChangePlan(albumId: string): boolean {
+    const libraryAlbumId = this.resolveLibraryAlbumId(albumId);
+    return libraryAlbumId
+      ? this.groupsHaveActiveLifecyclePlans([libraryAlbumId])
+      : false;
+  }
+
+  libraryAlbumIdentityExists(albumId: string): boolean {
+    const resolved = this.resolveLibraryAlbumId(albumId);
+    if (!resolved) return false;
+    return Boolean(
+      this.raw.prepare("SELECT 1 FROM library_albums WHERE id=?").get(resolved),
+    );
+  }
+
+  private expireLifecyclePreviews(localVersionId: string): void {
+    const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const rows = this.raw
+      .prepare(
+        `SELECT id,actor_id,actor_display_name FROM library_change_plans
+         WHERE local_version_id=? AND status='PREVIEWED' AND created_at<?`,
+      )
+      .all(localVersionId, cutoff) as Array<{
+      id: string;
+      actor_id: string;
+      actor_display_name: string;
+    }>;
+    const now = new Date().toISOString();
+    for (const row of rows) {
+      this.raw
+        .prepare(
+          `UPDATE library_change_plans SET status='CANCELLED',finished_at=?,
+             error='预览已过期，请重新生成' WHERE id=? AND status='PREVIEWED'`,
+        )
+        .run(now, row.id);
+      this.insertLibraryChangeEvent(
+        row.id,
+        "CANCEL",
+        { id: row.actor_id, displayName: row.actor_display_name },
+        { reason: "PREVIEW_EXPIRED" },
+        null,
+        now,
+      );
+    }
+  }
+
+  private revalidateLifecyclePlan(
+    plan: LibraryChangePlan,
+  ): LibraryChangeBlocker[] {
+    const files =
+      plan.action === "QUARANTINE_VERSION"
+        ? this.lifecycleVersionFiles(plan.localVersionId)
+        : plan.items.map((item) => ({
+            id: item.mediaFileId ?? "",
+            rootId: plan.root.id,
+            relativePath: item.sourceRelativePath,
+            sizeBytes: item.sizeBytes,
+            sha256: item.sha256,
+          }));
+    const blockers = this.lifecycleBlockers(plan.root.id, files, [
+      plan.localVersionId,
+    ]);
+    const actor = this.raw
+      .prepare("SELECT role,enabled FROM app_users WHERE id=?")
+      .get(plan.actor.id) as
+      { role: "ADMIN" | "MEMBER"; enabled: number } | undefined;
+    if (!actor || actor.role !== "ADMIN" || !actor.enabled)
+      blockers.push({
+        code: "ACTOR_NOT_AUTHORIZED",
+        message: "发起人已不再是启用的管理员，计划不能执行",
+      });
+    const album = this.raw
+      .prepare("SELECT revision FROM library_albums WHERE id=?")
+      .get(plan.libraryAlbumId) as { revision: number } | undefined;
+    const pathIdentity = this.raw
+      .prepare(
+        `SELECT p.root_container_path,p.quarantine_root_path,r.container_path
+         FROM library_change_plans p JOIN library_roots r ON r.id=p.root_id
+         WHERE p.id=?`,
+      )
+      .get(plan.id) as {
+      root_container_path: string;
+      quarantine_root_path: string;
+      container_path: string;
+    };
+    if (
+      !album ||
+      Number(album.revision) !== plan.expectedLibraryRevision ||
+      pathIdentity.root_container_path !== pathIdentity.container_path ||
+      pathIdentity.quarantine_root_path !== this.quarantineRoot ||
+      (plan.action === "QUARANTINE_VERSION" &&
+        plan.items.every((item) => item.status === "PENDING") &&
+        (files.length !== plan.items.length ||
+          files.some((file, index) => {
+            const frozen = plan.items[index];
+            return (
+              !frozen ||
+              file.id !== frozen.mediaFileId ||
+              file.rootId !== plan.root.id ||
+              file.relativePath !== frozen.sourceRelativePath ||
+              file.sizeBytes !== frozen.sizeBytes ||
+              file.sha256 !== frozen.sha256
+            );
+          })))
+    )
+      blockers.push({
+        code: "PLAN_STALE",
+        message: "唱片或文件清单已变化，请重新生成预览",
+      });
+    return blockers;
+  }
+
+  private insertLifecyclePlan(input: {
+    id: string;
+    requestId: string;
+    action: "QUARANTINE_VERSION" | "RESTORE_VERSION";
+    status: LibraryChangePlanStatus;
+    libraryAlbumId: string;
+    localVersionId: string;
+    rootId: string;
+    rootContainerPath: string;
+    quarantineRootPath: string;
+    sourcePlanId: string | null;
+    expectedLibraryRevision: number;
+    inputJson: string;
+    blockers: LibraryChangeBlocker[];
+    fileCount: number;
+    totalBytes: number;
+    actor: LibraryIdentityActor;
+    createdAt: string;
+  }): void {
+    this.raw
+      .prepare(
+        `INSERT INTO library_change_plans
+         (id,request_id,action,status,library_album_id,local_version_id,root_id,
+          root_container_path,quarantine_root_path,
+          source_plan_id,expected_library_revision,input_json,executable,
+          blockers_json,file_count,total_bytes,actor_id,actor_display_name,created_at)
+         VALUES (@id,@requestId,@action,@status,@libraryAlbumId,@localVersionId,@rootId,
+          @rootContainerPath,@quarantineRootPath,
+          @sourcePlanId,@expectedLibraryRevision,@inputJson,@executable,
+          @blockersJson,@fileCount,@totalBytes,@actorId,@actorDisplayName,@createdAt)`,
+      )
+      .run({
+        ...input,
+        executable: input.blockers.length === 0 ? 1 : 0,
+        blockersJson: JSON.stringify(input.blockers),
+        actorId: input.actor.id,
+        actorDisplayName: input.actor.displayName,
+      });
+  }
+
+  private insertLibraryChangeEvent(
+    planId: string,
+    eventType:
+      | "PREVIEW"
+      | "CONFIRM"
+      | "START"
+      | "ITEM_UPDATE"
+      | "COMPLETE"
+      | "FAIL"
+      | "RECOVERY_REQUIRED"
+      | "CANCEL",
+    actor: LibraryIdentityActor,
+    details: unknown,
+    requestId: string | null,
+    createdAt = new Date().toISOString(),
+  ): void {
+    this.raw
+      .prepare(
+        `INSERT INTO library_change_events
+         (id,request_id,plan_id,event_type,actor_id,actor_display_name,details_json,created_at)
+         VALUES (?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        randomUUID(),
+        requestId,
+        planId,
+        eventType,
+        actor.id,
+        actor.displayName,
+        JSON.stringify(details),
+        createdAt,
+      );
+  }
+
+  private mapLibraryChangePlan(
+    row: Record<string, unknown>,
+  ): LibraryChangePlan {
+    const items = (
+      this.raw
+        .prepare(
+          `SELECT * FROM library_change_plan_items
+           WHERE plan_id=? ORDER BY ordinal`,
+        )
+        .all(String(row.id)) as Record<string, unknown>[]
+    ).map((item): LibraryChangePlanItem => ({
+      ordinal: Number(item.ordinal),
+      mediaFileId: nullableString(item.media_file_id),
+      sourceRelativePath: String(item.source_relative_path),
+      quarantineRelativePath: String(item.quarantine_relative_path),
+      sizeBytes: Number(item.size_bytes),
+      sha256: nullableString(item.sha256),
+      status: item.status as LibraryChangePlanItem["status"],
+      finalSizeBytes: nullableNumber(item.final_size_bytes),
+      finalSha256: nullableString(item.final_sha256),
+      error: nullableString(item.error),
+    }));
+    return {
+      id: String(row.id),
+      requestId: String(row.request_id),
+      action: row.action as LibraryChangePlan["action"],
+      status: row.status as LibraryChangePlanStatus,
+      libraryAlbumId: String(row.library_album_id),
+      localVersionId: String(row.local_version_id),
+      root: {
+        id: String(row.root_id),
+        name: String(row.root_name),
+        policy: row.root_policy as "WATCH_ONLY" | "MANAGED",
+      },
+      sourcePlanId: nullableString(row.source_plan_id),
+      expectedLibraryRevision: Number(row.expected_library_revision),
+      executable: Boolean(row.executable),
+      blockers: parseJson<LibraryChangeBlocker[]>(row.blockers_json, []),
+      fileCount: Number(row.file_count),
+      totalBytes: Number(row.total_bytes),
+      items,
+      actor: {
+        id: String(row.actor_id),
+        displayName: String(row.actor_display_name),
+      },
+      error: nullableString(row.error),
+      createdAt: String(row.created_at),
+      confirmedAt: nullableString(row.confirmed_at),
+      startedAt: nullableString(row.started_at),
+      finishedAt: nullableString(row.finished_at),
+    };
+  }
+
+  private enqueueLifecycleReconciliationScan(
+    rootId: string,
+    createdAt: string,
+  ): void {
+    this.tryCreateScanJob(
+      emptyScanJob(randomUUID(), rootId, "INCREMENTAL", "MANUAL", createdAt),
+    );
+  }
+
   listAlbums(
     options: {
       search?: string;
       filter?: "ALL" | "DIGITAL" | PhysicalMedium;
       issue?: LibraryIssueCode | "ALL";
       sort?: "ARTIST" | "TITLE" | "YEAR_DESC";
+      visibility?: "VISIBLE" | "HIDDEN" | "ALL";
       limit?: number;
       offset?: number;
     } = {},
@@ -5478,6 +6859,7 @@ export class CoceanDatabase {
     const filter = options.filter ?? "ALL";
     const sort = options.sort ?? "ARTIST";
     const issue = options.issue ?? "ALL";
+    const visibility = options.visibility ?? "VISIBLE";
     const limit = Math.min(Math.max(options.limit ?? 100, 1), 500);
     const offset = Math.max(options.offset ?? 0, 0);
     const effectiveTitle = effectiveAlbumFieldSql("title", "a.title");
@@ -5488,6 +6870,10 @@ export class CoceanDatabase {
     const effectiveYear = effectiveAlbumFieldSql("year", "a.year");
     const conditions: string[] = [];
     const parameters: Record<string, string | number> = { limit, offset };
+    if (visibility !== "ALL") {
+      conditions.push("la.visibility=@visibility");
+      parameters.visibility = visibility;
+    }
     if (search) {
       conditions.push(
         `(${effectiveTitle} LIKE @query ESCAPE '\\' OR ${effectiveArtist} LIKE @query ESCAPE '\\')`,
@@ -5522,6 +6908,7 @@ export class CoceanDatabase {
         `SELECT a.*, la.id AS library_album_id, la.primary_version_id,
                 la.primary_version_source, la.revision, la.metadata_revision,
                 la.artwork_revision,la.effective_artwork_json,la.effective_artwork_source,
+                la.visibility,la.visibility_revision,
                 ${effectiveTitle} AS effective_title,
                 ${effectiveArtist} AS effective_album_artist,
                 ${effectiveYear} AS effective_year,
@@ -5540,11 +6927,13 @@ export class CoceanDatabase {
       search?: string;
       filter?: "ALL" | "DIGITAL" | PhysicalMedium;
       issue?: LibraryIssueCode | "ALL";
+      visibility?: "VISIBLE" | "HIDDEN" | "ALL";
     } = {},
   ): number {
     const search = options.search?.trim();
     const filter = options.filter ?? "ALL";
     const issue = options.issue ?? "ALL";
+    const visibility = options.visibility ?? "VISIBLE";
     const effectiveTitle = effectiveAlbumFieldSql("title", "a.title");
     const effectiveArtist = effectiveAlbumFieldSql(
       "albumArtist",
@@ -5552,6 +6941,10 @@ export class CoceanDatabase {
     );
     const conditions: string[] = [];
     const parameters: Record<string, string> = {};
+    if (visibility !== "ALL") {
+      conditions.push("la.visibility=@visibility");
+      parameters.visibility = visibility;
+    }
     if (search) {
       conditions.push(
         `(${effectiveTitle} LIKE @query ESCAPE '\\' OR ${effectiveArtist} LIKE @query ESCAPE '\\')`,
@@ -5595,6 +6988,7 @@ export class CoceanDatabase {
         `SELECT a.*, la.id AS library_album_id, la.primary_version_id,
         la.primary_version_source, la.revision, la.metadata_revision,
         la.artwork_revision,la.effective_artwork_json,la.effective_artwork_source,
+        la.visibility,la.visibility_revision,
         ${effectiveTitle} AS effective_title,
         ${effectiveArtist} AS effective_album_artist,
         ${effectiveYear} AS effective_year,
@@ -5709,8 +7103,32 @@ export class CoceanDatabase {
           ? ("INCOMPLETE" as const)
           : ("COMPLETE" as const),
         issues,
+        lifecycleStatus: this.getLocalVersionLifecycle(String(row.id)),
       };
     });
+  }
+
+  private getLocalVersionLifecycle(localVersionId: string) {
+    const row = this.raw
+      .prepare(
+        `SELECT action,status FROM library_change_plans
+         WHERE local_version_id=?
+         ORDER BY created_at DESC,id DESC LIMIT 1`,
+      )
+      .get(localVersionId) as
+      { action: string; status: LibraryChangePlanStatus } | undefined;
+    if (!row) return "ACTIVE" as const;
+    if (row.status === "RECOVERY_REQUIRED") return "RECOVERY_REQUIRED" as const;
+    if (row.action === "QUARANTINE_VERSION") {
+      if (["QUEUED", "RUNNING"].includes(row.status))
+        return "QUARANTINING" as const;
+      if (row.status === "SUCCEEDED") return "QUARANTINED" as const;
+    } else {
+      if (["PREVIEWED", "QUEUED", "RUNNING"].includes(row.status))
+        return "RESTORING" as const;
+      if (row.status === "FAILED") return "QUARANTINED" as const;
+    }
+    return "ACTIVE" as const;
   }
 
   private listLibraryIssues(
@@ -5751,7 +7169,9 @@ export class CoceanDatabase {
     const row = this.raw
       .prepare(
         `SELECT la.id FROM library_albums la JOIN albums a ON a.id=la.primary_version_id
-         WHERE ${effectiveTitle} = ? COLLATE NOCASE AND ${effectiveArtist} = ? COLLATE NOCASE
+         WHERE la.visibility='VISIBLE'
+           AND ${effectiveTitle} = ? COLLATE NOCASE
+           AND ${effectiveArtist} = ? COLLATE NOCASE
          ORDER BY EXISTS(
            SELECT 1 FROM album_files WHERE album_files.album_id = a.id
          ) DESC, a.updated_at DESC, la.id
@@ -6986,6 +8406,10 @@ export class CoceanDatabase {
         : summary.artwork,
       versionCount: Number(row.version_count),
       issues: this.listLibraryIssues(id),
+      visibility:
+        (nullableString(row.visibility) as AlbumSummary["visibility"]) ??
+        "VISIBLE",
+      visibilityRevision: Number(row.visibility_revision ?? 0),
     };
   }
 
@@ -7034,6 +8458,8 @@ export class CoceanDatabase {
         row.aggregation_issues_json,
         [],
       ),
+      visibility: "VISIBLE",
+      visibilityRevision: 0,
     };
   }
 }
@@ -7295,6 +8721,28 @@ function issueIdentity(
   code: string,
 ): string {
   return `${groupId}\0${albumId ?? ""}\0${code}`;
+}
+
+function lifecycleQuarantinePath(planId: string, relativePath: string): string {
+  if (
+    !relativePath ||
+    relativePath.startsWith("/") ||
+    relativePath.includes("\\") ||
+    relativePath.includes("\0")
+  )
+    throw new LibraryLifecycleError(
+      "INVALID_LIFECYCLE_COMMAND",
+      "文件路径不在来源目录内",
+    );
+  const segments = relativePath.split("/");
+  if (
+    segments.some((segment) => !segment || segment === "." || segment === "..")
+  )
+    throw new LibraryLifecycleError(
+      "INVALID_LIFECYCLE_COMMAND",
+      "文件路径包含不安全的目录片段",
+    );
+  return `${planId}/${segments.join("/")}`;
 }
 
 function mapScanJob(row: Record<string, unknown>): ScanJob {

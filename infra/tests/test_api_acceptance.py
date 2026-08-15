@@ -163,6 +163,9 @@ class MockState:
         grouped_local_versions: bool = False,
         scan_album_issue_count: int = 0,
         detail_album_issue_count: int = 0,
+        scan_conflicts: int = 0,
+        scan_conflict_error: str = "SCAN_ALREADY_ACTIVE",
+        active_scan_items: list[dict[str, object]] | None = None,
     ):
         self.incomplete_failures = incomplete_failures
         self.bad_range = bad_range
@@ -175,6 +178,8 @@ class MockState:
             else ledger_warning_codes
         )
         self.post_requests = 0
+        self.scan_conflicts_remaining = scan_conflicts
+        self.scan_conflict_error = scan_conflict_error
         self.grouped_local_versions = grouped_local_versions
         self.detail_album_issue_count = detail_album_issue_count
         self.albums = [album_summary("one", True)]
@@ -184,6 +189,7 @@ class MockState:
         self.job = {
             "id": "scan-test",
             "rootId": "music",
+            "mode": "FULL",
             "status": "COMPLETED_WITH_WARNINGS",
             "totalFiles": 2 + failure_count,
             "processedFiles": 2 + failure_count,
@@ -194,6 +200,12 @@ class MockState:
             "finishedAt": "2026-08-12T00:00:02Z",
             "error": None,
         }
+        default_active = dict(self.job)
+        default_active["status"] = "RUNNING"
+        default_active["finishedAt"] = None
+        self.active_scan_items = (
+            [default_active] if active_scan_items is None else active_scan_items
+        )
         self.failures = [
             {
                 "relativePath": "/volume1/private/Token-Cookie.iso",
@@ -399,6 +411,16 @@ def handler_for(state: MockState) -> type[BaseHTTPRequestHandler]:
             self.rfile.read(length)
             if self.path == "/api/v1/scans":
                 state.post_requests += 1
+                if state.scan_conflicts_remaining > 0:
+                    state.scan_conflicts_remaining -= 1
+                    self.json_response(
+                        409,
+                        {
+                            "error": state.scan_conflict_error,
+                            "message": "Token=secret Cookie=secret /volume1/private",
+                        },
+                    )
+                    return
                 queued = dict(state.job)
                 queued["status"] = "QUEUED"
                 queued["totalFiles"] = 0
@@ -427,6 +449,9 @@ def handler_for(state: MockState) -> type[BaseHTTPRequestHandler]:
                         },
                     },
                 )
+                return
+            if path == "/api/v1/scans":
+                self.json_response(200, {"items": state.active_scan_items})
                 return
             if path == "/api/v1/scans/scan-test":
                 self.json_response(200, state.job)
@@ -639,6 +664,8 @@ class ApiAcceptanceTests(unittest.TestCase):
         self.assertNotIn("Cookie=secret", report_text)
         self.assertNotIn("127.0.0.1", report_text)
         self.assertNotIn("Artist/", report_text)
+        self.assertNotIn("scan-test", report_text)
+        self.assertNotIn("scan-other", report_text)
 
     def test_full_success_pages_albums_and_checks_every_track_range(self) -> None:
         state = MockState()
@@ -646,6 +673,8 @@ class ApiAcceptanceTests(unittest.TestCase):
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual(state.post_requests, 1)
         self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["policy"]["scanAcquisitionSource"], "created")  # type: ignore[index]
+        self.assertEqual(report["scan"]["acquisitionSource"], "created")  # type: ignore[index]
         self.assertEqual(report["coverage"]["albumPages"], 2)  # type: ignore[index]
         self.assertEqual(report["coverage"]["albumDetails"], 2)  # type: ignore[index]
         self.assertEqual(report["coverage"]["listenRangeResponses"], 2)  # type: ignore[index]
@@ -667,7 +696,71 @@ class ApiAcceptanceTests(unittest.TestCase):
         self.assertEqual(state.post_requests, 0)
         self.assertTrue(report["policy"]["reusedExistingScan"])  # type: ignore[index]
         self.assertTrue(report["scan"]["reusedExistingScan"])  # type: ignore[index]
+        self.assertEqual(
+            report["policy"]["scanAcquisitionSource"], "explicit-reuse"  # type: ignore[index]
+        )
+        self.assertEqual(
+            report["scan"]["acquisitionSource"], "explicit-reuse"  # type: ignore[index]
+        )
         self.assertNotIn("scan-test", report_text)
+        self.assert_report_is_private(report_text)
+
+    def test_active_scan_conflict_reuses_the_unique_music_job(self) -> None:
+        state = MockState(scan_conflicts=1)
+        process, report, report_text = self.run_acceptance(state)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(state.post_requests, 1)
+        self.assertTrue(report["policy"]["reusedExistingScan"])  # type: ignore[index]
+        self.assertEqual(
+            report["policy"]["scanAcquisitionSource"], "conflict-reuse"  # type: ignore[index]
+        )
+        self.assertEqual(
+            report["scan"]["acquisitionSource"], "conflict-reuse"  # type: ignore[index]
+        )
+        self.assert_report_is_private(report_text)
+
+    def test_disappearing_scan_conflict_retries_creation_once(self) -> None:
+        state = MockState(scan_conflicts=1, active_scan_items=[])
+        process, report, report_text = self.run_acceptance(state)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(state.post_requests, 2)
+        self.assertFalse(report["policy"]["reusedExistingScan"])  # type: ignore[index]
+        self.assertEqual(report["policy"]["scanAcquisitionSource"], "created")  # type: ignore[index]
+        self.assert_report_is_private(report_text)
+
+    def test_disappearing_scan_conflict_fails_after_bounded_retries(self) -> None:
+        state = MockState(scan_conflicts=2, active_scan_items=[])
+        process, report, report_text = self.run_acceptance(state)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(state.post_requests, 2)
+        self.assertEqual(report["failure"]["gate"], "scan-acquire")  # type: ignore[index]
+        self.assert_report_is_private(report_text)
+
+    def test_unexpected_scan_conflict_fails_closed_without_remote_message(self) -> None:
+        state = MockState(
+            scan_conflicts=1,
+            scan_conflict_error="ROOT_POLICY_CHANGED",
+        )
+        process, report, report_text = self.run_acceptance(state)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(state.post_requests, 1)
+        self.assertEqual(report["failure"]["gate"], "scan-acquire")  # type: ignore[index]
+        self.assertNotIn("ROOT_POLICY_CHANGED", report_text)
+        self.assert_report_is_private(report_text)
+
+    def test_ambiguous_active_scan_candidates_fail_closed(self) -> None:
+        first = dict(MockState().job)
+        first["status"] = "RUNNING"
+        second = dict(first)
+        second["id"] = "scan-other"
+        state = MockState(
+            scan_conflicts=1,
+            active_scan_items=[first, second],
+        )
+        process, report, report_text = self.run_acceptance(state)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(state.post_requests, 1)
+        self.assertEqual(report["failure"]["gate"], "scan-acquire")  # type: ignore[index]
         self.assert_report_is_private(report_text)
 
     def test_grouped_album_reconciles_scan_count_against_local_versions(self) -> None:

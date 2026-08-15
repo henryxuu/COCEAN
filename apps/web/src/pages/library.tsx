@@ -31,8 +31,10 @@ import {
   scheduleLibraryScrollRestore,
   type LibraryFilter,
   type LibraryIssue,
+  type LibraryState,
   type LibraryStorage,
   type LibrarySort,
+  type LibraryVisibility,
 } from "../library-state.js";
 
 type Filter = LibraryFilter;
@@ -42,7 +44,7 @@ const PAGE_SIZE = 96;
 export function LibraryPage({ canManage }: { canManage: boolean }) {
   const [searchParams, setSearchParams] = useSearchParams();
   const currentLibraryState = readLibraryState(searchParams);
-  const { query, filter, sort, issue, page } = currentLibraryState;
+  const { query, filter, sort, issue, visibility, page } = currentLibraryState;
   const currentLibraryRoute = libraryRoute(currentLibraryState);
   const restoredRoute = useRef<string | null>(null);
   const [addingPhysical, setAddingPhysical] = useState(false);
@@ -53,16 +55,9 @@ export function LibraryPage({ canManage }: { canManage: boolean }) {
   const albums = useAsync(
     async () => ({
       route: currentLibraryRoute,
-      page: await api.albumPage({
-        search: query,
-        filter,
-        sort,
-        issue,
-        limit: PAGE_SIZE,
-        offset: page * PAGE_SIZE,
-      }),
+      page: await api.albumPage(libraryAlbumQuery(currentLibraryState)),
     }),
-    [query, filter, sort, issue, page],
+    [query, filter, sort, issue, visibility, page],
   );
   const stats = useAsync(() => api.stats(), []);
   const toast = useToast();
@@ -77,6 +72,7 @@ export function LibraryPage({ canManage }: { canManage: boolean }) {
       filter: Filter;
       sort: Sort;
       issue: LibraryIssue;
+      visibility: LibraryVisibility;
       page: number;
     }>,
   ) => {
@@ -252,6 +248,26 @@ export function LibraryPage({ canManage }: { canManage: boolean }) {
           placeholder="搜索 Album、Artist"
           aria-label="搜索唱片库"
         />
+        {canManage ? (
+          <div className="filter-row" aria-label="筛选显示状态">
+            <FilterPill
+              active={visibility === "VISIBLE"}
+              onClick={() =>
+                updateLibraryState({ visibility: "VISIBLE", page: 0 })
+              }
+            >
+              日常唱片
+            </FilterPill>
+            <FilterPill
+              active={visibility === "HIDDEN"}
+              onClick={() =>
+                updateLibraryState({ visibility: "HIDDEN", page: 0 })
+              }
+            >
+              已隐藏
+            </FilterPill>
+          </div>
+        ) : null}
         <div className="filter-row" aria-label="筛选介质">
           {(
             [
@@ -374,6 +390,18 @@ export function LibraryPage({ canManage }: { canManage: boolean }) {
       <Toast message={toast.message} />
     </div>
   );
+}
+
+export function libraryAlbumQuery(state: LibraryState) {
+  return {
+    search: state.query,
+    filter: state.filter,
+    sort: state.sort,
+    issue: state.issue,
+    visibility: state.visibility,
+    limit: PAGE_SIZE,
+    offset: state.page * PAGE_SIZE,
+  };
 }
 
 export function LibraryAlbumCard({

@@ -3,11 +3,14 @@ import { CoceanDatabase } from "@cocean/database";
 import { loadWorkerConfig } from "./config.js";
 import { shouldRecoverInterruptedJobs } from "./lease.js";
 import { processNextJob, SCAN_RULES_VERSION } from "./runner.js";
+import { processNextLifecyclePlan } from "./lifecycle.js";
 
 const config = loadWorkerConfig();
 const logger = pino({ level: config.logLevel });
 const database = new CoceanDatabase(config.databasePath, {
   musicRoot: config.musicRoot,
+  musicRootPolicy: config.musicRootPolicy,
+  quarantineRoot: config.quarantineRoot,
 });
 const controller = new AbortController();
 const previousHeartbeat = database.getWorkerHeartbeat("scanner");
@@ -26,6 +29,12 @@ if (!shouldRecoverInterruptedJobs(previousHeartbeat)) {
       { recoveredJobs: recovered.map((report) => report.scanJobId) },
       "recovered interrupted scan jobs",
     );
+  const recoveredLifecyclePlans = database.recoverRunningLibraryChangePlans();
+  if (recoveredLifecyclePlans)
+    logger.warn(
+      { recoveredPlans: recoveredLifecyclePlans },
+      "recovered interrupted library lifecycle plans",
+    );
 }
 const heartbeat = () =>
   database.touchWorkerHeartbeat(
@@ -43,12 +52,13 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
 
 try {
   do {
-    const processed = await processNextJob(
-      database,
-      config,
-      logger,
-      controller.signal,
-    );
+    const processed =
+      (await processNextLifecyclePlan(
+        database,
+        config,
+        logger,
+        controller.signal,
+      )) || (await processNextJob(database, config, logger, controller.signal));
     if (config.once || controller.signal.aborted) break;
     if (!processed) await wait(config.pollMs, controller.signal);
   } while (!controller.signal.aborted);

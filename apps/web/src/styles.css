@@ -1817,6 +1817,95 @@ p {
   padding: 8px 14px;
   font-size: 11px;
 }
+.lifecycle-governance,
+.lifecycle-version-list,
+.quarantine-list {
+  display: grid;
+  gap: 10px;
+}
+.lifecycle-governance {
+  margin-bottom: 16px;
+}
+.lifecycle-visibility-row,
+.lifecycle-section-heading,
+.lifecycle-version-row,
+.quarantine-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px;
+  border-radius: var(--radius-control);
+  background: var(--bg-secondary);
+}
+.lifecycle-visibility-row > div,
+.lifecycle-section-heading > div,
+.lifecycle-version-row > div,
+.quarantine-row > div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+.lifecycle-governance p,
+.lifecycle-version-row span,
+.lifecycle-version-row small,
+.quarantine-row span,
+.quarantine-row small,
+.lifecycle-preview p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1.55;
+}
+.lifecycle-version-row > svg,
+.quarantine-row > svg {
+  flex: 0 0 auto;
+  width: 20px;
+  color: var(--text-tertiary);
+}
+.lifecycle-version-row > div,
+.quarantine-row > div {
+  flex: 1 1 auto;
+}
+.lifecycle-preview {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  background: var(--bg-elevated);
+}
+.lifecycle-blockers {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, #b42318 9%, var(--bg-secondary));
+  color: var(--danger, #b42318);
+  font-size: 10px;
+}
+.lifecycle-confirmation {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1.5;
+}
+.lifecycle-confirmation input {
+  margin-top: 2px;
+}
+.lifecycle-preview-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.quarantine-page {
+  max-width: 980px;
+}
+.quarantine-list {
+  margin-top: 18px;
+}
 .identity-governance,
 .identity-governance-readonly {
   display: grid;
@@ -3791,6 +3880,22 @@ p {
     flex-direction: column;
   }
   .management-shortcut .button {
+    width: 100%;
+  }
+  .lifecycle-visibility-row,
+  .lifecycle-section-heading,
+  .lifecycle-version-row,
+  .quarantine-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .lifecycle-version-row > svg,
+  .quarantine-row > svg {
+    display: none;
+  }
+  .lifecycle-version-row .button,
+  .quarantine-row .button,
+  .lifecycle-visibility-row .button {
     width: 100%;
   }
   .filter-pill {

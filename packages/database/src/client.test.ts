@@ -7,6 +7,7 @@ import {
   AlbumArtworkDecisionError,
   AlbumMetadataDecisionError,
   CoceanDatabase,
+  LibraryLifecycleError,
 } from "./client.js";
 import {
   createVerifiedDatabaseBackup,
@@ -226,7 +227,7 @@ describe("CoceanDatabase", () => {
           "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1",
         )
         .get(),
-    ).toEqual({ version: 19 });
+    ).toEqual({ version: 20 });
   });
 
   it("creates and independently verifies an online SQLite backup", async () => {
@@ -267,8 +268,8 @@ describe("CoceanDatabase", () => {
       expect.objectContaining({
         schema: "cocean.database-backup/v1",
         releaseVersion: "0.1.0",
-        schemaVersion: 19,
-        migrationCount: 19,
+        schemaVersion: 20,
+        migrationCount: 20,
         sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       }),
     );
@@ -504,8 +505,8 @@ describe("CoceanDatabase", () => {
         )
         .get(),
     ).toEqual({
-      version: 19,
-      name: "album_artwork_governance",
+      version: 20,
+      name: "library_lifecycle_governance",
     });
   });
 
@@ -4153,6 +4154,260 @@ describe("CoceanDatabase", () => {
     );
     expect(database.listAlbumArtworkHistory(childId)).toEqual([]);
   });
+
+  it("keeps hidden albums out of normal browsing with an immutable idempotent ledger", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    seedLifecycleVersion(database, "hidden-version");
+    const albumId = database.getAlbumSummary("hidden-version")!.id;
+    const actor = { id: "admin", displayName: "Admin" };
+    const command = {
+      action: "HIDE" as const,
+      requestId: "hide-once",
+      expectedVisibilityRevision: 0,
+    };
+    const hidden = database.applyAlbumVisibility(albumId, command, actor);
+    expect(hidden).toEqual(
+      expect.objectContaining({ visibility: "HIDDEN", visibilityRevision: 1 }),
+    );
+    expect(database.applyAlbumVisibility(albumId, command, actor)).toEqual(
+      hidden,
+    );
+    expect(database.listAlbums()).toEqual([]);
+    expect(database.listAlbums({ visibility: "HIDDEN" })).toEqual([
+      expect.objectContaining({ id: albumId, visibility: "HIDDEN" }),
+    ]);
+    expect(() =>
+      database.applyAlbumVisibility(
+        albumId,
+        { ...command, action: "RESTORE" },
+        actor,
+      ),
+    ).toThrow(LibraryLifecycleError);
+    expect(() =>
+      database.raw.prepare("DELETE FROM library_visibility_events").run(),
+    ).toThrow(/append-only/);
+    database.replaceAlbumsForRoot("music", [
+      albumInput("hidden-version", ["hidden-version-file"]),
+    ]);
+    expect(database.getAlbumSummary(albumId)).toEqual(
+      expect.objectContaining({ visibility: "HIDDEN", visibilityRevision: 1 }),
+    );
+    database.replaceAlbumsForRoot("music", []);
+    database.replaceAlbumsForRoot("music", [
+      albumInput("hidden-version", ["hidden-version-file"]),
+    ]);
+    expect(database.getAlbumSummary("hidden-version")?.id).toBe(albumId);
+    expect(
+      database.applyAlbumVisibility(
+        albumId,
+        {
+          action: "RESTORE",
+          requestId: "restore-visible",
+          expectedVisibilityRevision: 1,
+        },
+        actor,
+      ),
+    ).toEqual(expect.objectContaining({ visibility: "VISIBLE" }));
+  });
+
+  it("previews but never queues quarantine for a WATCH_ONLY root", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    seedLifecycleVersion(database, "watch-version");
+    const album = database.getAlbumSummary("watch-version")!;
+    const actor = { id: "admin", displayName: "Admin" };
+    const plan = database.createQuarantinePlan(
+      album.id,
+      {
+        requestId: "watch-preview",
+        expectedLibraryRevision: album.revision,
+        localVersionId: "watch-version",
+      },
+      actor,
+    );
+    expect(plan).toEqual(
+      expect.objectContaining({
+        status: "PREVIEWED",
+        executable: false,
+        blockers: [expect.objectContaining({ code: "WATCH_ONLY_ROOT" })],
+        fileCount: 1,
+      }),
+    );
+    expect(plan.items[0]).toEqual(
+      expect.objectContaining({
+        sourceRelativePath: "Artist/watch-version/01 Track.flac",
+        quarantineRelativePath: `${plan.id}/Artist/watch-version/01 Track.flac`,
+        sha256: "a".repeat(64),
+      }),
+    );
+    expect(() =>
+      database.confirmLibraryChangePlan(plan.id, "watch-confirm", actor),
+    ).toThrow(/只读观察目录/);
+    expect(
+      database.cancelLibraryChangePlan(plan.id, "watch-cancel", actor).status,
+    ).toBe("CANCELLED");
+    expect(database.claimNextLibraryChangePlan()).toBeNull();
+  });
+
+  it("keeps every split partition hidden", () => {
+    const database = new CoceanDatabase(":memory:", {
+      musicRootPolicy: "MANAGED",
+    });
+    open.push(database);
+    const first = albumInput("hidden-split-a", []);
+    const second = albumInput("hidden-split-b", []);
+    database.replaceAlbumsForRoot("music", [first, second]);
+    const album = database.getAlbumSummary("hidden-split-a")!;
+    const actor = { id: "admin", displayName: "Admin" };
+    database.applyAlbumVisibility(
+      album.id,
+      {
+        action: "HIDE",
+        requestId: "hide-before-split",
+        expectedVisibilityRevision: 0,
+      },
+      actor,
+    );
+    database.applyLibraryIdentityDecision(
+      album.id,
+      {
+        type: "SPLIT",
+        requestId: "split-hidden",
+        revision: album.revision,
+        partitions: [
+          { versionIds: ["hidden-split-a"] },
+          { versionIds: ["hidden-split-b"] },
+        ],
+      },
+      actor,
+    );
+    expect(database.getAlbumSummary("hidden-split-a")?.visibility).toBe(
+      "HIDDEN",
+    );
+    expect(database.getAlbumSummary("hidden-split-b")?.visibility).toBe(
+      "HIDDEN",
+    );
+  });
+
+  it("runs frozen MANAGED quarantine and restore plans and recovers interrupted work", () => {
+    const database = new CoceanDatabase(":memory:", {
+      musicRootPolicy: "MANAGED",
+    });
+    open.push(database);
+    seedLifecycleVersion(database, "managed-version");
+    const album = database.getAlbumSummary("managed-version")!;
+    const actor = { id: "admin", displayName: "Admin" };
+    const preview = database.createQuarantinePlan(
+      album.id,
+      {
+        requestId: "managed-preview",
+        expectedLibraryRevision: album.revision,
+        localVersionId: "managed-version",
+      },
+      actor,
+    );
+    expect(preview.executable).toBe(true);
+    expect(
+      database.createQuarantinePlan(
+        album.id,
+        {
+          requestId: "managed-preview",
+          expectedLibraryRevision: album.revision,
+          localVersionId: "managed-version",
+        },
+        actor,
+      ),
+    ).toEqual(preview);
+    expect(
+      database.confirmLibraryChangePlan(preview.id, "managed-confirm", actor)
+        .status,
+    ).toBe("QUEUED");
+    expect(database.claimNextLibraryChangePlan()?.status).toBe("RUNNING");
+    expect(database.recoverRunningLibraryChangePlans()).toBe(1);
+    const running = database.claimNextLibraryChangePlan()!;
+    expect(running.id).toBe(preview.id);
+    database.updateLibraryChangePlanItem(running.id, 0, {
+      status: "QUARANTINED",
+      finalSizeBytes: 100,
+      finalSha256: "a".repeat(64),
+    });
+    expect(
+      database.finishLibraryChangePlan(running.id, "SUCCEEDED").status,
+    ).toBe("SUCCEEDED");
+    const scan = database.claimNextScanJob();
+    expect(scan).toEqual(
+      expect.objectContaining({ mode: "INCREMENTAL", triggerSource: "MANUAL" }),
+    );
+    database.finishScanJob(scan!.id);
+    const stableAlbumId = album.id;
+    database.replaceAlbumsForRoot("music", []);
+    expect(database.getLibraryChangePlan(running.id)?.libraryAlbumId).toBe(
+      stableAlbumId,
+    );
+    const restore = database.createRestorePlan(
+      running.id,
+      "restore-preview",
+      actor,
+    );
+    expect(restore).toEqual(
+      expect.objectContaining({
+        action: "RESTORE_VERSION",
+        sourcePlanId: running.id,
+        executable: true,
+      }),
+    );
+    database.confirmLibraryChangePlan(restore.id, "restore-confirm", actor);
+    database.claimNextLibraryChangePlan();
+    database.updateLibraryChangePlanItem(restore.id, 0, {
+      status: "RESTORED",
+      finalSizeBytes: 100,
+      finalSha256: "a".repeat(64),
+    });
+    expect(database.finishLibraryChangePlan(restore.id, "SUCCEEDED")).toEqual(
+      expect.objectContaining({ status: "SUCCEEDED" }),
+    );
+    database.replaceAlbumsForRoot("music", [
+      albumInput("managed-version", ["managed-version-file"]),
+    ]);
+    expect(database.getAlbumSummary("managed-version")?.id).toBe(stableAlbumId);
+    expect(database.listQuarantinedLibraryVersions()).toEqual([]);
+    expect(() =>
+      database.raw.prepare("DELETE FROM library_change_plans").run(),
+    ).toThrow(/cannot be deleted/);
+  });
+
+  it("cancels a queued plan and never replays a confirm event as cancellation", () => {
+    const database = new CoceanDatabase(":memory:", {
+      musicRootPolicy: "MANAGED",
+    });
+    open.push(database);
+    seedLifecycleVersion(database, "cancel-queued-version");
+    const album = database.getAlbumSummary("cancel-queued-version")!;
+    const actor = { id: "admin", displayName: "Admin" };
+    const preview = database.createQuarantinePlan(
+      album.id,
+      {
+        requestId: "cancel-queued-preview",
+        expectedLibraryRevision: album.revision,
+        localVersionId: "cancel-queued-version",
+      },
+      actor,
+    );
+    database.confirmLibraryChangePlan(preview.id, "same-request", actor);
+    expect(() =>
+      database.cancelLibraryChangePlan(preview.id, "same-request", actor),
+    ).toThrow(/不同的取消请求/);
+    expect(database.getLibraryChangePlan(preview.id)?.status).toBe("QUEUED");
+    expect(
+      database.cancelLibraryChangePlan(
+        preview.id,
+        "cancel-after-confirm",
+        actor,
+      ).status,
+    ).toBe("CANCELLED");
+    expect(database.claimNextLibraryChangePlan()).toBeNull();
+  });
 });
 
 function createRunningScan(database: CoceanDatabase, id: string): void {
@@ -4215,6 +4470,38 @@ function observedFile(relativePath: string, sizeBytes: number) {
     artwork: [],
     warnings: [],
   };
+}
+
+function seedLifecycleVersion(
+  database: CoceanDatabase,
+  versionId: string,
+): void {
+  if (!database.getUser("admin")) {
+    const now = new Date().toISOString();
+    database.createUser(
+      {
+        id: "admin",
+        username: "admin",
+        displayName: "Admin",
+        role: "ADMIN",
+        enabled: true,
+        createdAt: now,
+        updatedAt: now,
+        lastLoginAt: null,
+      },
+      "unused-test-password-hash",
+    );
+  }
+  const scanId = `${versionId}-scan`;
+  createRunningScan(database, scanId);
+  const fileId = `${versionId}-file`;
+  database.upsertMediaFile(fileId, "music", scanId, {
+    ...observedFile(`Artist/${versionId}/01 Track.flac`, 100),
+    fileSha256: "a".repeat(64),
+    rawTags: [],
+  });
+  database.replaceAlbumsForRoot("music", [albumInput(versionId, [fileId])]);
+  database.finishScanJob(scanId);
 }
 
 function albumInput(id: string, fileIds: string[]) {

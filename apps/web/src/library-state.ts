@@ -3,6 +3,7 @@ import type { LibraryIssueCode } from "@cocean/contracts";
 export type LibraryFilter = "ALL" | "DIGITAL" | "CD" | "SACD" | "VINYL";
 export type LibrarySort = "ARTIST" | "TITLE" | "YEAR_DESC";
 export type LibraryIssue = "ALL" | LibraryIssueCode;
+export type LibraryVisibility = "VISIBLE" | "HIDDEN";
 
 const libraryIssues: LibraryIssue[] = [
   "ALL",
@@ -20,6 +21,7 @@ export interface LibraryState {
   filter: LibraryFilter;
   sort: LibrarySort;
   issue: LibraryIssue;
+  visibility: LibraryVisibility;
   page: number;
 }
 
@@ -52,6 +54,8 @@ export function readLibraryState(searchParams: URLSearchParams): LibraryState {
     issue: libraryIssues.includes(issue as LibraryIssue)
       ? (issue as LibraryIssue)
       : "ALL",
+    visibility:
+      searchParams.get("visibility") === "HIDDEN" ? "HIDDEN" : "VISIBLE",
     page,
   };
 }
@@ -62,6 +66,7 @@ export function librarySearchParams(state: LibraryState): URLSearchParams {
   if (state.filter !== "ALL") next.set("filter", state.filter);
   if (state.sort !== "ARTIST") next.set("sort", state.sort);
   if (state.issue !== "ALL") next.set("issue", state.issue);
+  if (state.visibility === "HIDDEN") next.set("visibility", "HIDDEN");
   if (state.page > 0) next.set("page", String(state.page + 1));
   return next;
 }

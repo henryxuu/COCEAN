@@ -23,6 +23,7 @@ describe("唱片库返回连续性", () => {
       filter: "DIGITAL",
       sort: "YEAR_DESC",
       issue: "IDENTITY_OVERLAP",
+      visibility: "VISIBLE",
       page: 1,
     });
     expect(libraryRoute(state)).toBe(
@@ -164,11 +165,17 @@ describe("唱片库返回连续性", () => {
       filter: "CD",
       sort: "TITLE",
       issue: "ALL",
+      visibility: "VISIBLE",
       page: 2,
     });
     expect(
       readLibraryState(new URLSearchParams("issue=NOT_A_REAL_ISSUE")).issue,
     ).toBe("ALL");
+    const hidden = readLibraryState(
+      new URLSearchParams("visibility=HIDDEN&q=hidden"),
+    );
+    expect(hidden.visibility).toBe("HIDDEN");
+    expect(libraryRoute(hidden)).toContain("visibility=HIDDEN");
   });
 
   it("过期、损坏或存储异常的恢复记录会安全失效", () => {

@@ -23,7 +23,8 @@ SHM 禁止放在 SMB、NFS 或其他网络文件系统。
 - 长任务只在短事务中更新状态，不得持有数据库锁进行 ffprobe 或网络请求；
 - Worker 使用心跳供容器健康检查，扫描失败逐文件持久化；
 - 原始文件级备份前停止 Server/Worker，或使用 SQLite online backup；
-- Music 始终独立只读挂载，数据库与缓存不得写入 Music；
+- Music 始终独立挂载，Server 只读；Worker 在默认 WATCH_ONLY 下只读，只有显式授权的
+  MANAGED Root 才受控读写，数据库、缓存与隔离区仍不得写入 Music；
 - 数据量、多用户写并发或远程 HA 需求出现后，通过新 ADR 评估 PostgreSQL，
   不在 v1 预先引入。
 
