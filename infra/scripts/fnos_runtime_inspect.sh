@@ -145,4 +145,4 @@ fi
 provider_id=$(compose --profile providers ps -aq provider-qobuz 2>/dev/null | awk 'NF {print; exit}')
 [ -z "$provider_id" ] || fail "disabled Qobuz Provider has a container"
 
-printf 'runtime-inspect: PASS (3 healthy bounded core services; Music read-only; Provider absent)\n'
+printf 'runtime-inspect: PASS (3 healthy bounded core services; Music policy=%s; Provider absent)\n' "$music_root_policy"

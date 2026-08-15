@@ -1,17 +1,19 @@
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
 import {
   access,
-  copyFile,
   mkdir,
   mkdtemp,
   readFile,
   rm,
+  stat,
   symlink,
   unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import pino from "pino";
 import { afterEach, describe, expect, it } from "vitest";
 import { CoceanDatabase } from "@cocean/database";
@@ -19,6 +21,7 @@ import type { WorkerConfig } from "./config.js";
 import { processNextLifecyclePlan } from "./lifecycle.js";
 
 const temporaryDirectories: string[] = [];
+const execFileAsync = promisify(execFile);
 
 afterEach(async () => {
   await Promise.all(
@@ -32,6 +35,7 @@ describe("library lifecycle worker", () => {
   it("quarantines and restores one frozen local version without overwriting", async () => {
     const fixture = await lifecycleFixture();
     const { database, config, sourcePath, bytes, albumId, versionId } = fixture;
+    const originalMtime = (await stat(sourcePath, { bigint: true })).mtimeNs;
     const actor = { id: "admin", displayName: "Admin" };
     const album = database.getAlbumSummary(albumId)!;
     const preview = database.createQuarantinePlan(
@@ -59,6 +63,9 @@ describe("library lifecycle worker", () => {
     );
     await expect(access(sourcePath)).rejects.toThrow();
     expect(await readFile(quarantinePath)).toEqual(bytes);
+    expect((await stat(quarantinePath, { bigint: true })).mtimeNs).toBe(
+      originalMtime,
+    );
     expect(database.getLibraryChangePlan(preview.id)?.status).toBe("SUCCEEDED");
 
     const scan = database.claimNextScanJob();
@@ -75,7 +82,7 @@ describe("library lifecycle worker", () => {
     );
     // Simulate a crash after the verified restore copy and quarantine unlink,
     // but before the item status transaction commits.
-    await copyFile(quarantinePath, sourcePath);
+    await execFileAsync("/bin/cp", ["-p", quarantinePath, sourcePath]);
     await unlink(quarantinePath);
     await processNextLifecyclePlan(
       database,
@@ -84,6 +91,9 @@ describe("library lifecycle worker", () => {
       new AbortController().signal,
     );
     expect(await readFile(sourcePath)).toEqual(bytes);
+    expect((await stat(sourcePath, { bigint: true })).mtimeNs).toBe(
+      originalMtime,
+    );
     await expect(access(quarantinePath)).rejects.toThrow();
     expect(database.getLibraryChangePlan(restore.id)?.status).toBe("SUCCEEDED");
     database.close();

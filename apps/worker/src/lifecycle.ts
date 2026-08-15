@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
 import { createReadStream } from "node:fs";
 import {
   access,
@@ -12,6 +13,7 @@ import {
   unlink,
 } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { promisify } from "node:util";
 import type { Logger } from "pino";
 import type {
   LibraryChangePlan,
@@ -28,6 +30,8 @@ interface FileIdentity {
   sha256: string | null;
   error: string | null;
 }
+
+const execFileAsync = promisify(execFile);
 
 export async function processNextLifecyclePlan(
   database: CoceanDatabase,
@@ -301,12 +305,18 @@ async function executeItem(
         : item.sourceRelativePath,
     );
     await copyFile(undesiredPath, desiredPath, constants.COPYFILE_EXCL);
+    await preserveTimestamps(undesiredPath, desiredPath);
     const copied = await identity(desiredPath);
     if (copied.sizeBytes !== item.sizeBytes || copied.sha256 !== expected)
       return { status: "CONFLICT", error: "复制后的文件校验失败" };
     const unchanged = await identity(undesiredPath);
     if (unchanged.sizeBytes !== item.sizeBytes || unchanged.sha256 !== expected)
       return { status: "CONFLICT", error: "复制期间来源文件发生变化" };
+    if (
+      (await mtimeNanoseconds(undesiredPath)) !==
+      (await mtimeNanoseconds(desiredPath))
+    )
+      return { status: "CONFLICT", error: "复制期间来源文件时间戳发生变化" };
     const beforeDelete = await lstat(undesiredPath);
     if (
       !beforeDelete.isFile() ||
@@ -327,6 +337,20 @@ async function executeItem(
     finalSha256: final.sha256,
     error: null,
   };
+}
+
+async function preserveTimestamps(
+  sourcePath: string,
+  destinationPath: string,
+): Promise<void> {
+  await execFileAsync("/usr/bin/touch", ["-r", sourcePath, destinationPath], {
+    timeout: 5_000,
+    windowsHide: true,
+  });
+}
+
+async function mtimeNanoseconds(path: string): Promise<bigint> {
+  return (await stat(path, { bigint: true })).mtimeNs;
 }
 
 async function inspect(
