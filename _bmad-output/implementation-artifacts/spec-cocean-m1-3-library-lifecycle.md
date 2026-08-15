@@ -1,14 +1,14 @@
 ---
-title: 'M1.3 唱片生命周期与安全删除'
-type: 'feature'
-created: '2026-08-15'
-status: 'done'
+title: "M1.3 唱片生命周期与安全删除"
+type: "feature"
+created: "2026-08-15"
+status: "done"
 review_loop_iteration: 2
-baseline_commit: '7d3c506bd1dad429d044f33588959dbc970dc67b'
+baseline_commit: "7d3c506bd1dad429d044f33588959dbc970dc67b"
 context:
-  - '{project-root}/_bmad-output/specs/spec-cocean-m1-3-library-lifecycle/SPEC.md'
-  - '{project-root}/_bmad-output/specs/spec-cocean-m1-3-library-lifecycle/lifecycle-model.md'
-  - '{project-root}/docs/architecture/COCEAN_V1_IMPLEMENTATION_CONTRACT.md'
+  - "{project-root}/_bmad-output/specs/spec-cocean-m1-3-library-lifecycle/SPEC.md"
+  - "{project-root}/_bmad-output/specs/spec-cocean-m1-3-library-lifecycle/lifecycle-model.md"
+  - "{project-root}/docs/architecture/COCEAN_V1_IMPLEMENTATION_CONTRACT.md"
 ---
 
 <frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
@@ -29,12 +29,12 @@ context:
 
 ## I/O & Edge-Case Matrix
 
-| Scenario | Input / State | Expected Output / Behavior | Error Handling |
-| --- | --- | --- | --- |
-| 隐藏/恢复 | revision + requestId | 默认隐藏、管理视图可找回，重扫保持 | 陈旧或异指纹请求 409 |
-| 计划预览 | 单 Root LocalVersion | 返回精确成员、字节、目标、影响和阻塞；零副作用 | WATCH_ONLY、跨 Root、缺 SHA 或活动任务不可执行 |
-| 隔离/恢复 | 有效 MANAGED 计划 | 全成员移动并复验，成功后增量对账 | 计划过期、只读、漂移或目标存在时不覆盖 |
-| 中断恢复 | 两端混合状态 | 按逐项哈希续跑或进入 RECOVERY_REQUIRED | 两端均有/均无/哈希异常时保留事实并停止 |
+| Scenario  | Input / State        | Expected Output / Behavior                     | Error Handling                                 |
+| --------- | -------------------- | ---------------------------------------------- | ---------------------------------------------- |
+| 隐藏/恢复 | revision + requestId | 默认隐藏、管理视图可找回，重扫保持             | 陈旧或异指纹请求 409                           |
+| 计划预览  | 单 Root LocalVersion | 返回精确成员、字节、目标、影响和阻塞；零副作用 | WATCH_ONLY、跨 Root、缺 SHA 或活动任务不可执行 |
+| 隔离/恢复 | 有效 MANAGED 计划    | 全成员移动并复验，成功后增量对账               | 计划过期、只读、漂移或目标存在时不覆盖         |
+| 中断恢复  | 两端混合状态         | 按逐项哈希续跑或进入 RECOVERY_REQUIRED         | 两端均有/均无/哈希异常时保留事实并停止         |
 
 </frozen-after-approval>
 
@@ -52,6 +52,7 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
+
 - [x] `packages/contracts/src/lifecycle.ts`、`migrations.ts` -- 建立 schema 20、命令与不可变账本。
 - [x] `packages/database/src/client.ts` -- 实现显示状态、计划快照、并发、阻塞、逐项进度与过滤。
 - [x] `apps/worker/src/lifecycle.ts` -- 实现复验、隔离/恢复、重启判定和对账。
@@ -60,6 +61,7 @@ context:
 - [x] `infra/**`、`**/*.test.*` -- 默认只读部署合同及全部正负回归。
 
 **Acceptance Criteria:**
+
 - Given WATCH_ONLY 或实际只读 Root，when 管理员尝试隔离，then 系统明确拒绝且源文件、数据库活动版本和设备副本不变。
 - Given 有效 MANAGED QA 版本，when 隔离后恢复，then 文件数/字节/哈希一致，Album ID、字段、封面与历史保持。
 - Given Worker 在中途退出，when 重启处理同一计划，then 已移动成员不重复覆盖，剩余成员安全续跑或计划进入 RECOVERY_REQUIRED。
@@ -71,14 +73,17 @@ context:
 - 2026-08-15：完成 schema 20、显示治理、冻结计划、Worker 隔离/恢复、角色安全 API、隔离区与 FNOS 默认只读合同。
 - 2026-08-15：三路对抗评审后补强冻结 Root 身份、运行时权限/任务/actor 复验、未知目标拒绝、双端冲突、恢复断点收敛、排队取消与预览过期。
 - 2026-08-15：补齐隐藏管理视图、全局隔离区、状态/时间/失败筛选、异常计划重新核验、隐藏拆分继承、身份/投送互斥、MEMBER 错误脱敏与 MANAGED 运行检查。
+- 2026-08-15：增加真实 FNOS 双栈验收手册；生产只做 schema 20 + WATCH_ONLY，首次 MANAGED 文件写仅在完全隔离的临时 QA 栈执行。
 - 保留限制：Node 路径 API 无法提供 Linux `openat2`/`unlinkat` 级目录句柄原子性；已采用 realpath、逐级符号链接、COPYFILE_EXCL、哈希与 inode 复验缩小窗口，真实 MANAGED 部署仍需受控单写者验收。
 
 ## Verification
 
 **Commands:**
+
 - `pnpm check` -- 全仓类型、测试与生产构建通过；Contracts 5、Recommendation 14、Catalog Recommendation 3、Catalog Sources 2、Media Scanner 38（默认跳过真实媒体 10）、Still 2、Database 64、Worker 78、Server 56、Web 59。
 - `sh packages/media-scanner/tests/run-generated-integration.sh` -- 生成媒体 10/10，通过并清理 fixture。
 - `sh infra/tests/run.sh` -- Python acceptance 24/24、preflight/finalize mock、WATCH_ONLY/MANAGED runtime mount mock 与 7 服务 Compose 合同通过。
+- `docs/deployment/FNOS_M1_3_LIFECYCLE_ACCEPTANCE.md` -- 已定义生产只读升级、隔离 QA 栈、正向隔离/恢复、失败关闭矩阵与证据收口；待单独授权后执行。
 - `git diff --check` 与 Prettier -- 补丁和格式通过。
 - 未执行真实 FNOS schema 20、真实 Music MANAGED/隔离/恢复；这些仍属于 Ask First，不能由本地 Gate 替代。
 

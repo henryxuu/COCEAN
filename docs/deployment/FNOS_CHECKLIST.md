@@ -3,13 +3,14 @@
 ## 部署前
 
 - [ ] 已记录 FNOS 版本、CPU 架构、Docker Engine 与 Compose 版本。
-- [ ] 已确认 Music、data、cache、inbox、delivery 的真实绝对路径。
-- [ ] Music 是现有目录且容器账号只有读与遍历权限。
-- [ ] data/cache/inbox/delivery 已存在，UID/GID 与权限匹配。
+- [ ] 已确认 Music、quarantine、data、cache、inbox、delivery 的真实绝对路径。
+- [ ] 默认 WATCH_ONLY 的 Music 是现有目录且容器账号只有读与遍历权限；MANAGED 仅用于另行授权的独立 Root。
+- [ ] quarantine/data/cache/inbox/delivery 已存在，UID/GID 与权限匹配。
+- [ ] quarantine 位于 Music 之外，与其他目录互不相同、互不包含。
 - [ ] SQLite、WAL 和 SHM 只写入 data，不进入 Music 或 cache。
 - [ ] data 位于 FNOS 本机文件系统，不是 SMB/NFS 网络挂载。
 - [ ] 仅 Web 端口发布到局域网；数据库和 API 没有主机端口。
-- [ ] 已用 `generate_web_auth.sh` 生成独立的首位管理员 bootstrap 文件，文件不在 Music/data/cache/inbox/delivery 内，未把密码写入 `.env`、日志或 Issue。
+- [ ] 已用 `generate_web_auth.sh` 生成独立的首位管理员 bootstrap 文件，文件不在 Music/quarantine/data/cache/inbox/delivery 内，未把密码写入 `.env`、日志或 Issue。
 - [ ] 浏览器显示独立登录页；错误凭据返回 401，成功后使用 HttpOnly Session Cookie，`/healthz` 保持无凭据可用。
 - [ ] 管理员可创建独立成员账号，浏览器可保存各自密码；数据库不保存明文登录密码。
 - [ ] Web 端口未通过端口转发、UPnP 或无 TLS 的反向代理直接暴露公网；纯 HTTP 不能加密登录链路。
@@ -17,7 +18,7 @@
 - [ ] `docker compose config --quiet` 或仓库静态检查通过。
 - [ ] `fnos_preflight.sh` 返回 0，Compose >= 2.20，core/acceptance/maintenance/providers 四个 profile 均可展开。
 - [ ] `COCEAN_VERSION` 是不可变发行标签，不是 edge/latest/dev。
-- [ ] 五个目录存在且互不相同、互不包含；没有把 data/cache/inbox/delivery 放进 Music。
+- [ ] 六个目录存在且互不相同、互不包含；没有把 quarantine/data/cache/inbox/delivery 放进 Music。
 - [ ] `COCEAN_SCAN_EXCLUDE_DIRS` 中每一项都已人工确认不含真实音频；路径精确、区分大小写、非 symlink，且 Worker、manifest、API 验收使用同一策略。
 - [ ] 容器化 PUID/PGID 权限探针通过，且 PUID/PGID 均不为 0。
 - [ ] 升级前 runner 已生成并复核 `data/backups/pre-upgrade-*.sqlite` 与同名 JSON；初次安装明确记录“无旧库”。
@@ -123,3 +124,16 @@
 - [ ] 回退前先保存失败现场并再次 verify 目标快照；恢复数据库与旧镜像版本由管理员显式执行。
 - [ ] 健康检查全部通过后才视为升级完成。
 - [ ] 回滚不要求修改或重扫 Music 主库。
+
+## M1.3 生命周期验收
+
+- [ ] 生产栈升级 schema 20 时继续保持 `WATCH_ONLY` 与 Music 只读挂载。
+- [ ] 首次 MANAGED 写验收使用独立临时 QA 栈和测试音乐目录，不使用 Music 主库。
+- [ ] QA Root、QA quarantine、QA data/cache/inbox/delivery 与生产目录完全分离。
+- [ ] 隔离前计划精确显示 LocalVersion、文件数、总字节数和阻塞原因。
+- [ ] 隔离后逐文件 SHA-256 与冻结清单一致，源目录无对应文件且隔离区文件完整。
+- [ ] 恢复后原路径、大小和 SHA-256 全部恢复，隔离副本消失且不覆盖未知文件。
+- [ ] 人为制造目标占用、WATCH_ONLY 和 Worker 中断时分别拒绝、保留或进入可恢复状态。
+- [ ] 隐藏唱片可从“已隐藏”管理视图恢复，重扫不使人工状态丢失。
+- [ ] Music 主库和 SP3000M/设备目录的 before/after manifest 完全一致。
+- [ ] 永久删除入口仍不存在，隔离文件没有自动过期或清理任务。

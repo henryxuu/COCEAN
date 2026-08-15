@@ -15,18 +15,20 @@ infra/compose/fnos/compose.yaml
 
 ## 服务边界
 
-| 服务             | 默认启用 | 职责                                           | 主机端口       | 可写目录              |
-| ---------------- | -------- | ---------------------------------------------- | -------------- | --------------------- |
-| `web`            | 是       | 响应式 Web/PWA 与同源 `/api` 反向代理          | `18080` 可配置 | 无                    |
-| `server`         | 是       | API、登录、详情、试听转码与 FTP/USB 投送       | 无             | data、cache、delivery |
-| `worker`         | 是       | 扫描、标签解析、封面提取、任务执行             | 无             | data、cache、inbox    |
-| `provider-qobuz` | 否       | 预留占位；当前固定为零副本且不可启动           | 无             | 无                    |
-| `music-manifest` | 否       | 扫描前后只读不变性验收                         | 无             | data 中的验收目录     |
-| `acceptance-api` | 否       | 全库扫描、账本、专辑、详情、封面与 Listen 验收 | 无             | data 中的聚合报告     |
-| `db-maintenance` | 否       | 迁移前 SQLite online backup 与独立复核         | 无             | data 中的备份目录     |
+| 服务             | 默认启用 | 职责                                           | 主机端口       | 可写目录                                               |
+| ---------------- | -------- | ---------------------------------------------- | -------------- | ------------------------------------------------------ |
+| `web`            | 是       | 响应式 Web/PWA 与同源 `/api` 反向代理          | `18080` 可配置 | 无                                                     |
+| `server`         | 是       | API、登录、详情、试听转码与 FTP/USB 投送       | 无             | data、cache、delivery                                  |
+| `worker`         | 是       | 扫描、标签解析、封面提取、任务执行             | 无             | data、cache、inbox、quarantine；MANAGED 时条件写 Music |
+| `provider-qobuz` | 否       | 预留占位；当前固定为零副本且不可启动           | 无             | 无                                                     |
+| `music-manifest` | 否       | 扫描前后只读不变性验收                         | 无             | data 中的验收目录                                      |
+| `acceptance-api` | 否       | 全库扫描、账本、专辑、详情、封面与 Listen 验收 | 无             | data 中的聚合报告                                      |
+| `db-maintenance` | 否       | 迁移前 SQLite online backup 与独立复核         | 无             | data 中的备份目录                                      |
 
-`server` 与 `worker` 都只能把真实音乐库看到成 `/library/music:ro`。当前只有
-`worker` 能写 `/library/inbox`。容器不使用
+默认 `WATCH_ONLY` 下，`server` 与 `worker` 都只能把真实音乐库看到成
+`/library/music:ro`。只有部署者显式设置 `COCEAN_MUSIC_ROOT_POLICY=MANAGED`、
+`COCEAN_MUSIC_READ_ONLY=false` 并通过前检时，Worker 才把该测试 Root 挂为读写；
+Server 始终只读。Worker 可写独立 `/library/inbox` 与 `/library/quarantine`。容器不使用
 `privileged`、不使用 host network，也不接触磁盘设备或负责安全弹出。
 只有 Server 连接不发布端口的 `egress` bridge，为将来的显式元数据核验提供
 出站能力；执行本地扫描的 Worker 没有外联网络，Qobuz 占位服务与 `music-manifest`
@@ -44,7 +46,8 @@ Session Cookie，密码在数据库中只保存 scrypt 加盐哈希。管理员�
 
 纯 HTTP 仍不能加密登录链路，因此 Web 端口只能位于可信局域网，禁止直接映射到
 公网；跨网访问必须由 FNOS 反向代理或独立网关提供 TLS，并把
-`COCEAN_COOKIE_SECURE=true`。该访问边界不改变 Music 的只读挂载策略。
+`COCEAN_COOKIE_SECURE=true`。该访问边界本身不会授予 MANAGED 权限；Music 默认仍按
+WATCH_ONLY 只读挂载，只有另行授权并显式配置的 MANAGED Root 才允许 Worker 受控读写。
 
 ## MusicBrainz 可选访问与隐私边界
 
@@ -94,15 +97,16 @@ MusicBrainz 发行版候选搜索、候选持久化和人工确认；它不会�
 
 ## FNOS 目录和权限准备
 
-先在飞牛管理界面确认真实绝对路径，不要猜测卷名。至少准备五个生命周期不同的
+先在飞牛管理界面确认真实绝对路径，不要猜测卷名。至少准备六个生命周期不同的
 目录，以及一个独立 secret 文件：
 
 1. Music：现有主库，只读；
-2. data：SQLite 数据库、应用状态、内容包与验收清单；
-3. cache：可重新生成的封面、指纹和刮削缓存；
-4. inbox：新下载或导入内容的隔离区；
-5. delivery：供 FNOS 显式挂载 U 盘的可写投送目录；没有 U 盘时也应先准备空目录；
-6. 首位管理员 bootstrap secret：只读的一行 `owner:password`，必须位于上述五个目录之外；
+2. quarantine：COCEAN 生命周期隔离区，必须位于 Music 之外；
+3. data：SQLite 数据库、应用状态、内容包与验收清单；
+4. cache：可重新生成的封面、指纹和刮削缓存；
+5. inbox：新下载或导入内容的暂存区；
+6. delivery：供 FNOS 显式挂载 U 盘的可写投送目录；没有 U 盘时也应先准备空目录；
+7. 首位管理员 bootstrap secret：只读的一行 `owner:password`，必须位于上述六个目录之外；
 
 如果部署者有权使用 Still 精品目录，先按
 `docs/catalog/STILL_CATALOG_IMPORT.md` 在可信开发机生成运行包，再将最终文件放到
@@ -110,7 +114,7 @@ MusicBrainz 发行版候选搜索、候选持久化和人工确认；它不会�
 `/var/lib/cocean/still-catalog.json`；不要把目录文件放进 Music，也不要在镜像中重新分发。
 
 在 NAS 终端用 `id` 确认运行应用的 PUID/PGID，并让该账号对 Music 只有读和
-遍历权限，对 data/cache/inbox/delivery 有读写权限。SQLite 位于
+遍历权限，对 quarantine/data/cache/inbox/delivery 有读写权限。SQLite 位于
 `data/cocean.sqlite`，WAL 与 SHM 文件也只会写入 data，不会进入 Music。
 data 必须位于 FNOS 本机文件系统，不能放在 SMB、NFS 或其他不保证 SQLite
 锁与 WAL 语义的网络文件系统上。Server 负责先执行迁移，Worker 只在 Server
@@ -145,7 +149,7 @@ sh infra/scripts/generate_web_auth.sh \
 
 把生成文件的绝对路径填入 `.env` 的 `COCEAN_WEB_AUTH_FILE`。该名称为部署兼容键，
 文件只挂到 Server 用于首次建号。前检会验证它是非 symlink 的单行普通文件、密码至少
-16 字符，并拒绝它位于 Music/data/cache/inbox/delivery
+16 字符，并拒绝它位于 Music/quarantine/data/cache/inbox/delivery
 内部；实际凭据内容不会打印。
 
 将 `.env` 中所有 `/replace/with/...` 替换为 FNOS 显示的现有绝对路径。
@@ -249,11 +253,12 @@ sh infra/scripts/fnos_preflight.sh \
 ```
 
 它会 fail-closed 检查 Compose >= 2.20、core/acceptance/maintenance/providers 四种 profile、
-不可变镜像标签、非 0 PUID/PGID、五个目录存在且互不包含、隔离的首位管理员
+不可变镜像标签、非 0 PUID/PGID、六个目录存在且互不包含、隔离的首位管理员
 secret、data 不是已知网络
 文件系统、amd64/arm64 架构、Web 端口冲突，并在隔离容器中按配置 UID/GID 验证
-Music 可读与 data/cache/inbox/delivery 可写。权限探针只在四个可写目录创建并立即删除随机
-sentinel；不会写 Music，也不会打印真实主机路径。若无法证明文件系统类型或权限，
+Music 可读与 quarantine/data/cache/inbox/delivery 可写。权限探针只在五个固定可写目录
+创建并立即删除随机 sentinel；WATCH_ONLY 不会写 Music，MANAGED 则会额外验证 Music
+可写，也不会打印真实主机路径。若无法证明文件系统类型或权限，
 前检会失败，而不是降级为警告。
 
 使用本地源码构建并启动核心服务：
@@ -300,7 +305,8 @@ sh infra/scripts/fnos_acceptance.sh \
 4. 若旧数据库存在，创建并复核 online backup；备份失败时禁止启动新 Server；
 5. `docker compose up -d --wait`，等待 Web、Server、Worker 全部 healthy；
 6. 检查实际容器的非 root 用户、只读 rootfs、`cap_drop: ALL`、
-   `no-new-privileges`、Music `RW=false`、Server/Worker 网络差异、Worker ffprobe，
+   `no-new-privileges`、Server Music 始终 `RW=false`、Worker Music 挂载与 Root Policy
+   一致、Server/Worker 网络差异、Worker ffprobe，
    并证明 Qobuz Provider 没有容器；
 7. 启动一次性 `acceptance-api` 完成全库 API 验收；
 8. 无论镜像准备、备份、部署、运行态检查或 API 验收成功、失败还是收到终止信号，都再次核验 baseline 自身
