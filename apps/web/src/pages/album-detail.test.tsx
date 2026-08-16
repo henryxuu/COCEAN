@@ -561,6 +561,7 @@ describe("Album 详情身份治理", () => {
   it("为管理员提供确认、设主、拆分和合并入口并明确不修改 NAS", () => {
     const album = {
       id: "library-manual",
+      addedAt: "2026-08-12T00:00:00.000Z",
       title: "Manual Album",
       albumArtist: "Artist",
       year: 2026,
@@ -826,6 +827,7 @@ function mountedOrphanPreview() {
 function mountedOrphanAlbum(): AlbumDetail {
   return {
     id: "mounted-library",
+    addedAt: "2026-08-12T00:00:00.000Z",
     title: "Mounted",
     albumArtist: "Artist",
     year: null,
@@ -952,6 +954,7 @@ describe("Album 详情完整性与兼容展示", () => {
     expect(physical).not.toContain("实体收藏<!-- --> · <!-- -->托管");
     const legacy = legacyLocalVersions({
       id: "legacy",
+      addedAt: "2026-08-12T00:00:00.000Z",
       title: "Legacy",
       albumArtist: "Artist",
       year: 2020,

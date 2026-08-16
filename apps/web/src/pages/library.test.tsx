@@ -124,6 +124,7 @@ describe("唱片库页面返回接线", () => {
 
 const album: AlbumSummary = {
   id: "album-schubert",
+  addedAt: "2026-08-12T00:00:00.000Z",
   title: "String Quintet",
   albumArtist: "Franz Schubert",
   year: 2007,

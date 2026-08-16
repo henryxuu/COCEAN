@@ -239,6 +239,11 @@ describe("COCEAN HTTP API", () => {
         title: "Healthy Album",
       },
     ]);
+    const addedAt = "2025-07-08T09:10:11.000Z";
+    const storedGroupId = database.getAlbumSummary("shared-a")!.id;
+    database.raw
+      .prepare("UPDATE library_albums SET created_at=? WHERE id=?")
+      .run(addedAt, storedGroupId);
     const app = await buildApp({ config: testConfig(), database });
     close.push(
       () => app.close(),
@@ -256,6 +261,7 @@ describe("COCEAN HTTP API", () => {
         total: 1,
         items: [
           expect.objectContaining({
+            addedAt,
             title: "Shared Album",
             versionCount: 2,
             issues: expect.arrayContaining([
@@ -275,6 +281,8 @@ describe("COCEAN HTTP API", () => {
     ]);
     expect(legacyDetail.statusCode, legacyDetail.body).toBe(200);
     expect(groupedDetail.statusCode, groupedDetail.body).toBe(200);
+    expect(legacyDetail.json().addedAt).toBe(addedAt);
+    expect(groupedDetail.json().addedAt).toBe(addedAt);
     expect(legacyDetail.json().id).toBe(groupedAlbumId);
     expect(legacyDetail.json()).toEqual(groupedDetail.json());
   });

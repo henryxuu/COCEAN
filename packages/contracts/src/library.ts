@@ -462,8 +462,11 @@ export type AlbumArtworkMutationResult = z.infer<
   typeof albumArtworkMutationResultSchema
 >;
 
+export const albumAddedAtSchema = z.iso.datetime({ offset: false });
+
 export const albumSummarySchema = z.object({
   id: z.string(),
+  addedAt: albumAddedAtSchema,
   title: z.string(),
   albumArtist: z.string(),
   year: z.number().int().nullable(),

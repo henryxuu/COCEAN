@@ -90,6 +90,7 @@ const baseAlbums: Array<
 
 export const demoAlbums: AlbumSummary[] = baseAlbums.map((album, index) => ({
   ...album,
+  addedAt: new Date(Date.UTC(2026, 7, 12 - index)).toISOString(),
   artwork: {
     source: "NONE",
     url: null,

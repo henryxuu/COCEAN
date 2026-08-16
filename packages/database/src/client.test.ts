@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { appendFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import BetterSqlite3 from "better-sqlite3";
+import { albumAddedAtSchema } from "@cocean/contracts";
 import {
   AlbumArtworkDecisionError,
   AlbumMetadataDecisionError,
@@ -244,6 +245,25 @@ describe("CoceanDatabase", () => {
         )
         .get(),
     ).toEqual({ version: 21 });
+    expect(database.getAlbumSummary("legacy-art")?.addedAt).toBe(
+      "2026-08-14T00:00:00.000Z",
+    );
+    expect(
+      (
+        database.raw
+          .prepare("PRAGMA table_info(library_albums)")
+          .all() as Array<{
+          name: string;
+        }>
+      ).some((column) => column.name === "added_at"),
+    ).toBe(false);
+    open.splice(open.indexOf(database), 1);
+    database.close();
+    const reopened = new CoceanDatabase(path);
+    open.push(reopened);
+    expect(reopened.getAlbumSummary("legacy-art")?.addedAt).toBe(
+      "2026-08-14T00:00:00.000Z",
+    );
   });
 
   it("upgrades schema 20 to additive schema 21 without rewriting library data", async () => {
@@ -268,9 +288,26 @@ describe("CoceanDatabase", () => {
                  1,0,'[]','UNMATCHED',?,?)`,
       )
       .run("2026-08-16T00:00:00.000Z", "2026-08-16T00:00:00.000Z");
+    const schema20AddedAt = "2025-05-06T07:08:09.000Z";
+    legacy
+      .prepare(
+        `INSERT INTO library_albums
+         (id,identity_key,title,album_artist,primary_version_id,decision_source,
+          primary_version_source,revision,created_at,updated_at)
+         VALUES ('schema20-library',?,'Schema 20','Artist','schema20-version',
+                 'AUTOMATIC','AUTOMATIC',0,?,?)`,
+      )
+      .run("artist\0schema 20", schema20AddedAt, schema20AddedAt);
+    legacy
+      .prepare(
+        `INSERT INTO library_album_members
+         (library_album_id,album_id,relationship_status,created_at,updated_at)
+         VALUES ('schema20-library','schema20-version','AUTO_CANDIDATE',?,?)`,
+      )
+      .run(schema20AddedAt, schema20AddedAt);
     legacy.close();
 
-    const database = new CoceanDatabase(path);
+    let database = new CoceanDatabase(path);
     open.push(database);
     expect(
       database.raw
@@ -300,6 +337,16 @@ describe("CoceanDatabase", () => {
         .prepare("PRAGMA foreign_key_list(library_orphan_governance_events)")
         .all(),
     ).toEqual([]);
+    expect(database.getAlbumSummary("schema20-library")?.addedAt).toBe(
+      schema20AddedAt,
+    );
+    open.splice(open.indexOf(database), 1);
+    database.close();
+    database = new CoceanDatabase(path);
+    open.push(database);
+    expect(database.getAlbumSummary("schema20-library")?.addedAt).toBe(
+      schema20AddedAt,
+    );
     const insertEvent = database.raw.prepare(
       `INSERT INTO library_orphan_governance_events
        (id,request_id,local_version_id,status,action,actor_id,
@@ -2405,6 +2452,373 @@ describe("CoceanDatabase", () => {
     );
   });
 
+  it("persists the earliest member time and keeps addedAt isolated from mutable album facts", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cocean-added-at-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "cocean.sqlite");
+    let database = new CoceanDatabase(path);
+    open.push(database);
+    const observed = (id: string, year: number) => ({
+      ...albumInput(id, []),
+      title: "Stable Added At",
+      albumArtist: "Artist",
+      year,
+    });
+    const firstMemberAt = "2026-02-03T04:05:06.000Z";
+    const secondMemberAt = "2026-01-02T03:04:05.000Z";
+    const stableAddedAt = "2025-12-01T00:00:00.000Z";
+    database.replaceAlbumsForRoot("music", [
+      observed("added-first", 2001),
+      observed("added-second", 2002),
+    ]);
+    database.raw
+      .prepare(
+        `UPDATE albums SET created_at=CASE id
+           WHEN 'added-first' THEN ? WHEN 'added-second' THEN ? ELSE created_at END`,
+      )
+      .run(firstMemberAt, secondMemberAt);
+    database.raw.prepare("DELETE FROM library_albums").run();
+    open.splice(open.indexOf(database), 1);
+    database.close();
+    database = new CoceanDatabase(path);
+    open.push(database);
+
+    const initial = database.getAlbumSummary("added-first")!;
+    expect(initial.primaryVersionId).toBe("added-first");
+    expect(initial.addedAt).toBe(secondMemberAt);
+    database.raw
+      .prepare("UPDATE library_albums SET created_at=? WHERE id=?")
+      .run(stableAddedAt, initial.id);
+    const expectStableAddedAt = () => {
+      expect(database.listAlbums()).toEqual([
+        expect.objectContaining({ id: initial.id, addedAt: stableAddedAt }),
+      ]);
+      expect(database.getAlbum(initial.id)?.addedAt).toBe(stableAddedAt);
+      expect(database.getAlbumSummary("added-first")?.addedAt).toBe(
+        stableAddedAt,
+      );
+      expect(database.getAlbumSummary("added-second")?.addedAt).toBe(
+        stableAddedAt,
+      );
+    };
+    expectStableAddedAt();
+
+    database.raw
+      .prepare("UPDATE albums SET created_at='not-a-date' WHERE id=?")
+      .run("added-first");
+    expect(() =>
+      database.replaceAlbumsForRoot("music", [
+        observed("added-first", 2011),
+        observed("added-second", 2012),
+      ]),
+    ).not.toThrow();
+    expectStableAddedAt();
+    const afterRescan = database.getAlbumSummary(initial.id)!;
+    database.applyAlbumMetadata(
+      initial.id,
+      {
+        requestId: "added-at-metadata",
+        expectedMetadataRevision: afterRescan.metadataRevision ?? 0,
+        commands: [{ action: "SET", field: "title", value: "Curated" }],
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    expectStableAddedAt();
+    database.upsertArtworkCandidate(initial.id, {
+      sha256: "f".repeat(64),
+      mimeType: "image/jpeg",
+      width: 1000,
+      height: 1000,
+      sizeBytes: 10_000,
+      extension: ".jpg",
+      source: "OBSERVED_EMBEDDED",
+      localVersionId: "added-first",
+      relativePath: "Artist/Stable Added At/cover.jpg",
+      kind: "Front Cover",
+      evidence: { test: true },
+    });
+    expectStableAddedAt();
+    database.applyLibraryIdentityDecision(
+      initial.id,
+      {
+        type: "SET_PRIMARY",
+        requestId: "added-at-primary",
+        revision: database.getAlbumSummary(initial.id)!.revision,
+        primaryVersionId: "added-second",
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    expectStableAddedAt();
+    database.replaceAlbumsForRoot("music", [
+      observed("added-first", 2011),
+      observed("added-second", 2012),
+      observed("added-third", 2013),
+    ]);
+    expect(database.getAlbumSummary("added-third")?.id).toBe(initial.id);
+    expectStableAddedAt();
+
+    open.splice(open.indexOf(database), 1);
+    database.close();
+    database = new CoceanDatabase(path);
+    open.push(database);
+    expectStableAddedAt();
+  });
+
+  it("creates automatic groups from already loaded member times without a dynamic member-id query", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    const originalPrepare = database.raw.prepare.bind(database.raw);
+    const prepare = vi.spyOn(database.raw, "prepare");
+    prepare.mockImplementation(((source: string) => {
+      if (/SELECT id,created_at FROM albums\s+WHERE id IN/.test(source))
+        throw new Error("automatic grouping queried member ids dynamically");
+      return originalPrepare(source);
+    }) as typeof database.raw.prepare);
+    try {
+      expect(() =>
+        database.replaceAlbumsForRoot("music", [
+          { ...albumInput("loaded-time-a", []), title: "Loaded Time" },
+          { ...albumInput("loaded-time-b", []), title: "Loaded Time" },
+          { ...albumInput("loaded-time-c", []), title: "Loaded Time" },
+        ]),
+      ).not.toThrow();
+    } finally {
+      prepare.mockRestore();
+    }
+    expect(database.getAlbumSummary("loaded-time-a")?.versionCount).toBe(3);
+  });
+
+  it("maintains merge, split and undo addedAt invariants for aliases and version entry points", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    const actor = { id: "admin", displayName: "Admin" };
+    database.replaceAlbumsForRoot("music", [
+      { ...albumInput("time-merge-source", []), title: "Time Source" },
+      { ...albumInput("time-merge-target", []), title: "Time Target" },
+      { ...albumInput("time-split-a", []), title: "Time Split" },
+      { ...albumInput("time-split-b", []), title: "Time Split" },
+      { ...albumInput("time-split-c", []), title: "Time Split" },
+    ]);
+    const source = database.getAlbumSummary("time-merge-source")!;
+    const target = database.getAlbumSummary("time-merge-target")!;
+    const sourceAddedAt = new Date(
+      Date.now() - 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const targetAddedAt = new Date(
+      Date.now() - 31 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    database.raw
+      .prepare(
+        `UPDATE library_albums SET created_at=CASE id
+           WHEN ? THEN ? WHEN ? THEN ? ELSE created_at END`,
+      )
+      .run(source.id, sourceAddedAt, target.id, targetAddedAt);
+    const recentlyAddedBeforeMerge = database.getLibraryStats().recentlyAdded;
+    const merged = database.applyLibraryIdentityDecision(
+      source.id,
+      {
+        type: "MERGE",
+        requestId: "time-merge",
+        revision: source.revision,
+        targetLibraryAlbumId: target.id,
+        targetRevision: target.revision,
+        primaryVersionId: "time-merge-target",
+      },
+      actor,
+    );
+    for (const entry of [
+      target.id,
+      source.id,
+      "time-merge-source",
+      "time-merge-target",
+    ])
+      expect(database.getAlbumSummary(entry)?.addedAt).toBe(targetAddedAt);
+    expect(database.getLibraryStats().recentlyAdded).toBe(
+      recentlyAddedBeforeMerge - 1,
+    );
+    database.undoLibraryIdentityDecision(
+      target.id,
+      merged.decision.id,
+      "time-merge-undo",
+      database.getAlbumSummary(target.id)!.revision,
+      actor,
+    );
+    expect(database.getAlbumSummary(source.id)?.addedAt).toBe(sourceAddedAt);
+    expect(database.getAlbumSummary(target.id)?.addedAt).toBe(targetAddedAt);
+    expect(database.getLibraryStats().recentlyAdded).toBe(
+      recentlyAddedBeforeMerge,
+    );
+
+    const splitSource = database.getAlbumSummary("time-split-a")!;
+    expect(splitSource.primaryVersionId).toBe("time-split-a");
+    const splitOriginalAt = new Date(
+      Date.now() - 32 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const splitAAt = new Date(
+      Date.now() - 3 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const splitBAt = new Date(
+      Date.now() - 2 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const splitCAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    database.raw
+      .prepare("UPDATE library_albums SET created_at=? WHERE id=?")
+      .run(splitOriginalAt, splitSource.id);
+    database.raw
+      .prepare(
+        `UPDATE albums SET created_at=CASE id
+           WHEN 'time-split-a' THEN ? WHEN 'time-split-b' THEN ?
+           WHEN 'time-split-c' THEN ? ELSE created_at END`,
+      )
+      .run(splitAAt, splitBAt, splitCAt);
+    const recentlyAddedBeforeSplit = database.getLibraryStats().recentlyAdded;
+    const split = database.applyLibraryIdentityDecision(
+      splitSource.id,
+      {
+        type: "SPLIT",
+        requestId: "time-split",
+        revision: splitSource.revision,
+        partitions: [
+          { versionIds: ["time-split-a"] },
+          {
+            versionIds: ["time-split-b", "time-split-c"],
+            primaryVersionId: "time-split-c",
+          },
+        ],
+      },
+      actor,
+    );
+    const newGroup = database.getAlbumSummary("time-split-b")!;
+    expect(database.getAlbumSummary(splitSource.id)?.addedAt).toBe(
+      splitOriginalAt,
+    );
+    expect(newGroup.primaryVersionId).toBe("time-split-c");
+    expect(newGroup.addedAt).toBe(splitBAt);
+    expect(database.getLibraryStats().recentlyAdded).toBe(
+      recentlyAddedBeforeSplit + 1,
+    );
+    database.undoLibraryIdentityDecision(
+      splitSource.id,
+      split.decision.id,
+      "time-split-undo",
+      database.getAlbumSummary(splitSource.id)!.revision,
+      actor,
+    );
+    expect(database.getAlbumSummary(splitSource.id)?.addedAt).toBe(
+      splitOriginalAt,
+    );
+    expect(database.getAlbumSummary(newGroup.id)?.addedAt).toBe(
+      splitOriginalAt,
+    );
+    expect(database.getLibraryStats().recentlyAdded).toBe(
+      recentlyAddedBeforeSplit,
+    );
+  });
+
+  it("fails instead of returning a non-UTC addedAt and treats full deletion as newly added", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    database.replaceAlbumsForRoot("music", [albumInput("time-invalid", [])]);
+    const first = database.getAlbumSummary("time-invalid")!;
+    database.raw
+      .prepare("UPDATE library_albums SET created_at=? WHERE id=?")
+      .run("2026-08-12T08:00:00+08:00", first.id);
+    expect(() => database.getAlbumSummary(first.id)).toThrow();
+    expect(() => database.listAlbums()).toThrow();
+    const oldAddedAt = "2000-01-01T00:00:00.000Z";
+    database.raw
+      .prepare("UPDATE library_albums SET created_at=? WHERE id=?")
+      .run(oldAddedAt, first.id);
+    expect(database.getAlbumSummary(first.id)?.addedAt).toBe(oldAddedAt);
+    database.raw.prepare("DELETE FROM albums WHERE id=?").run("time-invalid");
+    database.replaceAlbumsForRoot("music", []);
+    expect(database.getAlbumSummary(first.id)).toBeNull();
+    database.replaceAlbumsForRoot("music", [albumInput("time-invalid", [])]);
+    const recreated = database.getAlbumSummary("time-invalid")!;
+    const recreatedVersion = database.raw
+      .prepare("SELECT created_at FROM albums WHERE id=?")
+      .get("time-invalid") as { created_at: string };
+    expect(recreated.id).toBe(first.id);
+    expect(recreated.addedAt).toBe(recreatedVersion.created_at);
+    expect(recreated.addedAt).not.toBe(oldAddedAt);
+    expect(albumAddedAtSchema.parse(recreated.addedAt)).toBe(
+      recreatedVersion.created_at,
+    );
+  });
+
+  it("rolls back automatic creation and split when member creation facts are not UTC", () => {
+    const automatic = new CoceanDatabase(":memory:");
+    open.push(automatic);
+    automatic.replaceAlbumsForRoot("music", [
+      albumInput("invalid-auto-member", []),
+    ]);
+    automatic.raw
+      .prepare("UPDATE albums SET created_at='invalid-auto-time' WHERE id=?")
+      .run("invalid-auto-member");
+    automatic.raw.prepare("DELETE FROM library_albums").run();
+    expect(() =>
+      automatic.replaceAlbumsForRoot("music", [
+        { ...albumInput("invalid-auto-member", []), year: 2021 },
+      ]),
+    ).toThrow();
+    expect(
+      automatic.raw
+        .prepare("SELECT year FROM albums WHERE id=?")
+        .get("invalid-auto-member"),
+    ).toEqual({ year: 2020 });
+    expect(
+      automatic.raw
+        .prepare("SELECT COUNT(*) AS count FROM library_albums")
+        .get(),
+    ).toEqual({ count: 0 });
+
+    const splitDatabase = new CoceanDatabase(":memory:");
+    open.push(splitDatabase);
+    splitDatabase.replaceAlbumsForRoot("music", [
+      { ...albumInput("invalid-split-a", []), title: "Invalid Split" },
+      { ...albumInput("invalid-split-b", []), title: "Invalid Split" },
+      { ...albumInput("invalid-split-c", []), title: "Invalid Split" },
+    ]);
+    const source = splitDatabase.getAlbumSummary("invalid-split-a")!;
+    splitDatabase.raw
+      .prepare("UPDATE albums SET created_at='invalid-split-time' WHERE id=?")
+      .run("invalid-split-b");
+    const membersBefore = splitDatabase
+      .getAlbum(source.id)!
+      .localVersions.map((version) => version.id)
+      .sort();
+    expect(() =>
+      splitDatabase.applyLibraryIdentityDecision(
+        source.id,
+        {
+          type: "SPLIT",
+          requestId: "invalid-time-split",
+          revision: source.revision,
+          partitions: [
+            { versionIds: ["invalid-split-a"] },
+            {
+              versionIds: ["invalid-split-b", "invalid-split-c"],
+              primaryVersionId: "invalid-split-c",
+            },
+          ],
+        },
+        { id: "admin", displayName: "Admin" },
+      ),
+    ).toThrow();
+    expect(splitDatabase.getAlbumSummary(source.id)).toEqual(
+      expect.objectContaining({ id: source.id, revision: source.revision }),
+    );
+    expect(
+      splitDatabase
+        .getAlbum(source.id)!
+        .localVersions.map((version) => version.id)
+        .sort(),
+    ).toEqual(membersBefore);
+    expect(splitDatabase.listLibraryIdentityDecisionHistory(source.id)).toEqual(
+      [],
+    );
+  });
+
   it("applies, replays, splits and safely undoes manual identity decisions without moving version dependencies", () => {
     const database = new CoceanDatabase(":memory:");
     open.push(database);
@@ -4356,6 +4770,10 @@ describe("CoceanDatabase", () => {
     database.raw
       .prepare("DELETE FROM library_issues WHERE album_id=?")
       .run("orphan-detach-target");
+    const orphanMemberAddedAt = "2025-06-07T08:09:10.000Z";
+    database.raw
+      .prepare("UPDATE albums SET created_at=? WHERE id=?")
+      .run(orphanMemberAddedAt, "orphan-detach-target");
     database.raw
       .prepare(
         `UPDATE library_album_members SET library_album_id=(
@@ -4364,6 +4782,10 @@ describe("CoceanDatabase", () => {
       )
       .run();
     const sourceId = database.getAlbumSummary("orphan-detach-scan-version")!.id;
+    const sourceAddedAt = "2024-03-04T05:06:07.000Z";
+    database.raw
+      .prepare("UPDATE library_albums SET created_at=? WHERE id=?")
+      .run(sourceAddedAt, sourceId);
     const businessBefore = {
       albums: Number(
         (
@@ -4461,12 +4883,14 @@ describe("CoceanDatabase", () => {
     expect(result.resultingLibraryAlbumId).not.toBe(sourceId);
     expect(database.getAlbumSummary(sourceId)).toEqual(
       expect.objectContaining({
+        addedAt: sourceAddedAt,
         primaryVersionId: "orphan-detach-scan-version",
         visibility: "VISIBLE",
       }),
     );
     expect(database.getAlbumSummary(result.resultingLibraryAlbumId!)).toEqual(
       expect.objectContaining({
+        addedAt: orphanMemberAddedAt,
         primaryVersionId: "orphan-detach-target",
         visibility: "HIDDEN",
       }),
@@ -4516,8 +4940,10 @@ describe("CoceanDatabase", () => {
     expect(reopened.getAlbumSummary(sourceId)?.primaryVersionId).toBe(
       "orphan-detach-scan-version",
     );
+    expect(reopened.getAlbumSummary(sourceId)?.addedAt).toBe(sourceAddedAt);
     expect(reopened.getAlbumSummary(resultingLibraryAlbumId)).toEqual(
       expect.objectContaining({
+        addedAt: orphanMemberAddedAt,
         visibility: "HIDDEN",
         primaryVersionId: "orphan-detach-target",
       }),
@@ -4569,6 +4995,10 @@ describe("CoceanDatabase", () => {
         now,
       );
     const historyGroup = database.getAlbumSummary("history-govern-target")!.id;
+    const historyAddedAt = "2024-04-05T06:07:08.000Z";
+    database.raw
+      .prepare("UPDATE library_albums SET created_at=? WHERE id=?")
+      .run(historyAddedAt, historyGroup);
     const historyPreview = database.previewOrphanGovernance(
       "history-govern-target",
       {
@@ -4588,7 +5018,12 @@ describe("CoceanDatabase", () => {
       },
       { id: "admin", displayName: "Admin" },
     );
-    expect(database.getAlbumSummary(historyGroup)!.visibility).toBe("HIDDEN");
+    expect(database.getAlbumSummary(historyGroup)).toEqual(
+      expect.objectContaining({
+        addedAt: historyAddedAt,
+        visibility: "HIDDEN",
+      }),
+    );
     expect(
       database.previewOrphanGovernance("history-govern-target", {
         localVersionId: "history-govern-target",
@@ -4613,6 +5048,10 @@ describe("CoceanDatabase", () => {
       .prepare("DELETE FROM library_issues WHERE album_id=?")
       .run("standalone-orphan");
     const orphanGroup = database.getAlbumSummary("standalone-orphan")!.id;
+    const orphanAddedAt = "2024-06-07T08:09:10.000Z";
+    database.raw
+      .prepare("UPDATE library_albums SET created_at=? WHERE id=?")
+      .run(orphanAddedAt, orphanGroup);
     const orphanPreview = database.previewOrphanGovernance(
       "standalone-orphan",
       {
@@ -4633,7 +5072,12 @@ describe("CoceanDatabase", () => {
       { id: "admin", displayName: "Admin" },
     );
     expect(orphanResult.resultingLibraryAlbumId).toBe(orphanGroup);
-    expect(database.getAlbumSummary(orphanGroup)!.visibility).toBe("HIDDEN");
+    expect(database.getAlbumSummary(orphanGroup)).toEqual(
+      expect.objectContaining({
+        addedAt: orphanAddedAt,
+        visibility: "HIDDEN",
+      }),
+    );
     finalizeEmptyInventoryScan(database, "post-governance-rescan", "physical");
     expect(
       database.raw
@@ -4668,8 +5112,18 @@ describe("CoceanDatabase", () => {
     database.close();
     const reopened = new CoceanDatabase(path);
     open.push(reopened);
-    expect(reopened.getAlbumSummary(historyGroup)?.visibility).toBe("HIDDEN");
-    expect(reopened.getAlbumSummary(orphanGroup)?.visibility).toBe("HIDDEN");
+    expect(reopened.getAlbumSummary(historyGroup)).toEqual(
+      expect.objectContaining({
+        addedAt: historyAddedAt,
+        visibility: "HIDDEN",
+      }),
+    );
+    expect(reopened.getAlbumSummary(orphanGroup)).toEqual(
+      expect.objectContaining({
+        addedAt: orphanAddedAt,
+        visibility: "HIDDEN",
+      }),
+    );
     expect(
       reopened.listOrphanGovernanceHistory("history-govern-target"),
     ).toEqual([

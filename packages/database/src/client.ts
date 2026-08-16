@@ -65,6 +65,7 @@ import type {
   UpdateAlbumMetadataCommand,
 } from "@cocean/contracts";
 import {
+  albumAddedAtSchema,
   formatCompactAudioSpec,
   releaseCandidateSchema,
   stillRuntimeCatalogSchema,
@@ -2150,6 +2151,7 @@ export class CoceanDatabase {
           | undefined;
         if (!version) throw new Error("local version disappeared");
         const createdId = `library-${randomUUID()}`;
+        const createdAt = this.earliestAlbumCreatedAt([before.localVersionId]);
         const identityKey = sourceId
           ? String(
               (
@@ -2174,7 +2176,7 @@ export class CoceanDatabase {
             version.album_artist,
             before.localVersionId,
             now,
-            now,
+            createdAt,
             now,
           );
         if (sourceId) {
@@ -3345,8 +3347,6 @@ export class CoceanDatabase {
         (oldPrimary !== primaryId ||
           oldMemberIds.length !== nextMemberIds.length ||
           oldMemberIds.some((id, index) => id !== nextMemberIds[index]));
-      const createdAt =
-        members.map((member) => String(member.created_at)).sort()[0] ?? now;
       if (existing)
         this.raw
           .prepare(
@@ -3362,7 +3362,10 @@ export class CoceanDatabase {
             now,
             groupId,
           );
-      else
+      else {
+        const createdAt = earliestUtcInstant(
+          members.map((member) => member.created_at),
+        );
         this.raw
           .prepare(
             `INSERT INTO library_albums
@@ -3379,6 +3382,7 @@ export class CoceanDatabase {
             createdAt,
             now,
           );
+      }
       for (const member of members) addMember.run(groupId, member.id, now, now);
       this.rebuildLibraryIssuesForGroup(groupId, members, true, now);
       this.bumpMetadataRevisionForEffectiveChange(
@@ -3736,6 +3740,10 @@ export class CoceanDatabase {
           );
         const target = this.libraryIdentityGroup(targetId);
         this.assertIdentityRevision(target, command.targetRevision);
+        const mergedAddedAt = this.earliestLibraryAlbumCreatedAt([
+          sourceId,
+          targetId,
+        ]);
         if (this.groupsHaveActiveLifecyclePlans([targetId]))
           throw new LibraryIdentityDecisionError(
             "IDENTITY_DECISION_CONFLICT",
@@ -3827,9 +3835,10 @@ export class CoceanDatabase {
         this.raw
           .prepare(
             `UPDATE library_albums SET decision_source='USER', primary_version_id=?,
-               primary_version_source='USER', revision=revision+1, updated_at=? WHERE id=?`,
+               primary_version_source='USER', revision=revision+1,
+               created_at=?, updated_at=? WHERE id=?`,
           )
-          .run(command.primaryVersionId, now, targetId);
+          .run(command.primaryVersionId, mergedAddedAt, now, targetId);
         this.raw
           .prepare(
             "DELETE FROM library_issues WHERE library_album_id=? AND code='IDENTITY_OVERLAP'",
@@ -3917,6 +3926,7 @@ export class CoceanDatabase {
                 groupId,
               );
           } else {
+            const createdAt = this.earliestAlbumCreatedAt(partition.versionIds);
             this.raw
               .prepare(
                 `INSERT INTO library_albums
@@ -3935,7 +3945,7 @@ export class CoceanDatabase {
                 sourceVisibility.visibility,
                 sourceVisibility.visibility_revision,
                 sourceVisibility.visibility_updated_at,
-                now,
+                createdAt,
                 now,
               );
           }
@@ -4543,6 +4553,45 @@ export class CoceanDatabase {
     return String([...rows].sort(comparePrimaryVersions)[0]!.id);
   }
 
+  private earliestAlbumCreatedAt(versionIds: string[]): string {
+    const ids = [...new Set(versionIds)];
+    if (!ids.length)
+      throw new LibraryIdentityDecisionError(
+        "IDENTITY_DECISION_CONFLICT",
+        "无法为没有本地版本的唱片确定首次入库时间",
+      );
+    const rows = this.raw
+      .prepare(
+        `SELECT id,created_at FROM albums
+         WHERE id IN (${ids.map(() => "?").join(",")})`,
+      )
+      .all(...ids) as Array<{ id: string; created_at: unknown }>;
+    if (rows.length !== ids.length)
+      throw new LibraryIdentityDecisionError(
+        "IDENTITY_DECISION_CONFLICT",
+        "本地版本已变化，无法确定首次入库时间",
+      );
+    return earliestUtcInstant(rows.map((row) => row.created_at));
+  }
+
+  private earliestLibraryAlbumCreatedAt(libraryAlbumIds: string[]): string {
+    const ids = [...new Set(libraryAlbumIds)];
+    const rows = ids.length
+      ? (this.raw
+          .prepare(
+            `SELECT id,created_at FROM library_albums
+             WHERE id IN (${ids.map(() => "?").join(",")})`,
+          )
+          .all(...ids) as Array<{ id: string; created_at: unknown }>)
+      : [];
+    if (!ids.length || rows.length !== ids.length)
+      throw new LibraryIdentityDecisionError(
+        "IDENTITY_DECISION_CONFLICT",
+        "唱片身份已变化，无法确定首次入库时间",
+      );
+    return earliestUtcInstant(rows.map((row) => row.created_at));
+  }
+
   private captureLibraryIdentitySnapshot(
     scope: string[],
   ): LibraryIdentitySnapshot {
@@ -4719,7 +4768,7 @@ export class CoceanDatabase {
           currentGroup?.effectiveArtworkSource ??
             group.effectiveArtworkSource ??
             "NONE",
-          currentGroup?.createdAt ?? group.createdAt,
+          group.createdAt,
           now,
         );
       for (const member of group.members)
@@ -8007,6 +8056,7 @@ export class CoceanDatabase {
     const rows = this.raw
       .prepare(
         `SELECT a.*, la.id AS library_album_id, la.primary_version_id,
+                la.created_at AS library_added_at,
                 la.primary_version_source, la.revision, la.metadata_revision,
                 la.artwork_revision,la.effective_artwork_json,la.effective_artwork_source,
                 la.visibility,la.visibility_revision,
@@ -8087,6 +8137,7 @@ export class CoceanDatabase {
     const row = this.raw
       .prepare(
         `SELECT a.*, la.id AS library_album_id, la.primary_version_id,
+        la.created_at AS library_added_at,
         la.primary_version_source, la.revision, la.metadata_revision,
         la.artwork_revision,la.effective_artwork_json,la.effective_artwork_source,
         la.visibility,la.visibility_revision,
@@ -9496,6 +9547,7 @@ export class CoceanDatabase {
         nullableString(row.effective_album_artist) ?? summary.albumArtist,
       year: nullableNumber(row.effective_year),
       id,
+      addedAt: albumAddedAtSchema.parse(row.library_added_at),
       hasDigital,
       physicalMedia,
       primaryVersionId: String(row.primary_version_id),
@@ -9514,7 +9566,9 @@ export class CoceanDatabase {
     };
   }
 
-  private mapAlbumSummary(row: Record<string, unknown>): AlbumSummary {
+  private mapAlbumSummary(
+    row: Record<string, unknown>,
+  ): Omit<AlbumSummary, "addedAt"> {
     const media = this.raw
       .prepare(
         "SELECT DISTINCT medium FROM physical_copies WHERE album_id = ? ORDER BY medium",
@@ -10278,6 +10332,17 @@ function effectiveAlbumFieldSql(
   return `(CASE WHEN ${exists("USER_OVERRIDE")} THEN ${row("USER_OVERRIDE")}
     WHEN ${exists("CONFIRMED_EXTERNAL")} THEN ${row("CONFIRMED_EXTERNAL")}
     ELSE ${observedSql} END)`;
+}
+
+function earliestUtcInstant(values: unknown[]): string {
+  if (!values.length)
+    throw new Error("cannot determine album addedAt from empty facts");
+  return values
+    .map((value) => albumAddedAtSchema.parse(value))
+    .sort((left, right) => {
+      const difference = Date.parse(left) - Date.parse(right);
+      return difference === 0 ? left.localeCompare(right) : difference;
+    })[0]!;
 }
 
 function parseJson<T>(value: unknown, fallback: T): T {
