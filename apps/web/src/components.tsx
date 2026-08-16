@@ -2,8 +2,6 @@ import type { AlbumSummary, AuthUser, PhysicalMedium } from "@cocean/contracts";
 import { formatFullAudioSpec } from "@cocean/contracts";
 import {
   AudioLines,
-  Archive,
-  CircleDot,
   Disc3,
   FolderSearch2,
   Library,
@@ -12,18 +10,14 @@ import {
   Search,
   Settings,
   SlidersHorizontal,
-  Sparkles,
 } from "lucide-react";
 import type { MouseEvent, PropsWithChildren, ReactNode } from "react";
 import { NavLink } from "react-router-dom";
 
 const navigation = [
-  { to: "/", label: "今日", icon: CircleDot, end: true },
   { to: "/library", label: "唱片库", icon: Library },
-  { to: "/quarantine", label: "隔离区", icon: Archive },
-  { to: "/discover", label: "找歌", icon: Sparkles },
-  { to: "/systems", label: "我的系统", icon: AudioLines },
   { to: "/tasks", label: "任务", icon: ListTodo },
+  { to: "/systems", label: "我的系统", icon: AudioLines },
 ];
 
 export function PageShell({
@@ -33,14 +27,13 @@ export function PageShell({
 }: PropsWithChildren<{ user: AuthUser; onLogout: () => void }>) {
   return (
     <div className="app-shell">
-      <aside className="sidebar" aria-label="主导航">
+      <aside className="sidebar" aria-label="应用侧栏">
         <BrandLockup />
-        <nav className="sidebar-nav">
-          {navigation.map(({ to, label, icon: Icon, end }) => (
+        <nav className="sidebar-nav" aria-label="桌面主导航">
+          {navigation.map(({ to, label, icon: Icon }) => (
             <NavLink
               key={to}
               to={to}
-              end={Boolean(end)}
               className={({ isActive }) =>
                 `nav-item${isActive ? " is-active" : ""}`
               }
@@ -60,27 +53,28 @@ export function PageShell({
             <LogOut />
           </button>
         </div>
-        <NavLink
-          to="/settings"
-          className={({ isActive }) =>
-            `nav-item settings-link${isActive ? " is-active" : ""}`
-          }
-        >
-          <Settings aria-hidden="true" />
-          <span>设置</span>
-        </NavLink>
+        <nav className="sidebar-footer-nav" aria-label="桌面设置导航">
+          <NavLink
+            to="/settings"
+            className={({ isActive }) =>
+              `nav-item settings-link${isActive ? " is-active" : ""}`
+            }
+          >
+            <Settings aria-hidden="true" />
+            <span>设置</span>
+          </NavLink>
+        </nav>
         <div className="nas-status">
           <span>COCEAN NAS</span>
           <strong>Music · 安全策略</strong>
         </div>
       </aside>
       <main className="main-content">{children}</main>
-      <nav className="mobile-nav" aria-label="移动导航">
-        {navigation.slice(0, 4).map(({ to, label, icon: Icon, end }) => (
+      <nav className="mobile-nav" aria-label="移动主导航">
+        {navigation.map(({ to, label, icon: Icon }) => (
           <NavLink
             key={to}
             to={to}
-            end={Boolean(end)}
             className={({ isActive }) => (isActive ? "is-active" : "")}
           >
             <Icon aria-hidden="true" />
@@ -101,7 +95,7 @@ export function PageShell({
 
 export function BrandLockup() {
   return (
-    <NavLink to="/" className="brand-lockup" aria-label="COCEAN 首页">
+    <NavLink to="/library" className="brand-lockup" aria-label="COCEAN 唱片库">
       <span className="brand-mark" aria-hidden="true">
         C
       </span>

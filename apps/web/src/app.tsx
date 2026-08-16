@@ -4,8 +4,6 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { api } from "./api.js";
 import { PageShell } from "./components.js";
 import { AlbumDetailPage } from "./pages/album-detail.js";
-import { DiscoverPage } from "./pages/discover.js";
-import { HomePage } from "./pages/home.js";
 import { InformationMatchPage } from "./pages/information-match.js";
 import { LibraryPage } from "./pages/library.js";
 import { LoginPage } from "./pages/login.js";
@@ -65,9 +63,9 @@ export function App() {
       }}
     >
       <Routes>
-        <Route path="/login" element={<Navigate to="/" replace />} />
-        <Route path="/" element={<HomePage />} />
-        <Route path="/today" element={<HomePage />} />
+        <Route path="/login" element={<Navigate to="/library" replace />} />
+        <Route path="/" element={<Navigate to="/library" replace />} />
+        <Route path="/today" element={<Navigate to="/library" replace />} />
         <Route
           path="/library"
           element={<LibraryPage canManage={canManage} />}
@@ -84,8 +82,8 @@ export function App() {
           path="/albums/:id/information-match"
           element={<InformationMatchPage canManage={canManage} />}
         />
-        <Route path="/discover" element={<DiscoverPage />} />
-        <Route path="/find" element={<DiscoverPage />} />
+        <Route path="/discover" element={<Navigate to="/library" replace />} />
+        <Route path="/find" element={<Navigate to="/library" replace />} />
         <Route
           path="/systems"
           element={<SystemsPage canManage={canManage} />}
@@ -97,7 +95,7 @@ export function App() {
           element={<QuarantinePage canManage={canManage} />}
         />
         <Route path="/settings" element={<SettingsPage />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
+        <Route path="*" element={<Navigate to="/library" replace />} />
       </Routes>
     </PageShell>
   );

@@ -717,7 +717,9 @@ a {
 }
 button:focus-visible,
 a:focus-visible,
-input:focus-visible {
+input:focus-visible,
+select:focus-visible,
+summary:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 3px;
 }
@@ -799,6 +801,10 @@ p {
   min-height: 48px;
 }
 .settings-link {
+  width: 100%;
+}
+.sidebar-footer-nav {
+  margin-top: 8px;
   margin-bottom: 16px;
 }
 .nas-status {
@@ -1461,6 +1467,13 @@ p {
 .empty-state p {
   max-width: 460px;
   color: var(--text-secondary);
+}
+.empty-state-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 6px;
 }
 
 /* Album detail */
@@ -3772,13 +3785,15 @@ p {
     bottom: 0;
     height: calc(68px + env(safe-area-inset-bottom));
     display: grid;
-    grid-template-columns: repeat(5, 1fr);
+    grid-template-columns: repeat(4, 1fr);
     padding: 7px 8px env(safe-area-inset-bottom);
     border-top: 1px solid var(--border-default);
     background: color-mix(in srgb, var(--bg-primary) 94%, transparent);
     backdrop-filter: blur(12px);
   }
   .mobile-nav a {
+    min-width: 44px;
+    min-height: 44px;
     display: grid;
     place-items: center;
     align-content: center;
@@ -3792,6 +3807,11 @@ p {
   .mobile-nav svg {
     width: 19px;
     height: 19px;
+  }
+  select,
+  summary,
+  .filter-pill {
+    min-height: 44px;
   }
   .settings-layout {
     grid-template-columns: 1fr;
@@ -3858,6 +3878,12 @@ p {
     padding-inline: 10px !important;
     font-size: 11px !important;
   }
+  .physical-album-form input,
+  .physical-album-form select,
+  .sort-control select {
+    min-height: 44px;
+    height: 44px;
+  }
   .physical-album-form {
     grid-template-columns: 1fr 1fr;
   }
@@ -3915,6 +3941,7 @@ p {
     grid-template-columns: 1fr;
   }
   .management-disclosure > summary {
+    min-height: 44px;
     align-items: flex-start;
     flex-direction: column;
     gap: 4px;
@@ -3945,8 +3972,16 @@ p {
   .lifecycle-visibility-row .button {
     width: 100%;
   }
-  .filter-pill {
+  .collection-disclosure > summary,
+  .card-disclosure-summary,
+  .version-technical-details > summary {
     min-height: 44px;
+  }
+  .empty-state-actions {
+    width: 100%;
+  }
+  .empty-state-actions .button {
+    flex: 1 1 180px;
   }
   .track-row {
     grid-template-columns: 44px minmax(0, 1fr) auto;

@@ -78,6 +78,62 @@ describe("Album 详情主操作", () => {
     expect(html).not.toContain("Listen");
     expect(html).not.toContain("信息匹配");
   });
+
+  it("页面先呈现用户内容，全部管理分组默认折叠", async () => {
+    const album = mountedOrphanAlbum();
+    vi.spyOn(api, "album").mockResolvedValue(album);
+    vi.spyOn(api, "deliveryTargets").mockResolvedValue([]);
+    vi.spyOn(api, "albumDeliveries").mockResolvedValue([]);
+    vi.spyOn(api, "albumIntroduction").mockResolvedValue(null);
+    vi.spyOn(api, "identityDecisions").mockResolvedValue([]);
+    vi.spyOn(api, "metadataHistory").mockResolvedValue([]);
+    vi.spyOn(api, "artworkHistory").mockResolvedValue([]);
+    vi.spyOn(api, "orphanGovernanceHistory").mockResolvedValue([]);
+    vi.spyOn(api, "capabilities").mockResolvedValue({} as never);
+    vi.spyOn(api, "lifecyclePlans").mockResolvedValue([]);
+    let renderer: TestRenderer.ReactTestRenderer;
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <MemoryRouter initialEntries={["/albums/mounted-library"]}>
+          <Routes>
+            <Route path="/albums/:id" element={<AlbumDetailPage canManage />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+    });
+
+    const orderedSections = renderer!.root.findAll(
+      (candidate) =>
+        candidate.props.className === "detail-hero" ||
+        candidate.props.id === "album-management",
+    );
+    expect(orderedSections[0]!.props.className).toBe("detail-hero");
+    expect(orderedSections[1]!.props.id).toBe("album-management");
+    const managementDetails = orderedSections[1]!.findAll(
+      (candidate) => candidate.props.className === "management-disclosure",
+    );
+    expect(
+      managementDetails.map((detail) =>
+        testRendererText(detail.findByType("summary").findByType("span")),
+      ),
+    ).toEqual([
+      "显示与存放",
+      "核对唱片资料",
+      "异常版本治理",
+      "合并或拆分版本",
+      "唱片介绍",
+    ]);
+    expect(managementDetails).toHaveLength(5);
+    expect(managementDetails.every((detail) => !detail.props.open)).toBe(true);
+    expect(
+      renderer!.root
+        .findAllByType("a")
+        .some((candidate) => candidate.props.href === "/quarantine"),
+    ).toBe(false);
+
+    await act(async () => renderer!.unmount());
+  });
 });
 
 describe("Album 异常版本治理", () => {

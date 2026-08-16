@@ -67,6 +67,14 @@ export function LibraryPage({ canManage }: { canManage: boolean }) {
   const items = loadedPage?.items ?? [];
   const total = loadedPage?.total ?? 0;
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const isRecoveringFromOutOfRangePage = Boolean(
+    loadedPage && page > 0 && items.length === 0,
+  );
+  const hasActiveCriteria =
+    Boolean(query.trim()) ||
+    filter !== "ALL" ||
+    issue !== "ALL" ||
+    visibility !== "VISIBLE";
   const updateLibraryState = (
     patch: Partial<{
       query: string;
@@ -89,6 +97,28 @@ export function LibraryPage({ canManage }: { canManage: boolean }) {
       { replace: true },
     );
   };
+  useLayoutEffect(() => {
+    if (!isRecoveringFromOutOfRangePage) return;
+    setSearchParams(
+      librarySearchParams({
+        query,
+        filter,
+        sort,
+        issue,
+        visibility,
+        page: 0,
+      }),
+      { replace: true },
+    );
+  }, [
+    filter,
+    isRecoveringFromOutOfRangePage,
+    issue,
+    query,
+    setSearchParams,
+    sort,
+    visibility,
+  ]);
   useLayoutEffect(() => {
     if (
       albums.loading ||
@@ -159,7 +189,7 @@ export function LibraryPage({ canManage }: { canManage: boolean }) {
               </Button>
             ) : null}
             <Link className="button secondary" to="/tasks">
-              <ScanLine /> 管理扫描
+              <ScanLine /> {canManage ? "管理扫描" : "查看任务"}
             </Link>
           </div>
         }
@@ -338,7 +368,9 @@ export function LibraryPage({ canManage }: { canManage: boolean }) {
           <RefreshCw />
         </Button>
       </div>
-      {albums.loading || (!loadedPage && !albums.error) ? (
+      {albums.loading ||
+      (!loadedPage && !albums.error) ||
+      isRecoveringFromOutOfRangePage ? (
         <LoadingGrid />
       ) : albums.error ? (
         <EmptyState
@@ -383,11 +415,32 @@ export function LibraryPage({ canManage }: { canManage: boolean }) {
         </>
       ) : (
         <EmptyState
-          title="没有符合条件的 Album"
+          title={hasActiveCriteria ? "没有符合条件的 Album" : "唱片库还是空的"}
           detail={
-            query
-              ? "换一个关键词，或清除介质筛选。"
-              : "确认 Music 目录已挂载并完成扫描，或添加实体唱片。"
+            hasActiveCriteria
+              ? "清除搜索或筛选条件，再查看完整唱片库。"
+              : canManage
+                ? "从真实 Music 目录开始扫描，或添加一张实体唱片。"
+                : "唱片库尚无可浏览内容；可查看任务进度或联系管理员检查目录。"
+          }
+          action={
+            hasActiveCriteria ? (
+              <Button
+                variant="secondary"
+                onClick={() => setSearchParams({}, { replace: true })}
+              >
+                清除筛选
+              </Button>
+            ) : canManage ? (
+              <div className="empty-state-actions">
+                <Link
+                  className="button secondary"
+                  to="/settings#settings-resources"
+                >
+                  检查目录设置
+                </Link>
+              </div>
+            ) : undefined
           }
         />
       )}

@@ -43,7 +43,7 @@ export function LoginPage({
               .login(username, password)
               .then((session) => {
                 onLogin(session);
-                navigate("/", { replace: true });
+                navigate("/library", { replace: true });
               })
               .catch((reason) =>
                 setError(reason instanceof Error ? reason.message : "登录失败"),

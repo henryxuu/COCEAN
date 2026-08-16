@@ -853,7 +853,6 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
                       隔离不是永久删除；文件会保留在 COCEAN 隔离区，可随时恢复。
                     </p>
                   </div>
-                  <Link to="/quarantine">查看隔离区</Link>
                 </div>
                 {localVersions.map((version) => (
                   <div className="lifecycle-version-row" key={version.id}>
