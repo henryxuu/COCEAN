@@ -3,6 +3,7 @@ import type {
   AlbumArtworkGovernance,
   AlbumMetadata,
   DeliveryJob,
+  LibraryChangePlanRead,
   LocalVersionSummary,
 } from "@cocean/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -28,6 +29,7 @@ import {
   buildSplitIdentityCommand,
   createLatestRequestTracker,
   legacyLocalVersions,
+  lifecycleRecordForVersion,
   mergeTargetAlbumQuery,
 } from "./album-detail.js";
 
@@ -133,6 +135,102 @@ describe("Album 详情主操作", () => {
     ).toBe(false);
 
     await act(async () => renderer!.unmount());
+  });
+
+  it("MEMBER 可看到相关最近删除结果链接，但没有管理动作", async () => {
+    const album = mountedOrphanAlbum();
+    vi.spyOn(api, "album").mockResolvedValue(album);
+    vi.spyOn(api, "deliveryTargets").mockResolvedValue([]);
+    vi.spyOn(api, "albumDeliveries").mockResolvedValue([]);
+    vi.spyOn(api, "albumIntroduction").mockResolvedValue(null);
+    vi.spyOn(api, "identityDecisions").mockResolvedValue([]);
+    vi.spyOn(api, "metadataHistory").mockResolvedValue([]);
+    vi.spyOn(api, "artworkHistory").mockResolvedValue([]);
+    vi.spyOn(api, "orphanGovernanceHistory").mockResolvedValue([]);
+    vi.spyOn(api, "capabilities").mockResolvedValue({} as never);
+    const source = lifecycleReadPlan({
+      id: "source-member",
+      status: "SUCCEEDED",
+    });
+    const plans = vi.spyOn(api, "lifecyclePlans").mockResolvedValue([source]);
+    let renderer: TestRenderer.ReactTestRenderer;
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <MemoryRouter initialEntries={["/albums/mounted-library"]}>
+          <Routes>
+            <Route
+              path="/albums/:id"
+              element={<AlbumDetailPage canManage={false} />}
+            />
+          </Routes>
+        </MemoryRouter>,
+      );
+    });
+
+    expect(plans).toHaveBeenCalledWith({ albumId: "mounted-library" });
+    const links = renderer!.root.findAllByType("a");
+    expect(
+      links.some(
+        (candidate) =>
+          candidate.props.href === "/quarantine?plan=source-member" &&
+          testRendererText(candidate).includes("查看最近删除记录"),
+      ),
+    ).toBe(true);
+    expect(
+      renderer!.root
+        .findAllByType("button")
+        .some((candidate) =>
+          testRendererText(candidate).includes("预览移到最近删除"),
+        ),
+    ).toBe(false);
+    await act(async () => renderer!.unmount());
+  });
+});
+
+describe("Album 最近删除记录关联", () => {
+  it.each(["PREVIEWED", "FAILED", "CANCELLED"] as const)(
+    "QUARANTINE %s 不会被误标成结果链接",
+    (status) => {
+      expect(
+        lifecycleRecordForVersion(
+          [lifecycleReadPlan({ status })],
+          "mounted-version",
+          false,
+        ),
+      ).toBeUndefined();
+    },
+  );
+
+  it.each(["PREVIEWED", "QUEUED", "RUNNING", "RECOVERY_REQUIRED"] as const)(
+    "active RESTORE %s 会链接回 source",
+    (status) => {
+      const restore = lifecycleReadPlan({
+        id: `restore-${status}`,
+        action: "RESTORE_VERSION",
+        status,
+        sourcePlanId: "source-plan",
+      });
+      expect(
+        lifecycleRecordForVersion([restore], "mounted-version", false)?.id,
+      ).toBe(restore.id);
+    },
+  );
+
+  it("成功 restore 后不再显示 source 结果链接", () => {
+    const source = lifecycleReadPlan({
+      id: "source-plan",
+      status: "SUCCEEDED",
+    });
+    const restore = lifecycleReadPlan({
+      id: "restore-plan",
+      action: "RESTORE_VERSION",
+      status: "SUCCEEDED",
+      sourcePlanId: "source-plan",
+    });
+    expect(
+      lifecycleRecordForVersion([restore, source], "mounted-version", false),
+    ).toBeUndefined();
   });
 });
 
@@ -1017,6 +1115,27 @@ function version(patch: Partial<LocalVersionSummary>): LocalVersionSummary {
     issues: [],
     ...patch,
   };
+}
+
+function lifecycleReadPlan(
+  patch: Partial<LibraryChangePlanRead> = {},
+): LibraryChangePlanRead {
+  return {
+    id: "source-plan",
+    action: "QUARANTINE_VERSION",
+    status: "SUCCEEDED",
+    sourcePlanId: null,
+    fileCount: 1,
+    totalBytes: 100,
+    error: null,
+    createdAt: "2026-08-16T00:00:00.000Z",
+    confirmedAt: "2026-08-16T00:00:01.000Z",
+    startedAt: "2026-08-16T00:00:02.000Z",
+    finishedAt: "2026-08-16T00:00:03.000Z",
+    object: { title: "Mounted", albumArtist: "Artist" },
+    completedFiles: 1,
+    ...patch,
+  } as LibraryChangePlanRead;
 }
 
 describe("Album 详情完整性与兼容展示", () => {

@@ -38,6 +38,7 @@ import type {
   LibraryChangeBlocker,
   LibraryChangePlan,
   LibraryChangePlanItem,
+  LibraryChangePlanObject,
   LibraryChangePlanStatus,
   MetadataCommand,
   MetadataField,
@@ -76,6 +77,14 @@ import { migrations } from "./migrations.js";
 
 type Sqlite = BetterSqlite3.Database;
 
+const currentQuarantinedVersionPredicate = `
+  p.action='QUARANTINE_VERSION' AND p.status='SUCCEEDED'
+  AND NOT EXISTS (
+    SELECT 1 FROM library_change_plans restore
+    WHERE restore.source_plan_id=p.id AND restore.action='RESTORE_VERSION'
+      AND restore.status='SUCCEEDED'
+  )`;
+
 export interface AlbumRecordInput {
   id: string;
   rootId: string;
@@ -98,6 +107,19 @@ export interface AlbumRecordInput {
   barcode?: string | null;
   musicBrainzReleaseId?: string | null;
   aggregationIssues?: AlbumAggregationIssue[];
+}
+
+export interface RecentlyDeletedDatabaseItem {
+  source: LibraryChangePlan;
+  latestRestore: LibraryChangePlan | null;
+  object: LibraryChangePlanObject;
+}
+
+export interface RecentlyDeletedDatabasePage {
+  items: RecentlyDeletedDatabaseItem[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 export type ScanFileResultInput = Omit<ScanFileResult, "id" | "createdAt">;
@@ -7380,39 +7402,182 @@ export class CoceanDatabase {
   }
 
   listLibraryChangePlans(
-    options: { limit?: number } = {},
+    options: { limit?: number; libraryAlbumId?: string } = {},
   ): LibraryChangePlan[] {
     const limit = Math.min(Math.max(options.limit ?? 100, 1), 100);
-    return this.raw
+    const albumFilter = options.libraryAlbumId
+      ? "WHERE library_album_id=@libraryAlbumId"
+      : "";
+    const outerAlbumFilter = options.libraryAlbumId
+      ? " AND p.library_album_id=@libraryAlbumId"
+      : "";
+    const rows = this.raw
       .prepare(
         `WITH head AS (
            SELECT id FROM library_change_plans
-           ORDER BY created_at DESC,id DESC LIMIT ?
+           ${albumFilter}
+           ORDER BY created_at DESC,id DESC LIMIT @limit
          )
          SELECT p.*,r.name AS root_name,r.policy AS root_policy
          FROM library_change_plans p JOIN library_roots r ON r.id=p.root_id
-         WHERE p.id IN (SELECT id FROM head) OR p.status='RECOVERY_REQUIRED'
+         WHERE (p.id IN (SELECT id FROM head) OR p.status='RECOVERY_REQUIRED')
+           ${outerAlbumFilter}
          ORDER BY p.created_at DESC,p.id DESC`,
       )
-      .all(limit)
-      .map((row) => this.mapLibraryChangePlan(row as Record<string, unknown>));
+      .all({
+        limit,
+        ...(options.libraryAlbumId
+          ? { libraryAlbumId: options.libraryAlbumId }
+          : {}),
+      }) as Record<string, unknown>[];
+    const items = this.getLibraryChangePlanItems(
+      rows.map((row) => String(row.id)),
+    );
+    return rows.map((row) =>
+      this.mapLibraryChangePlan(row, items.get(String(row.id)) ?? []),
+    );
+  }
+
+  listRecentlyDeletedLibraryVersions(
+    options: { limit?: number; offset?: number; sourcePlanId?: string } = {},
+  ): RecentlyDeletedDatabasePage {
+    const limit = Math.min(Math.max(options.limit ?? 100, 1), 100);
+    const offset = Math.max(options.offset ?? 0, 0);
+    const sourceFilter = options.sourcePlanId ? " AND p.id=@sourcePlanId" : "";
+    const effectiveTitle = effectiveAlbumFieldSql("title", "a.title");
+    const effectiveArtist = effectiveAlbumFieldSql(
+      "albumArtist",
+      "a.album_artist",
+    );
+    return this.raw.transaction(() => {
+      const totalRow = this.raw
+        .prepare(
+          `SELECT COUNT(*) AS count FROM library_change_plans p
+           WHERE ${currentQuarantinedVersionPredicate}`,
+        )
+        .get() as { count: number };
+      const rows = this.raw
+        .prepare(
+          `SELECT p.*,r.name AS root_name,r.policy AS root_policy,
+                  ${effectiveTitle} AS object_title,
+                  ${effectiveArtist} AS object_album_artist
+           FROM library_change_plans p
+           JOIN library_roots r ON r.id=p.root_id
+           JOIN library_albums la ON la.id=p.library_album_id
+           JOIN albums a ON a.id=la.primary_version_id
+           WHERE ${currentQuarantinedVersionPredicate}${sourceFilter}
+           ORDER BY p.finished_at DESC,p.id DESC LIMIT @limit OFFSET @offset`,
+        )
+        .all({
+          limit,
+          offset,
+          ...(options.sourcePlanId
+            ? { sourcePlanId: options.sourcePlanId }
+            : {}),
+        }) as Record<string, unknown>[];
+      const sourceIds = rows.map((row) => String(row.id));
+      const restoreRows: Record<string, unknown>[] = [];
+      if (sourceIds.length) {
+        const placeholders = sourceIds.map(() => "?").join(",");
+        restoreRows.push(
+          ...(this.raw
+            .prepare(
+              `WITH ranked AS (
+               SELECT id,ROW_NUMBER() OVER (
+                 PARTITION BY source_plan_id ORDER BY created_at DESC,id DESC
+               ) AS rank
+               FROM library_change_plans
+               WHERE action='RESTORE_VERSION' AND source_plan_id IN (${placeholders})
+             )
+             SELECT p.*,r.name AS root_name,r.policy AS root_policy
+             FROM ranked
+             JOIN library_change_plans p ON p.id=ranked.id
+             JOIN library_roots r ON r.id=p.root_id
+             WHERE ranked.rank=1`,
+            )
+            .all(...sourceIds) as Record<string, unknown>[]),
+        );
+      }
+      const itemsByPlan = this.getLibraryChangePlanItems(
+        [...rows, ...restoreRows].map((row) => String(row.id)),
+      );
+      const restoreBySource = new Map<string, LibraryChangePlan>();
+      for (const row of restoreRows) {
+        const plan = this.mapLibraryChangePlan(
+          row,
+          itemsByPlan.get(String(row.id)) ?? [],
+        );
+        if (plan.sourcePlanId) restoreBySource.set(plan.sourcePlanId, plan);
+      }
+      return {
+        items: rows.map((row) => ({
+          source: this.mapLibraryChangePlan(
+            row,
+            itemsByPlan.get(String(row.id)) ?? [],
+          ),
+          latestRestore: restoreBySource.get(String(row.id)) ?? null,
+          object: {
+            title: String(row.object_title || "唱片记录不可用"),
+            albumArtist: nullableString(row.object_album_artist),
+          },
+        })),
+        total: Number(totalRow.count),
+        limit,
+        offset,
+      };
+    })();
+  }
+
+  getRecentlyDeletedLibraryVersion(
+    sourcePlanId: string,
+  ): RecentlyDeletedDatabaseItem | null {
+    return (
+      this.listRecentlyDeletedLibraryVersions({
+        limit: 1,
+        offset: 0,
+        sourcePlanId,
+      }).items[0] ?? null
+    );
   }
 
   listQuarantinedLibraryVersions(limit = 100): LibraryChangePlan[] {
-    return this.raw
+    return this.listRecentlyDeletedLibraryVersions({ limit }).items.map(
+      (item) => item.source,
+    );
+  }
+
+  countQuarantinedLibraryVersions(): number {
+    return this.listRecentlyDeletedLibraryVersions({ limit: 1 }).total;
+  }
+
+  getLibraryChangePlanObjects(
+    libraryAlbumIds: string[],
+  ): Map<string, LibraryChangePlanObject> {
+    const ids = [...new Set(libraryAlbumIds)].filter(Boolean);
+    if (!ids.length) return new Map();
+    const placeholders = ids.map(() => "?").join(",");
+    const effectiveTitle = effectiveAlbumFieldSql("title", "a.title");
+    const effectiveArtist = effectiveAlbumFieldSql(
+      "albumArtist",
+      "a.album_artist",
+    );
+    const rows = this.raw
       .prepare(
-        `SELECT p.*,r.name AS root_name,r.policy AS root_policy
-         FROM library_change_plans p JOIN library_roots r ON r.id=p.root_id
-         WHERE p.action='QUARANTINE_VERSION' AND p.status='SUCCEEDED'
-           AND NOT EXISTS (
-             SELECT 1 FROM library_change_plans restore
-             WHERE restore.source_plan_id=p.id AND restore.action='RESTORE_VERSION'
-               AND restore.status='SUCCEEDED'
-           )
-         ORDER BY p.finished_at DESC,p.id DESC LIMIT ?`,
+        `SELECT la.id,${effectiveTitle} AS object_title,
+                ${effectiveArtist} AS object_album_artist
+         FROM library_albums la JOIN albums a ON a.id=la.primary_version_id
+         WHERE la.id IN (${placeholders})`,
       )
-      .all(Math.min(Math.max(limit, 1), 100))
-      .map((row) => this.mapLibraryChangePlan(row as Record<string, unknown>));
+      .all(...ids) as Record<string, unknown>[];
+    return new Map(
+      rows.map((row) => [
+        String(row.id),
+        {
+          title: String(row.object_title || "唱片记录不可用"),
+          albumArtist: nullableString(row.object_album_artist),
+        },
+      ]),
+    );
   }
 
   claimNextLibraryChangePlan(): LibraryChangePlan | null {
@@ -7934,17 +8099,32 @@ export class CoceanDatabase {
       );
   }
 
-  private mapLibraryChangePlan(
-    row: Record<string, unknown>,
-  ): LibraryChangePlan {
-    const items = (
-      this.raw
-        .prepare(
-          `SELECT * FROM library_change_plan_items
-           WHERE plan_id=? ORDER BY ordinal`,
-        )
-        .all(String(row.id)) as Record<string, unknown>[]
-    ).map((item): LibraryChangePlanItem => ({
+  private getLibraryChangePlanItems(
+    planIds: string[],
+  ): Map<string, LibraryChangePlanItem[]> {
+    const ids = [...new Set(planIds)].filter(Boolean);
+    if (!ids.length) return new Map();
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = this.raw
+      .prepare(
+        `SELECT * FROM library_change_plan_items
+         WHERE plan_id IN (${placeholders}) ORDER BY plan_id,ordinal`,
+      )
+      .all(...ids) as Record<string, unknown>[];
+    const byPlan = new Map<string, LibraryChangePlanItem[]>();
+    for (const row of rows) {
+      const planId = String(row.plan_id);
+      const items = byPlan.get(planId) ?? [];
+      items.push(this.mapLibraryChangePlanItem(row));
+      byPlan.set(planId, items);
+    }
+    return byPlan;
+  }
+
+  private mapLibraryChangePlanItem(
+    item: Record<string, unknown>,
+  ): LibraryChangePlanItem {
+    return {
       ordinal: Number(item.ordinal),
       mediaFileId: nullableString(item.media_file_id),
       sourceRelativePath: String(item.source_relative_path),
@@ -7955,7 +8135,23 @@ export class CoceanDatabase {
       finalSizeBytes: nullableNumber(item.final_size_bytes),
       finalSha256: nullableString(item.final_sha256),
       error: nullableString(item.error),
-    }));
+    };
+  }
+
+  private mapLibraryChangePlan(
+    row: Record<string, unknown>,
+    prefetchedItems?: LibraryChangePlanItem[],
+  ): LibraryChangePlan {
+    const items =
+      prefetchedItems ??
+      (
+        this.raw
+          .prepare(
+            `SELECT * FROM library_change_plan_items
+           WHERE plan_id=? ORDER BY ordinal`,
+          )
+          .all(String(row.id)) as Record<string, unknown>[]
+      ).map((item) => this.mapLibraryChangePlanItem(item));
     return {
       id: String(row.id),
       requestId: String(row.request_id),

@@ -150,6 +150,66 @@ export type LibraryChangePlanSummary = z.infer<
   typeof libraryChangePlanSummarySchema
 >;
 
+export const libraryChangePlanObjectSchema = z.object({
+  title: z.string().min(1),
+  albumArtist: z.string().nullable(),
+});
+export type LibraryChangePlanObject = z.infer<
+  typeof libraryChangePlanObjectSchema
+>;
+
+const libraryChangePlanReadFields = {
+  object: libraryChangePlanObjectSchema,
+  completedFiles: z.number().int().nonnegative(),
+};
+
+export const libraryChangePlanMemberReadSchema = z.object({
+  id: z.string(),
+  action: libraryChangeActionSchema,
+  status: libraryChangePlanStatusSchema,
+  sourcePlanId: z.string().nullable(),
+  fileCount: z.number().int().nonnegative(),
+  totalBytes: z.number().int().nonnegative(),
+  error: z.string().nullable(),
+  createdAt: z.string(),
+  confirmedAt: z.string().nullable(),
+  startedAt: z.string().nullable(),
+  finishedAt: z.string().nullable(),
+  ...libraryChangePlanReadFields,
+});
+export type LibraryChangePlanMemberRead = z.infer<
+  typeof libraryChangePlanMemberReadSchema
+>;
+
+export const libraryChangePlanReadSchema = z.union([
+  libraryChangePlanSchema.extend(libraryChangePlanReadFields),
+  libraryChangePlanMemberReadSchema,
+]);
+export type LibraryChangePlanRead = z.infer<typeof libraryChangePlanReadSchema>;
+
+export const libraryChangePlanListResponseSchema = z.object({
+  items: z.array(libraryChangePlanReadSchema),
+});
+export type LibraryChangePlanListResponse = z.infer<
+  typeof libraryChangePlanListResponseSchema
+>;
+
+export const recentlyDeletedItemSchema = z.object({
+  source: libraryChangePlanReadSchema,
+  latestRestore: libraryChangePlanReadSchema.nullable(),
+});
+export type RecentlyDeletedItem = z.infer<typeof recentlyDeletedItemSchema>;
+
+export const recentlyDeletedResponseSchema = z.object({
+  items: z.array(recentlyDeletedItemSchema),
+  total: z.number().int().nonnegative(),
+  limit: z.number().int().positive(),
+  offset: z.number().int().nonnegative(),
+});
+export type RecentlyDeletedResponse = z.infer<
+  typeof recentlyDeletedResponseSchema
+>;
+
 export const createQuarantinePlanCommandSchema = z.object({
   requestId: z.string().trim().min(1).max(200),
   expectedLibraryRevision: z.number().int().nonnegative(),

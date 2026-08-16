@@ -18,6 +18,10 @@ import type {
   DeviceOwnership,
   LibraryStats,
   LibraryChangePlan,
+  LibraryChangePlanRead,
+  LibraryChangePlanListResponse,
+  RecentlyDeletedItem,
+  RecentlyDeletedResponse,
   AlbumVisibilityCommand,
   AlbumVisibilityMutationResult,
   AlbumVisibilityEvent,
@@ -383,15 +387,31 @@ export const api = {
       { method: "POST", body: JSON.stringify({ requestId }) },
     );
   },
-  lifecyclePlans(): Promise<LibraryChangePlan[]> {
-    return request<{ items: LibraryChangePlan[] }>(
-      "/api/v1/lifecycle-plans",
+  lifecyclePlans(
+    input: { albumId?: string; limit?: number } = {},
+  ): Promise<LibraryChangePlanRead[]> {
+    const params = new URLSearchParams({ limit: String(input.limit ?? 100) });
+    if (input.albumId) params.set("albumId", input.albumId);
+    return request<LibraryChangePlanListResponse>(
+      `/api/v1/lifecycle-plans?${params.toString()}`,
     ).then((result) => result.items);
   },
-  quarantinedVersions(): Promise<LibraryChangePlan[]> {
-    return request<{ items: LibraryChangePlan[] }>(
-      "/api/v1/lifecycle-plans/quarantine",
-    ).then((result) => result.items);
+  lifecyclePlan(planId: string): Promise<LibraryChangePlanRead> {
+    return request(`/api/v1/lifecycle-plans/${encodeURIComponent(planId)}`);
+  },
+  quarantinedVersions(
+    input: { limit?: number; offset?: number } = {},
+  ): Promise<RecentlyDeletedResponse> {
+    const params = new URLSearchParams({
+      limit: String(input.limit ?? 100),
+      offset: String(input.offset ?? 0),
+    });
+    return request(`/api/v1/lifecycle-plans/quarantine?${params.toString()}`);
+  },
+  recentlyDeletedVersion(sourcePlanId: string): Promise<RecentlyDeletedItem> {
+    return request(
+      `/api/v1/lifecycle-plans/quarantine/${encodeURIComponent(sourcePlanId)}`,
+    );
   },
   albumArtwork(albumId: string): Promise<AlbumArtworkGovernance> {
     return request(`/api/v1/albums/${encodeURIComponent(albumId)}/artwork`);

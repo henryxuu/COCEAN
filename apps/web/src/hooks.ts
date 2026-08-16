@@ -37,7 +37,7 @@ export function useToast() {
   const [message, setMessage] = useState<string | null>(null);
   const show = useCallback((next: string) => {
     setMessage(next);
-    window.setTimeout(() => setMessage(null), 2800);
+    globalThis.setTimeout(() => setMessage(null), 2800);
   }, []);
   return { message, show };
 }

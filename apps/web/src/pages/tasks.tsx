@@ -6,12 +6,17 @@ import {
   Clock3,
   LoaderCircle,
   OctagonX,
+  ArchiveRestore,
   ScanLine,
   Send,
 } from "lucide-react";
-import type { DeliveryJob, ScanJob } from "@cocean/contracts";
+import type {
+  DeliveryJob,
+  LibraryChangePlanRead,
+  ScanJob,
+} from "@cocean/contracts";
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { api } from "../api.js";
 import { Button, EmptyState, PageHeader } from "../components.js";
 import {
@@ -20,11 +25,36 @@ import {
   type DeliveryPlan,
 } from "../delivery-plan.js";
 import { useAsync, useToast } from "../hooks.js";
+import { formatFileSize } from "../media-ui.js";
+import { safeLifecycleMessage } from "./quarantine.js";
 
 export function TasksPage({ canManage }: { canManage: boolean }) {
+  const [searchParams] = useSearchParams();
+  const requestedPlanId = searchParams.get("plan")?.trim() ?? "";
   const scans = useAsync(() => api.scans(), []);
   const deliveries = useAsync(() => api.deliveries(), []);
+  const lifecyclePlans = useAsync(() => api.lifecyclePlans(), []);
+  const recentlyDeleted = useAsync(() => api.quarantinedVersions(), []);
+  const requestedLifecyclePlan = useAsync(
+    () =>
+      requestedPlanId
+        ? api.lifecyclePlan(requestedPlanId)
+        : Promise.resolve<LibraryChangePlanRead | null>(null),
+    [requestedPlanId],
+  );
+  const requestedSourcePlanId =
+    requestedLifecyclePlan.data?.action === "RESTORE_VERSION"
+      ? (requestedLifecyclePlan.data.sourcePlanId ?? "")
+      : requestedPlanId;
+  const requestedSourcePlan = useAsync(
+    () =>
+      requestedSourcePlanId && requestedSourcePlanId !== requestedPlanId
+        ? api.lifecyclePlan(requestedSourcePlanId)
+        : Promise.resolve<LibraryChangePlanRead | null>(null),
+    [requestedPlanId, requestedSourcePlanId],
+  );
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [showAllLifecycle, setShowAllLifecycle] = useState(false);
   const [scanDialogOpen, setScanDialogOpen] = useState(false);
   const [scanMode, setScanMode] = useState<"INCREMENTAL" | "FULL">(
     "INCREMENTAL",
@@ -34,16 +64,29 @@ export function TasksPage({ canManage }: { canManage: boolean }) {
   const toast = useToast();
   const hasActiveTask = Boolean(
     scans.data?.some((job) => ["QUEUED", "RUNNING"].includes(job.status)) ||
-    deliveries.data?.some((job) => ["QUEUED", "RUNNING"].includes(job.status)),
+    deliveries.data?.some((job) =>
+      ["QUEUED", "RUNNING"].includes(job.status),
+    ) ||
+    lifecyclePlans.data?.some((plan) =>
+      ["QUEUED", "RUNNING"].includes(plan.status),
+    ),
   );
   useEffect(() => {
     if (!hasActiveTask) return;
     const timer = window.setInterval(() => {
       void scans.reload();
       void deliveries.reload();
+      void lifecyclePlans.reload();
+      void recentlyDeleted.reload();
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [deliveries.reload, hasActiveTask, scans.reload]);
+  }, [
+    deliveries.reload,
+    hasActiveTask,
+    lifecyclePlans.reload,
+    recentlyDeleted.reload,
+    scans.reload,
+  ]);
   const start = async () => {
     setStarting(true);
     try {
@@ -88,6 +131,14 @@ export function TasksPage({ canManage }: { canManage: boolean }) {
       setRetrying(null);
     }
   };
+  const lifecycleRecords = prioritizeLifecyclePlan(
+    mergeLifecyclePlans(
+      lifecyclePlans.data ?? [],
+      requestedLifecyclePlan.data,
+      requestedSourcePlan.data,
+    ),
+    requestedSourcePlanId || requestedPlanId,
+  );
   return (
     <div className="page tasks-page">
       <PageHeader
@@ -163,6 +214,77 @@ export function TasksPage({ canManage }: { canManage: boolean }) {
           </section>
         </div>
       ) : null}
+      <h2 className="task-section-title">文件管理 / 最近删除</h2>
+      <section className="surface-card lifecycle-task-summary">
+        {recentlyDeleted.error ? (
+          <div className="deep-link-context has-error" role="alert">
+            最近删除数量读取失败：
+            {safeLifecycleMessage(recentlyDeleted.error.message)}
+          </div>
+        ) : null}
+        {lifecyclePlans.error ? (
+          <div className="deep-link-context has-error" role="alert">
+            文件管理历史读取失败：
+            {safeLifecycleMessage(lifecyclePlans.error.message)}
+          </div>
+        ) : null}
+        <div className="lifecycle-task-count">
+          <ArchiveRestore aria-hidden="true" />
+          <div>
+            <strong>
+              最近删除 {recentlyDeleted.data?.total.toLocaleString() ?? "—"} 项
+            </strong>
+            <span>
+              精确统计已移出且尚未成功恢复的对象；成员仅可查看脱敏概要。
+            </span>
+          </div>
+          <Link
+            className="button secondary"
+            to={
+              requestedPlanId
+                ? `/quarantine?plan=${encodeURIComponent(
+                    requestedSourcePlanId || requestedPlanId,
+                  )}`
+                : "/quarantine"
+            }
+          >
+            打开最近删除
+          </Link>
+        </div>
+        {requestedPlanId && requestedLifecyclePlan.error ? (
+          <div className="deep-link-context has-error" role="alert">
+            没有找到指定的文件管理记录，可能已失效或无权查看。
+          </div>
+        ) : null}
+        <div className="lifecycle-task-list">
+          {lifecycleRecords
+            .slice(0, showAllLifecycle ? undefined : 5)
+            .map((plan) => (
+              <LifecycleTaskRecord
+                plan={plan}
+                highlighted={
+                  plan.id === (requestedSourcePlanId || requestedPlanId)
+                }
+                key={plan.id}
+              />
+            ))}
+        </div>
+        {!lifecyclePlans.loading &&
+        !lifecyclePlans.error &&
+        !lifecycleRecords.length ? (
+          <p className="lifecycle-task-empty">
+            暂无文件管理任务；这里不会用演示记录代替真实生命周期事实。
+          </p>
+        ) : null}
+        {lifecycleRecords.length > 5 ? (
+          <Button
+            variant="quiet"
+            onClick={() => setShowAllLifecycle((current) => !current)}
+          >
+            {showAllLifecycle ? "收起" : "展开全部"}
+          </Button>
+        ) : null}
+      </section>
       <h2 className="task-section-title">Music 扫描</h2>
       {scans.error ? (
         <EmptyState
@@ -284,6 +406,93 @@ export function TasksPage({ canManage }: { canManage: boolean }) {
       {toast.message ? <div className="toast">{toast.message}</div> : null}
     </div>
   );
+}
+
+function mergeLifecyclePlans(
+  plans: LibraryChangePlanRead[],
+  ...requested: Array<LibraryChangePlanRead | null | undefined>
+): LibraryChangePlanRead[] {
+  const result = [...plans];
+  for (const plan of requested) {
+    if (plan && !result.some((candidate) => candidate.id === plan.id))
+      result.unshift(plan);
+  }
+  return result;
+}
+
+function prioritizeLifecyclePlan(
+  plans: LibraryChangePlanRead[],
+  pinnedId: string,
+): LibraryChangePlanRead[] {
+  if (!pinnedId) return plans;
+  const pinned = plans.find((plan) => plan.id === pinnedId);
+  return pinned
+    ? [pinned, ...plans.filter((plan) => plan.id !== pinnedId)]
+    : plans;
+}
+
+export function LifecycleTaskRecord({
+  plan,
+  highlighted = false,
+}: {
+  plan: LibraryChangePlanRead;
+  highlighted?: boolean;
+}) {
+  const sourcePlanId =
+    plan.action === "RESTORE_VERSION" ? plan.sourcePlanId : plan.id;
+  return (
+    <article
+      className={`lifecycle-task-record ${highlighted ? "is-target" : ""}`}
+      aria-current={highlighted ? "true" : undefined}
+    >
+      <div>
+        <strong>{plan.object.title}</strong>
+        <span>
+          {plan.object.albumArtist ?? "未知艺术家"} · {plan.fileCount} 个文件 ·{" "}
+          {formatFileSize(plan.totalBytes)}
+        </span>
+        <small>
+          {lifecycleActionLabel(plan.action)} ·{" "}
+          {lifecyclePlanStatusLabel(plan.status)} ·{" "}
+          {formatTaskTime(plan.finishedAt ?? plan.createdAt)}
+          {plan.completedFiles
+            ? ` · 已处理 ${plan.completedFiles}/${plan.fileCount}`
+            : ""}
+        </small>
+        {plan.error ? (
+          <small role="alert">{safeLifecycleMessage(plan.error)}</small>
+        ) : null}
+      </div>
+      {sourcePlanId ? (
+        <Link
+          className="button quiet"
+          to={`/quarantine?plan=${encodeURIComponent(sourcePlanId)}`}
+        >
+          查看记录
+        </Link>
+      ) : (
+        <span className="status-pill">源记录不可用</span>
+      )}
+    </article>
+  );
+}
+
+function lifecycleActionLabel(action: LibraryChangePlanRead["action"]): string {
+  return action === "QUARANTINE_VERSION" ? "移到最近删除" : "恢复到原位置";
+}
+
+function lifecyclePlanStatusLabel(
+  status: LibraryChangePlanRead["status"],
+): string {
+  return {
+    PREVIEWED: "等待确认",
+    QUEUED: "等待执行",
+    RUNNING: "执行中",
+    SUCCEEDED: "已完成",
+    FAILED: "失败",
+    RECOVERY_REQUIRED: "需要人工处理",
+    CANCELLED: "已取消",
+  }[status];
 }
 
 export function DeliveryPlanRecord({

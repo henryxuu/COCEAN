@@ -2947,9 +2947,23 @@ describe("COCEAN HTTP API", () => {
       headers: { cookie: member },
     });
     expect(memberView.statusCode, memberView.body).toBe(200);
-    expect(memberView.json()).not.toHaveProperty("items");
-    expect(memberView.json()).not.toHaveProperty("actor");
-    expect(memberView.json()).not.toHaveProperty("requestId");
+    expect(Object.keys(memberView.json()).sort()).toEqual(
+      [
+        "action",
+        "completedFiles",
+        "confirmedAt",
+        "createdAt",
+        "error",
+        "fileCount",
+        "finishedAt",
+        "id",
+        "object",
+        "sourcePlanId",
+        "startedAt",
+        "status",
+        "totalBytes",
+      ].sort(),
+    );
     const confirmed = await app.inject({
       method: "POST",
       url: `/api/v1/lifecycle-plans/${plan.json().id}/confirm`,
@@ -2981,6 +2995,367 @@ describe("COCEAN HTTP API", () => {
     });
     expect(retried.statusCode, retried.body).toBe(202);
     expect(retried.json().status).toBe("QUEUED");
+  });
+
+  it("serves an exact role-safe recently-deleted projection before and after restore", async () => {
+    const database = new CoceanDatabase(":memory:", {
+      musicRootPolicy: "MANAGED",
+    });
+    const { albumId, versionId } = seedLifecycleApiAlbum(database);
+    const app = await buildApp({
+      config: testConfig({ musicRootPolicy: "MANAGED" }),
+      database,
+      deliveryExecution: false,
+    });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const admin = adminCookie(database);
+    const member = sessionCookieFor(database, "MEMBER");
+    const preview = await app.inject({
+      method: "POST",
+      url: `/api/v1/albums/${albumId}/lifecycle-plans`,
+      headers: { cookie: admin },
+      payload: {
+        requestId: "recently-deleted-preview",
+        expectedLibraryRevision: database.getAlbumSummary(albumId)!.revision,
+        localVersionId: versionId,
+      },
+    });
+    const planId = preview.json().id as string;
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/lifecycle-plans/${planId}/confirm`,
+      headers: { cookie: admin },
+      payload: { requestId: "recently-deleted-confirm" },
+    });
+    database.claimNextLibraryChangePlan();
+    database.updateLibraryChangePlanItem(planId, 0, {
+      status: "QUARANTINED",
+      finalSizeBytes: 5,
+      finalSha256: createHash("sha256").update("audio").digest("hex"),
+    });
+    database.finishLibraryChangePlan(planId, "SUCCEEDED");
+
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: "/api/v1/lifecycle-plans/quarantine",
+        })
+      ).statusCode,
+    ).toBe(401);
+    const memberList = await app.inject({
+      method: "GET",
+      url: "/api/v1/lifecycle-plans/quarantine",
+      headers: { cookie: member },
+    });
+    expect(memberList.statusCode, memberList.body).toBe(200);
+    expect(memberList.json()).toEqual({
+      total: 1,
+      limit: 100,
+      offset: 0,
+      items: [
+        {
+          source: expect.objectContaining({
+            id: planId,
+            object: { title: "Album", albumArtist: "Artist" },
+            completedFiles: 1,
+          }),
+          latestRestore: null,
+        },
+      ],
+    });
+    expect(memberList.body).not.toMatch(
+      /actor|requestId|sourceRelativePath|quarantineRelativePath|sha256|\/library\/music/,
+    );
+    const memberExact = await app.inject({
+      method: "GET",
+      url: `/api/v1/lifecycle-plans/quarantine/${planId}`,
+      headers: { cookie: member },
+    });
+    expect(memberExact.statusCode, memberExact.body).toBe(200);
+    expect(memberExact.json()).toEqual(memberList.json().items[0]);
+    expect(memberExact.body).not.toMatch(
+      /libraryAlbumId|localVersionId|expectedLibraryRevision|executable|root|actor|requestId|items/,
+    );
+    const adminExact = await app.inject({
+      method: "GET",
+      url: `/api/v1/lifecycle-plans/quarantine/${planId}`,
+      headers: { cookie: admin },
+    });
+    expect(adminExact.statusCode, adminExact.body).toBe(200);
+    expect(adminExact.json().source).toEqual(
+      expect.objectContaining({
+        id: planId,
+        libraryAlbumId: albumId,
+        localVersionId: versionId,
+        executable: true,
+        items: [expect.objectContaining({ status: "QUARANTINED" })],
+      }),
+    );
+    const adminDetail = await app.inject({
+      method: "GET",
+      url: `/api/v1/lifecycle-plans/${planId}`,
+      headers: { cookie: admin },
+    });
+    expect(adminDetail.json()).toEqual(
+      expect.objectContaining({
+        object: { title: "Album", albumArtist: "Artist" },
+        completedFiles: 1,
+        actor: expect.objectContaining({ displayName: "Test Admin" }),
+        items: [expect.objectContaining({ status: "QUARANTINED" })],
+      }),
+    );
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/v1/lifecycle-plans/${planId}/restore`,
+          headers: { cookie: member },
+          payload: { requestId: "member-cannot-restore" },
+        })
+      ).statusCode,
+    ).toBe(403);
+
+    const reconciliationScan = database.claimNextScanJob();
+    expect(reconciliationScan).not.toBeNull();
+    database.finishScanJob(reconciliationScan!.id);
+
+    const restore = await app.inject({
+      method: "POST",
+      url: `/api/v1/lifecycle-plans/${planId}/restore`,
+      headers: { cookie: admin },
+      payload: { requestId: "recently-deleted-restore-preview" },
+    });
+    const restoreId = restore.json().id as string;
+    const withPreview = await app.inject({
+      method: "GET",
+      url: `/api/v1/lifecycle-plans/quarantine/${planId}`,
+      headers: { cookie: member },
+    });
+    expect(withPreview.json().latestRestore).toEqual(
+      expect.objectContaining({ id: restoreId, status: "PREVIEWED" }),
+    );
+    const duplicate = await app.inject({
+      method: "POST",
+      url: `/api/v1/lifecycle-plans/${planId}/restore`,
+      headers: { cookie: admin },
+      payload: { requestId: "recently-deleted-restore-duplicate" },
+    });
+    expect(duplicate.statusCode).toBe(409);
+    await app.inject({
+      method: "POST",
+      url: `/api/v1/lifecycle-plans/${restoreId}/confirm`,
+      headers: { cookie: admin },
+      payload: { requestId: "recently-deleted-restore-confirm" },
+    });
+    database.claimNextLibraryChangePlan();
+    database.updateLibraryChangePlanItem(restoreId, 0, {
+      status: "RESTORED",
+      finalSizeBytes: 5,
+      finalSha256: createHash("sha256").update("audio").digest("hex"),
+    });
+    database.finishLibraryChangePlan(restoreId, "SUCCEEDED");
+    const afterRestore = await app.inject({
+      method: "GET",
+      url: "/api/v1/lifecycle-plans/quarantine",
+      headers: { cookie: member },
+    });
+    expect(afterRestore.json()).toEqual({
+      items: [],
+      total: 0,
+      limit: 100,
+      offset: 0,
+    });
+    const restoredExact = await app.inject({
+      method: "GET",
+      url: `/api/v1/lifecycle-plans/quarantine/${planId}`,
+      headers: { cookie: member },
+    });
+    expect(restoredExact.statusCode).toBe(404);
+    expect(restoredExact.json().error).toBe("RECENTLY_DELETED_NOT_FOUND");
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/v1/lifecycle-plans/quarantine/${planId}`,
+        })
+      ).statusCode,
+    ).toBe(401);
+
+    const insertMixedStatus = database.raw.prepare(
+      `INSERT INTO library_change_plan_items
+       (plan_id,ordinal,media_file_id,source_relative_path,
+        quarantine_relative_path,size_bytes,sha256,status,updated_at)
+       VALUES (?,99,NULL,?,?,0,NULL,?,?)`,
+    );
+    const now = new Date().toISOString();
+    insertMixedStatus.run(
+      planId,
+      "mixed/source-restored.flac",
+      "mixed/quarantine-restored.flac",
+      "RESTORED",
+      now,
+    );
+    insertMixedStatus.run(
+      restoreId,
+      "mixed/source-quarantined.flac",
+      "mixed/quarantine-quarantined.flac",
+      "QUARANTINED",
+      now,
+    );
+    const sourceCount = await app.inject({
+      method: "GET",
+      url: `/api/v1/lifecycle-plans/${planId}`,
+      headers: { cookie: admin },
+    });
+    const restoreCount = await app.inject({
+      method: "GET",
+      url: `/api/v1/lifecycle-plans/${restoreId}`,
+      headers: { cookie: admin },
+    });
+    expect(sourceCount.json().completedFiles).toBe(1);
+    expect(restoreCount.json().completedFiles).toBe(1);
+  });
+
+  it("paginates more than 100 current records and resolves exact membership independently", async () => {
+    const database = new CoceanDatabase(":memory:", {
+      musicRootPolicy: "MANAGED",
+    });
+    const { albumId } = seedLifecycleApiAlbum(database);
+    const app = await buildApp({
+      config: testConfig({ musicRootPolicy: "MANAGED" }),
+      database,
+      deliveryExecution: false,
+    });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const member = sessionCookieFor(database, "MEMBER");
+    const insert = database.raw.prepare(
+      `INSERT INTO library_change_plans
+       (id,request_id,action,status,library_album_id,local_version_id,root_id,
+        root_container_path,quarantine_root_path,source_plan_id,
+        expected_library_revision,input_json,executable,blockers_json,
+        file_count,total_bytes,actor_id,actor_display_name,created_at,finished_at)
+       VALUES (?,?,?,?,?,?,'music','/library/music','/library/quarantine',
+               ?,0,'{}',1,'[]',1,100,'admin','Admin',?,?)`,
+    );
+    for (let index = 0; index < 102; index += 1) {
+      const id = `api-current-${String(index).padStart(3, "0")}`;
+      const createdAt = new Date(Date.UTC(2026, 7, 16, 0, index)).toISOString();
+      insert.run(
+        id,
+        `request-${id}`,
+        "QUARANTINE_VERSION",
+        "SUCCEEDED",
+        albumId,
+        `version-${index}`,
+        null,
+        createdAt,
+        createdAt,
+      );
+    }
+    insert.run(
+      "api-current-restored",
+      "request-api-current-restored",
+      "RESTORE_VERSION",
+      "SUCCEEDED",
+      albumId,
+      "version-0",
+      "api-current-000",
+      "2026-08-16T03:00:00.000Z",
+      "2026-08-16T03:00:00.000Z",
+    );
+    insert.run(
+      "api-current-preview",
+      "request-api-current-preview",
+      "RESTORE_VERSION",
+      "PREVIEWED",
+      albumId,
+      "version-1",
+      "api-current-001",
+      "2026-08-16T03:01:00.000Z",
+      null,
+    );
+    insert.run(
+      "api-not-current",
+      "request-api-not-current",
+      "QUARANTINE_VERSION",
+      "FAILED",
+      albumId,
+      "version-not-current",
+      null,
+      "2026-08-16T03:02:00.000Z",
+      "2026-08-16T03:02:00.000Z",
+    );
+
+    const first = await app.inject({
+      method: "GET",
+      url: "/api/v1/lifecycle-plans/quarantine?limit=100&offset=0",
+      headers: { cookie: member },
+    });
+    expect(first.statusCode, first.body).toBe(200);
+    expect(first.json()).toEqual(
+      expect.objectContaining({ total: 101, limit: 100, offset: 0 }),
+    );
+    expect(first.json().items).toHaveLength(100);
+    expect(
+      first
+        .json()
+        .items.some(
+          (item: { source: { id: string } }) =>
+            item.source.id === "api-current-001",
+        ),
+    ).toBe(false);
+
+    const second = await app.inject({
+      method: "GET",
+      url: "/api/v1/lifecycle-plans/quarantine?limit=100&offset=100",
+      headers: { cookie: member },
+    });
+    expect(second.json()).toEqual(
+      expect.objectContaining({ total: 101, limit: 100, offset: 100 }),
+    );
+    expect(second.json().items).toEqual([
+      expect.objectContaining({
+        source: expect.objectContaining({ id: "api-current-001" }),
+        latestRestore: expect.objectContaining({
+          id: "api-current-preview",
+          status: "PREVIEWED",
+        }),
+      }),
+    ]);
+
+    const exact = await app.inject({
+      method: "GET",
+      url: "/api/v1/lifecycle-plans/quarantine/api-current-001",
+      headers: { cookie: member },
+    });
+    expect(exact.statusCode, exact.body).toBe(200);
+    expect(exact.json().source.id).toBe("api-current-001");
+    expect(exact.json().latestRestore.id).toBe("api-current-preview");
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: "/api/v1/lifecycle-plans/quarantine/api-current-000",
+          headers: { cookie: member },
+        })
+      ).statusCode,
+    ).toBe(404);
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: "/api/v1/lifecycle-plans/quarantine/api-not-current",
+          headers: { cookie: member },
+        })
+      ).statusCode,
+    ).toBe(404);
   });
 });
 

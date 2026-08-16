@@ -6562,6 +6562,94 @@ describe("CoceanDatabase", () => {
     ).toThrow(/cannot be deleted/);
   });
 
+  it("counts the complete current recently-deleted projection beyond the 100-row view", () => {
+    const database = new CoceanDatabase(":memory:", {
+      musicRootPolicy: "MANAGED",
+    });
+    open.push(database);
+    seedLifecycleVersion(database, "recent-count-version");
+    const album = database.getAlbumSummary("recent-count-version")!;
+    const insert = database.raw.prepare(
+      `INSERT INTO library_change_plans
+       (id,request_id,action,status,library_album_id,local_version_id,root_id,
+        root_container_path,quarantine_root_path,source_plan_id,
+        expected_library_revision,input_json,executable,blockers_json,
+        file_count,total_bytes,actor_id,actor_display_name,created_at,finished_at)
+       VALUES (?,?,?,'SUCCEEDED',?,?,'music','/library/music','/library/quarantine',
+               ?,0,'{}',1,'[]',1,100,'admin','Admin',?,?)`,
+    );
+    for (let index = 0; index < 102; index += 1) {
+      const id = `recent-count-${String(index).padStart(3, "0")}`;
+      const createdAt = new Date(Date.UTC(2026, 7, 16, 0, index)).toISOString();
+      insert.run(
+        id,
+        `request-${id}`,
+        "QUARANTINE_VERSION",
+        album.id,
+        `version-${index}`,
+        null,
+        createdAt,
+        createdAt,
+      );
+    }
+    insert.run(
+      "recent-count-restored",
+      "request-recent-count-restored",
+      "RESTORE_VERSION",
+      album.id,
+      "version-0",
+      "recent-count-000",
+      "2026-08-16T03:00:00.000Z",
+      "2026-08-16T03:00:00.000Z",
+    );
+    insert.run(
+      "recent-count-active-restore",
+      "request-recent-count-active-restore",
+      "RESTORE_VERSION",
+      album.id,
+      "version-1",
+      "recent-count-001",
+      "2026-08-16T03:01:00.000Z",
+      null,
+    );
+    database.raw
+      .prepare("UPDATE library_change_plans SET status='PREVIEWED' WHERE id=?")
+      .run("recent-count-active-restore");
+
+    const first = database.listRecentlyDeletedLibraryVersions({ limit: 100 });
+    expect(first).toEqual(
+      expect.objectContaining({ total: 101, limit: 100, offset: 0 }),
+    );
+    expect(first.items).toHaveLength(100);
+    expect(
+      first.items.some((item) => item.source.id === "recent-count-001"),
+    ).toBe(false);
+    const second = database.listRecentlyDeletedLibraryVersions({
+      limit: 100,
+      offset: 100,
+    });
+    expect(second).toEqual(
+      expect.objectContaining({ total: 101, limit: 100, offset: 100 }),
+    );
+    expect(second.items.map((item) => item.source.id)).toEqual([
+      "recent-count-001",
+    ]);
+    expect(second.items[0]?.latestRestore?.id).toBe(
+      "recent-count-active-restore",
+    );
+    expect(second.items[0]?.object).toEqual({
+      title: "Album",
+      albumArtist: "Artist",
+    });
+    expect(
+      database.getRecentlyDeletedLibraryVersion("recent-count-001")
+        ?.latestRestore?.status,
+    ).toBe("PREVIEWED");
+    expect(
+      database.getRecentlyDeletedLibraryVersion("recent-count-000"),
+    ).toBeNull();
+  });
+
   it("cancels a queued plan and never replays a confirm event as cancellation", () => {
     const database = new CoceanDatabase(":memory:", {
       musicRootPolicy: "MANAGED",

@@ -42,6 +42,8 @@ import {
   undoLibraryIdentityDecisionCommandSchema,
   updateAlbumMetadataCommandSchema,
   type LibraryChangePlan,
+  type LibraryChangePlanObject,
+  type LibraryChangePlanRead,
   type ReleaseCandidate,
 } from "@cocean/contracts";
 import { defaultLibrarySort } from "@cocean/contracts";
@@ -1038,23 +1040,85 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   app.get("/api/v1/lifecycle-plans/quarantine", async (request, reply) => {
     const session = requireSession(request, reply);
     if (!session) return;
+    const query = z
+      .object({
+        limit: z.coerce.number().int().min(1).max(100).default(100),
+        offset: z.coerce.number().int().min(0).default(0),
+      })
+      .parse(request.query);
+    const page = database.listRecentlyDeletedLibraryVersions(query);
     return {
-      items: database
-        .listQuarantinedLibraryVersions()
-        .map((plan) => lifecyclePlanView(plan, session.user.role)),
+      ...page,
+      items: page.items.map((item) => ({
+        source: lifecyclePlanView(item.source, session.user.role, item.object),
+        latestRestore: item.latestRestore
+          ? lifecyclePlanView(
+              item.latestRestore,
+              session.user.role,
+              item.object,
+            )
+          : null,
+      })),
     };
   });
+
+  app.get(
+    "/api/v1/lifecycle-plans/quarantine/:sourcePlanId",
+    async (request, reply) => {
+      const session = requireSession(request, reply);
+      if (!session) return;
+      const { sourcePlanId } = z
+        .object({ sourcePlanId: z.string().min(1) })
+        .parse(request.params);
+      const item = database.getRecentlyDeletedLibraryVersion(sourcePlanId);
+      if (!item)
+        return reply.code(404).send({
+          error: "RECENTLY_DELETED_NOT_FOUND",
+          message: "这条记录不在当前最近删除集合中",
+        });
+      return {
+        source: lifecyclePlanView(item.source, session.user.role, item.object),
+        latestRestore: item.latestRestore
+          ? lifecyclePlanView(
+              item.latestRestore,
+              session.user.role,
+              item.object,
+            )
+          : null,
+      };
+    },
+  );
 
   app.get("/api/v1/lifecycle-plans", async (request, reply) => {
     const session = requireSession(request, reply);
     if (!session) return;
     const query = z
-      .object({ limit: z.coerce.number().int().min(1).max(100).default(100) })
+      .object({
+        limit: z.coerce.number().int().min(1).max(100).default(100),
+        albumId: z.string().min(1).optional(),
+      })
       .parse(request.query);
+    const libraryAlbumId = query.albumId
+      ? database.resolveLibraryAlbumId(query.albumId)
+      : undefined;
+    const plans =
+      query.albumId && !libraryAlbumId
+        ? []
+        : database.listLibraryChangePlans({
+            limit: query.limit,
+            ...(libraryAlbumId ? { libraryAlbumId } : {}),
+          });
+    const objects = database.getLibraryChangePlanObjects(
+      plans.map((plan) => plan.libraryAlbumId),
+    );
     return {
-      items: database
-        .listLibraryChangePlans({ limit: query.limit })
-        .map((plan) => lifecyclePlanView(plan, session.user.role)),
+      items: plans.map((plan) =>
+        lifecyclePlanView(
+          plan,
+          session.user.role,
+          objects.get(plan.libraryAlbumId),
+        ),
+      ),
     };
   });
 
@@ -1067,7 +1131,13 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       return reply
         .code(404)
         .send({ error: "LIFECYCLE_PLAN_NOT_FOUND", message: "管理计划不存在" });
-    return lifecyclePlanView(plan, session.user.role);
+    return lifecyclePlanView(
+      plan,
+      session.user.role,
+      database
+        .getLibraryChangePlanObjects([plan.libraryAlbumId])
+        .get(plan.libraryAlbumId),
+    );
   });
 
   app.get("/api/v1/albums/:id/artwork", async (request, reply) => {
@@ -2475,26 +2545,32 @@ function handleOrphanGovernanceError(
 function lifecyclePlanView(
   plan: LibraryChangePlan,
   role: "ADMIN" | "MEMBER",
-): LibraryChangePlan | Record<string, unknown> {
-  if (role === "ADMIN") return plan;
-  const {
-    requestId: _requestId,
-    actor: _actor,
-    items,
-    root,
-    ...summary
-  } = plan;
+  object: LibraryChangePlanObject = {
+    title: "唱片记录不可用",
+    albumArtist: null,
+  },
+): LibraryChangePlanRead {
+  const completedStatus =
+    plan.action === "QUARANTINE_VERSION" ? "QUARANTINED" : "RESTORED";
+  const shared = {
+    object,
+    completedFiles: plan.items.filter((item) => item.status === completedStatus)
+      .length,
+  };
+  if (role === "ADMIN") return { ...plan, ...shared };
   return {
-    ...summary,
+    id: plan.id,
+    action: plan.action,
+    status: plan.status,
+    sourcePlanId: plan.sourcePlanId,
+    fileCount: plan.fileCount,
+    totalBytes: plan.totalBytes,
+    ...shared,
     error: plan.error ? "任务需要管理员处理" : null,
-    blockers: plan.blockers.map((blocker) => ({
-      code: blocker.code,
-      message: "需要管理员处理",
-    })),
-    root: { id: root.id, name: root.name, policy: root.policy },
-    completedFiles: items.filter((item) =>
-      ["QUARANTINED", "RESTORED"].includes(item.status),
-    ).length,
+    createdAt: plan.createdAt,
+    confirmedAt: plan.confirmedAt,
+    startedAt: plan.startedAt,
+    finishedAt: plan.finishedAt,
   };
 }
 

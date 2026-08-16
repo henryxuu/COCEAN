@@ -10,6 +10,7 @@ import {
   type LibraryIdentityDecision,
   type LibraryIdentityDecisionCommand,
   type LibraryChangePlan,
+  type LibraryChangePlanRead,
   type LocalVersionSummary,
   type MetadataCommand,
   type MetadataField,
@@ -99,8 +100,8 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
   }, [id]);
   const capabilities = useAsync(() => api.capabilities(), []);
   const lifecyclePlans = useAsync(
-    () => (canManage ? api.lifecyclePlans() : Promise.resolve([])),
-    [canManage],
+    () => api.lifecyclePlans({ albumId: id }),
+    [id],
   );
   const [listeningTrackId, setListeningTrackId] = useState<string | null>(null);
   const [deliveryTargetId, setDeliveryTargetId] = useState("");
@@ -183,15 +184,17 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
     setOrphanGovernanceStale(false);
   }, [id]);
   useEffect(() => {
-    if (lifecyclePreview || !album.data) return;
+    if (!canManage || lifecyclePreview || !album.data) return;
+    const albumId = album.data.id;
     const recoverable = lifecyclePlans.data?.find(
       (plan) =>
         plan.action === "QUARANTINE_VERSION" &&
         plan.status === "PREVIEWED" &&
-        plan.libraryAlbumId === album.data?.id,
+        "items" in plan &&
+        plan.libraryAlbumId === albumId,
     );
-    if (recoverable) setLifecyclePreview(recoverable);
-  }, [album.data, lifecyclePlans.data, lifecyclePreview]);
+    if (recoverable && "items" in recoverable) setLifecyclePreview(recoverable);
+  }, [album.data, canManage, lifecyclePlans.data, lifecyclePreview]);
   if (album.loading)
     return (
       <div className="page">
@@ -267,7 +270,9 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
       setLifecyclePreview(plan);
       await lifecyclePlans.reload();
     } catch (error) {
-      toast.show(error instanceof Error ? error.message : "无法生成隔离预览");
+      toast.show(
+        error instanceof Error ? error.message : "无法生成最近删除预览",
+      );
     } finally {
       setLifecycleWorking(false);
     }
@@ -280,9 +285,11 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
       setLifecyclePreview(null);
       setLifecycleConfirmed(false);
       await Promise.all([album.reload(), lifecyclePlans.reload()]);
-      toast.show("已提交隔离任务；源文件会先校验，再移入 COCEAN 隔离区");
+      toast.show("已提交文件管理任务；源文件会先校验，再移到最近删除");
     } catch (error) {
-      toast.show(error instanceof Error ? error.message : "隔离任务提交失败");
+      toast.show(
+        error instanceof Error ? error.message : "文件管理任务提交失败",
+      );
     } finally {
       setLifecycleWorking(false);
     }
@@ -821,7 +828,7 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
           <details className="management-disclosure">
             <summary>
               <span>显示与存放</span>
-              <small>隐藏唱片，或将托管目录中的本地版本移入隔离区</small>
+              <small>隐藏唱片，或将托管目录中的本地版本移到最近删除</small>
             </summary>
             <div className="lifecycle-governance">
               <div className="lifecycle-visibility-row">
@@ -850,54 +857,74 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
                   <div>
                     <strong>本地文件存放</strong>
                     <p>
-                      隔离不是永久删除；文件会保留在 COCEAN 隔离区，可随时恢复。
+                      最近删除不是永久删除；文件会保留在受控位置，可按原清单恢复。
                     </p>
                   </div>
                 </div>
-                {localVersions.map((version) => (
-                  <div className="lifecycle-version-row" key={version.id}>
-                    <Archive aria-hidden="true" />
-                    <div>
-                      <strong>
-                        {version.isPrimary ? "主版本" : "本地版本"} ·{" "}
-                        {version.fileCount} 个文件
-                      </strong>
-                      <span>
-                        {version.sourceRoot?.name ?? "实体收藏"} ·{" "}
-                        {lifecycleStatusLabel(version.lifecycleStatus)}
-                      </span>
-                      <small>
-                        {version.sourceRoot?.readOnly
-                          ? "只读观察目录：COCEAN 不会改动这里的文件"
-                          : version.sourceRoot
-                            ? "托管目录：可先预览清单，再确认隔离"
-                            : "没有可移动的本地文件"}
-                      </small>
+                {localVersions.map((version) => {
+                  const record = lifecycleRecordForVersion(
+                    lifecyclePlans.data ?? [],
+                    version.id,
+                    canManage,
+                  );
+                  return (
+                    <div className="lifecycle-version-row" key={version.id}>
+                      <Archive aria-hidden="true" />
+                      <div>
+                        <strong>
+                          {version.isPrimary ? "主版本" : "本地版本"} ·{" "}
+                          {version.fileCount} 个文件
+                        </strong>
+                        <span>
+                          {version.sourceRoot?.name ?? "实体收藏"} ·{" "}
+                          {lifecycleStatusLabel(version.lifecycleStatus)}
+                        </span>
+                        <small>
+                          {version.sourceRoot?.readOnly
+                            ? "只读观察目录：COCEAN 不会改动这里的文件"
+                            : version.sourceRoot
+                              ? "托管目录：可先预览清单，再确认移到最近删除"
+                              : "没有可移动的本地文件"}
+                        </small>
+                        {record ? (
+                          <small>
+                            <Link
+                              to={`/quarantine?plan=${encodeURIComponent(
+                                record.action === "RESTORE_VERSION"
+                                  ? (record.sourcePlanId ?? record.id)
+                                  : record.id,
+                              )}`}
+                            >
+                              查看最近删除记录
+                            </Link>
+                          </small>
+                        ) : null}
+                      </div>
+                      {canManage &&
+                      version.sourceRoot &&
+                      !version.sourceRoot.readOnly &&
+                      (version.lifecycleStatus ?? "ACTIVE") === "ACTIVE" ? (
+                        <Button
+                          variant="secondary"
+                          disabled={lifecycleWorking}
+                          onClick={() => void previewQuarantine(version.id)}
+                        >
+                          预览移到最近删除
+                        </Button>
+                      ) : null}
                     </div>
-                    {canManage &&
-                    version.sourceRoot &&
-                    !version.sourceRoot.readOnly &&
-                    (version.lifecycleStatus ?? "ACTIVE") === "ACTIVE" ? (
-                      <Button
-                        variant="secondary"
-                        disabled={lifecycleWorking}
-                        onClick={() => void previewQuarantine(version.id)}
-                      >
-                        预览隔离
-                      </Button>
-                    ) : null}
-                  </div>
-                ))}
+                  );
+                })}
               </div>
 
               {lifecyclePreview ? (
                 <div
                   className="lifecycle-preview"
                   role="region"
-                  aria-label="隔离预览"
+                  aria-label="移到最近删除预览"
                 >
                   <div>
-                    <strong>隔离前确认</strong>
+                    <strong>移到最近删除前确认</strong>
                     <p>
                       将移动 {lifecyclePreview.fileCount} 个文件，共{" "}
                       {formatFileSize(lifecyclePreview.totalBytes)}。
@@ -937,7 +964,7 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
                       }
                       onClick={() => void confirmQuarantine()}
                     >
-                      确认移入隔离区
+                      确认移到最近删除
                     </Button>
                   </div>
                 </div>
@@ -2368,11 +2395,43 @@ function lifecycleStatusLabel(
   return (
     {
       ACTIVE: "在曲库中",
-      QUARANTINING: "正在移入隔离区",
-      QUARANTINED: "已隔离",
+      QUARANTINING: "正在移到最近删除",
+      QUARANTINED: "已移到最近删除",
       RESTORING: "正在恢复",
       RECOVERY_REQUIRED: "需要人工检查",
     }[status] ?? status
+  );
+}
+
+export function lifecycleRecordForVersion(
+  plans: LibraryChangePlanRead[],
+  localVersionId: string,
+  canMatchVersion: boolean,
+): LibraryChangePlanRead | undefined {
+  const relevantPlans = plans.filter(
+    (plan) =>
+      !canMatchVersion ||
+      !("localVersionId" in plan) ||
+      plan.localVersionId === localVersionId,
+  );
+  const successfulRestoreSources = new Set(
+    relevantPlans
+      .filter(
+        (plan) =>
+          plan.action === "RESTORE_VERSION" && plan.status === "SUCCEEDED",
+      )
+      .map((plan) => plan.sourcePlanId)
+      .filter((id): id is string => Boolean(id)),
+  );
+  return relevantPlans.find(
+    (plan) =>
+      (plan.action === "RESTORE_VERSION" &&
+        ["PREVIEWED", "QUEUED", "RUNNING", "RECOVERY_REQUIRED"].includes(
+          plan.status,
+        )) ||
+      (plan.action === "QUARANTINE_VERSION" &&
+        plan.status === "SUCCEEDED" &&
+        !successfulRestoreSources.has(plan.id)),
   );
 }
 function formatDuration(value: number | null) {

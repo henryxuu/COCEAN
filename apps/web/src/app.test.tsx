@@ -42,14 +42,14 @@ describe("登录后的入口路由", () => {
   });
 
   it.each(["ADMIN", "MEMBER"] as const)(
-    "%s 直接访问隔离深链时保留原路由和既有角色页面",
+    "%s 直接访问兼容深链时保留原路由并显示最近删除",
     async (role) => {
       const { renderer, visits } = await renderAppAt("/quarantine", role);
       const location = renderer.root.findByProps({ "data-route-probe": true });
 
       expect(location.props["data-pathname"]).toBe("/quarantine");
       expect(location.props["data-navigation-type"]).toBe("POP");
-      expect(rendererText(renderer.root)).toContain("隔离区");
+      expect(rendererText(renderer.root)).toContain("最近删除");
       expect(visits).toEqual(["/quarantine"]);
 
       await act(async () => renderer.unmount());
@@ -105,6 +105,7 @@ async function renderAppAt(entry: string, role: "ADMIN" | "MEMBER" = "ADMIN") {
   vi.spyOn(api, "albumPage").mockReturnValue(pending);
   vi.spyOn(api, "stats").mockReturnValue(pending);
   vi.spyOn(api, "lifecyclePlans").mockReturnValue(pending);
+  vi.spyOn(api, "quarantinedVersions").mockReturnValue(pending);
 
   let renderer: TestRenderer.ReactTestRenderer;
   await act(async () => {
