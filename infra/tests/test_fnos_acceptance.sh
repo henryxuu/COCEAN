@@ -61,6 +61,132 @@ if grep -F "$TEMP_ROOT" "$OUTPUT_FILE" >/dev/null; then
   exit 1
 fi
 
+SUCCESS_LOG="$TEMP_ROOT/success-calls.log"
+if ! PATH="$FIXTURES:$PATH" \
+   COCEAN_DOCKER_BIN="$FIXTURES/fake-docker.sh" \
+   FAKE_DOCKER_LOG="$SUCCESS_LOG" \
+   sh "$RUNNER" --env-file "$ENV_FILE" --compose-file "$COMPOSE" \
+     >"$OUTPUT_FILE" 2>&1; then
+  printf 'total runner did not complete the success path\n' >&2
+  exit 1
+fi
+grep -q 'acceptance-session issue' "$SUCCESS_LOG"
+grep -q ' acceptance-api' "$SUCCESS_LOG"
+grep -q '^acceptance-api-cookie-ready mode=600$' "$SUCCESS_LOG"
+grep -q 'acceptance-session revoke' "$SUCCESS_LOG"
+[ ! -e "$TEMP_ROOT/data/acceptance/admin-session-cookie" ] || {
+  printf 'success path retained the temporary acceptance Cookie\n' >&2
+  exit 1
+}
+grep -q 'fnos-acceptance: PASS' "$OUTPUT_FILE"
+if grep -F 'cocean_session=' "$SUCCESS_LOG" "$OUTPUT_FILE" >/dev/null; then
+  printf 'success path leaked the raw acceptance Cookie\n' >&2
+  exit 1
+fi
+
+API_FAILURE_LOG="$TEMP_ROOT/api-failure-calls.log"
+if PATH="$FIXTURES:$PATH" \
+   COCEAN_DOCKER_BIN="$FIXTURES/fake-docker.sh" \
+   FAKE_DOCKER_LOG="$API_FAILURE_LOG" \
+   FAKE_API_ACCEPTANCE_FAIL=1 \
+   sh "$RUNNER" --env-file "$ENV_FILE" --compose-file "$COMPOSE" \
+     >/dev/null 2>&1; then
+  printf 'total runner accepted an API Gate failure\n' >&2
+  exit 1
+fi
+grep -q 'acceptance-session issue' "$API_FAILURE_LOG"
+grep -q '^acceptance-api-cookie-ready mode=600$' "$API_FAILURE_LOG"
+grep -q 'acceptance-session revoke' "$API_FAILURE_LOG"
+[ ! -e "$TEMP_ROOT/data/acceptance/admin-session-cookie" ] || {
+  printf 'API failure retained the temporary acceptance Cookie\n' >&2
+  exit 1
+}
+
+ISSUE_FAILURE_LOG="$TEMP_ROOT/issue-failure-calls.log"
+if PATH="$FIXTURES:$PATH" \
+   COCEAN_DOCKER_BIN="$FIXTURES/fake-docker.sh" \
+   FAKE_DOCKER_LOG="$ISSUE_FAILURE_LOG" \
+   FAKE_SESSION_ISSUE_FAIL=1 \
+   sh "$RUNNER" --env-file "$ENV_FILE" --compose-file "$COMPOSE" \
+     >/dev/null 2>&1; then
+  printf 'total runner accepted an acceptance Session issue failure\n' >&2
+  exit 1
+fi
+[ "$(grep -c 'acceptance-session revoke' "$ISSUE_FAILURE_LOG")" -eq 2 ]
+[ ! -e "$TEMP_ROOT/data/acceptance/admin-session-cookie" ] || {
+  printf 'issue failure retained the temporary acceptance Cookie\n' >&2
+  exit 1
+}
+
+ISSUE_SIGNAL_LOG="$TEMP_ROOT/issue-signal-calls.log"
+if PATH="$FIXTURES:$PATH" \
+   COCEAN_DOCKER_BIN="$FIXTURES/fake-docker.sh" \
+   FAKE_DOCKER_LOG="$ISSUE_SIGNAL_LOG" \
+   FAKE_SESSION_ISSUE_SIGNAL=1 \
+   sh "$RUNNER" --env-file "$ENV_FILE" --compose-file "$COMPOSE" \
+     >/dev/null 2>&1; then
+  printf 'total runner accepted a signal during Session issue\n' >&2
+  exit 1
+fi
+[ "$(grep -c 'acceptance-session revoke' "$ISSUE_SIGNAL_LOG")" -eq 2 ]
+[ ! -e "$TEMP_ROOT/data/acceptance/admin-session-cookie" ] || {
+  printf 'issue signal retained the temporary acceptance Cookie\n' >&2
+  exit 1
+}
+
+REVOKE_RETRY_LOG="$TEMP_ROOT/revoke-retry-calls.log"
+if PATH="$FIXTURES:$PATH" \
+   COCEAN_DOCKER_BIN="$FIXTURES/fake-docker.sh" \
+   FAKE_DOCKER_LOG="$REVOKE_RETRY_LOG" \
+   FAKE_SESSION_REVOKE_FAIL_AT=2 \
+   sh "$RUNNER" --env-file "$ENV_FILE" --compose-file "$COMPOSE" \
+     >/dev/null 2>&1; then
+  printf 'total runner ignored an initial Session cleanup failure\n' >&2
+  exit 1
+fi
+[ "$(grep -c 'acceptance-session revoke' "$REVOKE_RETRY_LOG")" -eq 3 ]
+grep -q ' acceptance-api' "$REVOKE_RETRY_LOG"
+[ ! -e "$TEMP_ROOT/data/acceptance/admin-session-cookie" ] || {
+  printf 'finalizer retry did not clean the temporary acceptance Cookie\n' >&2
+  exit 1
+}
+
+REVOKE_FAILURE_LOG="$TEMP_ROOT/revoke-failure-calls.log"
+if PATH="$FIXTURES:$PATH" \
+   COCEAN_DOCKER_BIN="$FIXTURES/fake-docker.sh" \
+   FAKE_DOCKER_LOG="$REVOKE_FAILURE_LOG" \
+   FAKE_SESSION_REVOKE_FAIL_FROM=2 \
+   sh "$RUNNER" --env-file "$ENV_FILE" --compose-file "$COMPOSE" \
+     >/dev/null 2>&1; then
+  printf 'total runner accepted repeated Session cleanup failures\n' >&2
+  exit 1
+fi
+[ "$(grep -c 'acceptance-session revoke' "$REVOKE_FAILURE_LOG")" -eq 3 ]
+grep -q ' acceptance-api' "$REVOKE_FAILURE_LOG"
+[ -e "$TEMP_ROOT/data/acceptance/admin-session-cookie" ] || {
+  printf 'repeated failing revoke was not exercised against Session state\n' >&2
+  exit 1
+}
+rm -f "$TEMP_ROOT/data/acceptance/admin-session-cookie"
+
+SIGNAL_LOG="$TEMP_ROOT/signal-calls.log"
+if PATH="$FIXTURES:$PATH" \
+   COCEAN_DOCKER_BIN="$FIXTURES/fake-docker.sh" \
+   FAKE_DOCKER_LOG="$SIGNAL_LOG" \
+   FAKE_API_ACCEPTANCE_SIGNAL=1 \
+   sh "$RUNNER" --env-file "$ENV_FILE" --compose-file "$COMPOSE" \
+     >/dev/null 2>&1; then
+  printf 'total runner accepted an interrupted API Gate\n' >&2
+  exit 1
+fi
+grep -q 'acceptance-session issue' "$SIGNAL_LOG"
+grep -q '^acceptance-api-cookie-ready mode=600$' "$SIGNAL_LOG"
+grep -q 'acceptance-session revoke' "$SIGNAL_LOG"
+[ ! -e "$TEMP_ROOT/data/acceptance/admin-session-cookie" ] || {
+  printf 'signal exit retained the temporary acceptance Cookie\n' >&2
+  exit 1
+}
+
 BACKUP_FAILURE_LOG="$TEMP_ROOT/backup-failure-calls.log"
 if PATH="$FIXTURES:$PATH" \
    COCEAN_DOCKER_BIN="$FIXTURES/fake-docker.sh" \
@@ -74,6 +200,11 @@ fi
 grep -q 'music-manifest verify' "$BACKUP_FAILURE_LOG"
 if grep -q ' up ' "$BACKUP_FAILURE_LOG"; then
   printf 'total runner deployed after a failed pre-migration backup\n' >&2
+  exit 1
+fi
+
+if grep -F 'cocean_session=' "$TEMP_ROOT"/*-calls.log >/dev/null; then
+  printf 'acceptance invocation log leaked a raw Cookie\n' >&2
   exit 1
 fi
 

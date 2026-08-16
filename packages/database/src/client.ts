@@ -26,6 +26,9 @@ import type {
   LibraryRoot,
   LibraryIssue,
   LibraryIssueCode,
+  LibraryInventoryReport,
+  InventoryFinding,
+  InventoryReason,
   LibraryIdentityDecision,
   LibraryIdentityDecisionCommand,
   LibraryIdentityDecisionResult,
@@ -168,6 +171,29 @@ export class LibraryLifecycleError extends Error {
     super(message);
     this.name = "LibraryLifecycleError";
   }
+}
+
+export class LibraryInventoryReportError extends Error {
+  constructor(
+    public readonly code: "SCAN_NOT_FOUND" | "SCAN_NOT_AUTHORITATIVE",
+    message: string,
+  ) {
+    super(message);
+    this.name = "LibraryInventoryReportError";
+  }
+}
+
+export function countClosedInventoryPartitionEntries(
+  classifications: readonly string[],
+): number {
+  const closed = new Set([
+    "CURRENT_DIGITAL",
+    "PHYSICAL_ONLY",
+    "REFERENCED_HISTORY",
+    "ORPHAN",
+  ]);
+  return classifications.filter((classification) => closed.has(classification))
+    .length;
 }
 
 export interface ArtworkAssetInput {
@@ -1287,6 +1313,331 @@ export class CoceanDatabase {
     return row ? mapScanReport(row) : null;
   }
 
+  getLibraryInventoryReport(scanJobId: string): LibraryInventoryReport {
+    return this.raw.transaction(() => {
+      const scan = this.raw
+        .prepare(
+          `SELECT sj.id,sj.root_id,sj.status,sr.album_count,sr.parsed,sr.created_at
+           FROM scan_jobs sj LEFT JOIN scan_reports sr ON sr.scan_job_id=sj.id
+           WHERE sj.id=?`,
+        )
+        .get(scanJobId) as Record<string, unknown> | undefined;
+      if (!scan)
+        throw new LibraryInventoryReportError(
+          "SCAN_NOT_FOUND",
+          "scan job does not exist",
+        );
+      if (
+        !scan.created_at ||
+        !["COMPLETED", "COMPLETED_WITH_WARNINGS"].includes(
+          String(scan.status),
+        ) ||
+        scan.album_count == null
+      )
+        throw new LibraryInventoryReportError(
+          "SCAN_NOT_AUTHORITATIVE",
+          "scan does not have an authoritative published snapshot",
+        );
+      const latest = this.raw
+        .prepare(
+          `SELECT sr.scan_job_id FROM scan_reports sr
+           JOIN scan_jobs sj ON sj.id=sr.scan_job_id
+           WHERE sr.root_id=? AND sj.status IN ('COMPLETED','COMPLETED_WITH_WARNINGS')
+             AND sr.album_count IS NOT NULL
+           ORDER BY sr.created_at DESC,sr.rowid DESC LIMIT 1`,
+        )
+        .get(String(scan.root_id)) as { scan_job_id: string } | undefined;
+      if (latest?.scan_job_id !== scanJobId)
+        throw new LibraryInventoryReportError(
+          "SCAN_NOT_AUTHORITATIVE",
+          "scan is not the latest published snapshot for its root",
+        );
+
+      const auditReferences = readInventoryAuditVersionReferences(this.raw);
+
+      const localVersionBaseCount = Number(
+        (
+          this.raw.prepare("SELECT COUNT(*) AS count FROM albums").get() as {
+            count: number;
+          }
+        ).count,
+      );
+
+      const rows = readInventoryVersionFactRows(this.raw);
+      const mediaRows = this.raw
+        .prepare(
+          `SELECT af.album_id,af.media_file_id,
+                  a.root_id AS album_root_id,mf.root_id AS media_root_id
+           FROM album_files af
+           JOIN albums a ON a.id=af.album_id
+           JOIN media_files mf ON mf.id=af.media_file_id
+           ORDER BY af.album_id,af.media_file_id`,
+        )
+        .all() as Array<{
+        album_id: string;
+        media_file_id: string;
+        album_root_id: string;
+        media_root_id: string;
+      }>;
+      const mediaByVersion = new Map<string, string[]>();
+      const ownersByMedia = new Map<string, string[]>();
+      for (const item of mediaRows) {
+        const versionMedia = mediaByVersion.get(item.album_id) ?? [];
+        versionMedia.push(item.media_file_id);
+        mediaByVersion.set(item.album_id, versionMedia);
+        const owners = ownersByMedia.get(item.media_file_id) ?? [];
+        owners.push(item.album_id);
+        ownersByMedia.set(item.media_file_id, owners);
+      }
+      const findings: InventoryFinding[] = [];
+      const addFinding = (
+        code: InventoryFinding["code"],
+        localVersionId: string | null = null,
+        libraryAlbumId: string | null = null,
+        mediaFileId: string | null = null,
+      ) => {
+        if (
+          !findings.some(
+            (finding) =>
+              finding.code === code &&
+              finding.localVersionId === localVersionId &&
+              finding.libraryAlbumId === libraryAlbumId &&
+              finding.mediaFileId === mediaFileId,
+          )
+        )
+          findings.push({ code, localVersionId, libraryAlbumId, mediaFileId });
+      };
+      const versions = rows.map((row) => {
+        const localVersionId = String(row.id);
+        const rootId = String(row.root_id);
+        const libraryAlbumId = row.library_album_id
+          ? String(row.library_album_id)
+          : null;
+        const mediaFileIds = mediaByVersion.get(localVersionId) ?? [];
+        const physicalCopyCount = Number(row.physical_copy_count);
+        const reasons: InventoryReason[] = [];
+        let classification: LibraryInventoryReport["versions"][number]["classification"];
+        if (mediaFileIds.length > 0) {
+          classification = "CURRENT_DIGITAL";
+          reasons.push("CURRENT_FILES");
+        } else if (physicalCopyCount > 0) {
+          classification = "PHYSICAL_ONLY";
+          reasons.push("PHYSICAL_COPY");
+        } else {
+          reasons.push(
+            ...zeroFileRetentionReasons(row, localVersionId, auditReferences),
+          );
+          if (reasons.length > 0) classification = "REFERENCED_HISTORY";
+          else {
+            classification = "ORPHAN";
+            reasons.push("NO_CURRENT_FACT");
+          }
+        }
+        if (!localVersionId || !rootId)
+          addFinding(
+            "EMPTY_IDENTIFIER",
+            localVersionId || null,
+            libraryAlbumId,
+          );
+        if (!libraryAlbumId)
+          addFinding("LOCAL_VERSION_WITHOUT_LIBRARY_ALBUM", localVersionId);
+        return {
+          localVersionId,
+          libraryAlbumId,
+          rootId,
+          classification,
+          reasons,
+          mediaFileIds,
+          fileCount: mediaFileIds.length,
+          physicalCopyCount,
+          physicalQuantity: Number(row.physical_quantity),
+          isPrimary: Boolean(row.is_primary),
+        };
+      });
+
+      for (const [mediaFileId, owners] of ownersByMedia)
+        if (owners.length !== 1)
+          addFinding(
+            "MEDIA_FILE_MULTIPLE_OWNERS",
+            owners[0] ?? null,
+            null,
+            mediaFileId,
+          );
+      for (const item of mediaRows)
+        if (item.album_root_id !== item.media_root_id)
+          addFinding(
+            "MEDIA_FILE_ROOT_MISMATCH",
+            item.album_id,
+            null,
+            item.media_file_id,
+          );
+      const groupRows = this.raw
+        .prepare(
+          `SELECT la.id,la.primary_version_id,la.visibility,
+                  EXISTS(SELECT 1 FROM library_album_members lm WHERE lm.library_album_id=la.id AND lm.album_id=la.primary_version_id) AS primary_is_member
+           FROM library_albums la ORDER BY la.id`,
+        )
+        .all() as Record<string, unknown>[];
+      const libraryAlbums = groupRows.map((group) => {
+        const libraryAlbumId = String(group.id);
+        const primary = group.primary_version_id
+          ? String(group.primary_version_id)
+          : null;
+        const memberVersionIds = versions
+          .filter((version) => version.libraryAlbumId === libraryAlbumId)
+          .map((version) => version.localVersionId)
+          .sort();
+        const currentMembers = versions.filter(
+          (version) =>
+            version.libraryAlbumId === libraryAlbumId &&
+            ["CURRENT_DIGITAL", "PHYSICAL_ONLY"].includes(
+              version.classification,
+            ),
+        );
+        const primaryVersion = primary
+          ? versions.find(
+              (version) =>
+                version.localVersionId === primary &&
+                version.libraryAlbumId === libraryAlbumId,
+            )
+          : undefined;
+        const visible = group.visibility === "VISIBLE";
+        if (visible && currentMembers.length === 0)
+          addFinding(
+            "VISIBLE_ALBUM_WITHOUT_CURRENT_MEMBER",
+            null,
+            libraryAlbumId,
+          );
+        if (!primary)
+          addFinding(
+            "LIBRARY_ALBUM_WITHOUT_PRIMARY_VERSION",
+            null,
+            libraryAlbumId,
+          );
+        else if (!Boolean(group.primary_is_member))
+          addFinding("PRIMARY_VERSION_NOT_MEMBER", primary, libraryAlbumId);
+        else if (
+          visible &&
+          primaryVersion &&
+          !["CURRENT_DIGITAL", "PHYSICAL_ONLY"].includes(
+            primaryVersion.classification,
+          )
+        )
+          addFinding("PRIMARY_VERSION_WITHOUT_FILES", primary, libraryAlbumId);
+        return {
+          libraryAlbumId,
+          primaryVersionId: primary,
+          memberVersionIds,
+          visible,
+          displayed:
+            visible &&
+            primaryVersion !== undefined &&
+            ["CURRENT_DIGITAL", "PHYSICAL_ONLY"].includes(
+              primaryVersion.classification,
+            ),
+        };
+      });
+
+      const scanParsedRows = this.raw
+        .prepare(
+          `SELECT sfr.media_file_id,sfr.root_id AS scan_file_root_id,
+                  mf.root_id AS media_root_id
+           FROM scan_file_results sfr
+           LEFT JOIN media_files mf ON mf.id=sfr.media_file_id
+           WHERE sfr.scan_job_id=? AND sfr.outcome='PARSED'
+           ORDER BY sfr.media_file_id`,
+        )
+        .all(scanJobId) as Array<{
+        media_file_id: string;
+        scan_file_root_id: string;
+        media_root_id: string | null;
+      }>;
+      const scanParsedMediaIds = scanParsedRows.map((row) => row.media_file_id);
+      const currentRootMediaIds = versions
+        .filter((version) => version.rootId === String(scan.root_id))
+        .flatMap((version) => version.mediaFileIds)
+        .sort();
+      if (new Set(scanParsedMediaIds).size !== scanParsedMediaIds.length)
+        addFinding("SCAN_PARSED_MEDIA_ID_DUPLICATE");
+      if (new Set(currentRootMediaIds).size !== currentRootMediaIds.length)
+        addFinding("CURRENT_ROOT_MEDIA_ID_DUPLICATE");
+      for (const row of scanParsedRows)
+        if (
+          row.scan_file_root_id !== String(scan.root_id) ||
+          row.media_root_id !== String(scan.root_id)
+        )
+          addFinding("SCAN_MEDIA_ROOT_MISMATCH", null, null, row.media_file_id);
+      const currentRootDigital = versions.filter(
+        (version) =>
+          version.rootId === String(scan.root_id) &&
+          version.classification === "CURRENT_DIGITAL",
+      ).length;
+      if (Number(scan.album_count) !== currentRootDigital)
+        addFinding("SCAN_ALBUM_COUNT_MISMATCH");
+      if (Number(scan.parsed) !== scanParsedMediaIds.length)
+        addFinding("SCAN_PARSED_FILE_COUNT_MISMATCH");
+      if (
+        scanParsedMediaIds.length !== currentRootMediaIds.length ||
+        scanParsedMediaIds.some(
+          (id, index) => id !== currentRootMediaIds[index],
+        )
+      )
+        addFinding("SCAN_MEDIA_ID_MISMATCH");
+      const partitionCount = countClosedInventoryPartitionEntries(
+        versions.map((version) => version.classification),
+      );
+      if (partitionCount !== localVersionBaseCount)
+        addFinding("PARTITION_COUNT_MISMATCH");
+
+      const count = (
+        classification: (typeof versions)[number]["classification"],
+      ) =>
+        versions.filter((version) => version.classification === classification)
+          .length;
+      const counts = {
+        localVersions: localVersionBaseCount,
+        currentDigital: count("CURRENT_DIGITAL"),
+        physicalOnly: count("PHYSICAL_ONLY"),
+        referencedHistory: count("REFERENCED_HISTORY"),
+        orphan: count("ORPHAN"),
+        physicalVersions: versions.filter(
+          (version) => version.physicalCopyCount > 0,
+        ).length,
+        digitalPhysicalOverlap: versions.filter(
+          (version) =>
+            version.classification === "CURRENT_DIGITAL" &&
+            version.physicalCopyCount > 0,
+        ).length,
+        physicalCopies: versions.reduce(
+          (sum, version) => sum + version.physicalCopyCount,
+          0,
+        ),
+        physicalQuantity: versions.reduce(
+          (sum, version) => sum + version.physicalQuantity,
+          0,
+        ),
+        libraryAlbums: libraryAlbums.length,
+        displayedAlbums: libraryAlbums.filter((album) => album.displayed)
+          .length,
+        scanAlbumCount: Number(scan.album_count),
+        scanParsedFiles: Number(scan.parsed),
+      };
+      return {
+        schema: "cocean.library-inventory/v1" as const,
+        scanJobId,
+        rootId: String(scan.root_id),
+        generatedAt: new Date().toISOString(),
+        versions,
+        libraryAlbums,
+        scanParsedMediaIds,
+        currentRootMediaIds,
+        counts,
+        findings,
+        valid: findings.length === 0 && counts.orphan === 0,
+      };
+    })();
+  }
+
   finalizeSuccessfulScan(input: FinalizeSuccessfulScanInput): ScanReport {
     this.raw.transaction(() => {
       const job = this.requireRunningScanJob(input.scanJobId, input.rootId);
@@ -1726,32 +2077,29 @@ export class CoceanDatabase {
       }
     }
     this.remapMergedAlbumDependencies(albums, previousMembership, now);
+    this.raw.exec(
+      "CREATE TEMP TABLE IF NOT EXISTS cocean_retained_album_ids(id TEXT PRIMARY KEY); DELETE FROM cocean_retained_album_ids;",
+    );
+    const rememberRetainedAlbum = this.raw.prepare(
+      "INSERT OR IGNORE INTO cocean_retained_album_ids(id) VALUES (?)",
+    );
+    const auditReferences = readInventoryAuditVersionReferences(this.raw);
+    for (const row of readInventoryVersionFactRows(this.raw)) {
+      const localVersionId = String(row.id);
+      if (
+        zeroFileRetentionReasons(row, localVersionId, auditReferences).length >
+        0
+      )
+        rememberRetainedAlbum.run(localVersionId);
+    }
     this.raw
       .prepare(
         `DELETE FROM albums
          WHERE root_id = ?
            AND id NOT IN (SELECT id FROM cocean_current_album_ids)
-           AND NOT EXISTS (
-             SELECT 1 FROM library_album_members lm
-             JOIN library_albums la ON la.id=lm.library_album_id
-             WHERE lm.album_id=albums.id
-               AND (lm.relationship_status<>'AUTO_CANDIDATE'
-                 OR (la.primary_version_id=albums.id AND la.primary_version_source='USER'))
-           )
+           AND id NOT IN (SELECT id FROM cocean_retained_album_ids)
            AND NOT EXISTS (SELECT 1 FROM physical_copies WHERE physical_copies.album_id = albums.id)
-           AND NOT EXISTS (SELECT 1 FROM release_match_candidates WHERE release_match_candidates.album_id = albums.id)
-           AND NOT EXISTS (SELECT 1 FROM delivery_records WHERE delivery_records.album_id = albums.id)
-           AND NOT EXISTS (SELECT 1 FROM delivery_jobs WHERE delivery_jobs.album_id = albums.id)
-           AND NOT EXISTS (SELECT 1 FROM album_introductions WHERE album_introductions.album_id = albums.id)
-           AND NOT EXISTS (
-             SELECT 1 FROM library_metadata_values mv
-             WHERE mv.scope_type='VERSION' AND mv.owner_id=albums.id
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM library_album_members lm
-             JOIN library_metadata_event_groups meg ON meg.library_album_id=lm.library_album_id
-             WHERE lm.album_id=albums.id
-           )`,
+          `,
       )
       .run(rootId);
     this.raw
@@ -9186,6 +9534,202 @@ function parseJson<T>(value: unknown, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+function readInventoryVersionFactRows(
+  database: Sqlite,
+): Record<string, unknown>[] {
+  return database
+    .prepare(
+      `SELECT a.id,a.root_id,lm.library_album_id,
+              CASE WHEN la.primary_version_id=a.id THEN 1 ELSE 0 END AS is_primary,
+              lm.relationship_status,la.primary_version_source,
+              (SELECT COUNT(*) FROM physical_copies pc WHERE pc.album_id=a.id) AS physical_copy_count,
+              COALESCE((SELECT SUM(pc.quantity) FROM physical_copies pc WHERE pc.album_id=a.id),0) AS physical_quantity,
+              EXISTS(SELECT 1 FROM delivery_records dr WHERE dr.album_id=a.id) AS has_delivery_record,
+              EXISTS(SELECT 1 FROM delivery_jobs dj WHERE dj.album_id=a.id) AS has_delivery_job,
+              EXISTS(SELECT 1 FROM album_introductions ai WHERE ai.album_id=a.id) AS has_introduction,
+              EXISTS(SELECT 1 FROM release_match_candidates rc WHERE rc.album_id=a.id) AS has_candidate,
+              EXISTS(SELECT 1 FROM library_metadata_values mv WHERE mv.scope_type='VERSION' AND mv.owner_id=a.id) AS has_version_metadata,
+              EXISTS(SELECT 1 FROM library_metadata_event_groups meg WHERE meg.library_album_id=lm.library_album_id) AS has_metadata_governance,
+              (EXISTS(SELECT 1 FROM library_artwork_candidates ac WHERE ac.local_version_id=a.id)
+                OR EXISTS(SELECT 1 FROM library_artwork_selections ase WHERE ase.library_album_id=lm.library_album_id)
+                OR EXISTS(SELECT 1 FROM library_artwork_event_groups aeg WHERE aeg.library_album_id=lm.library_album_id)) AS has_artwork,
+              EXISTS(SELECT 1 FROM library_visibility_events ve WHERE ve.library_album_id=lm.library_album_id) AS has_visibility,
+              EXISTS(SELECT 1 FROM library_change_plans cp WHERE cp.local_version_id=a.id) AS has_lifecycle,
+              EXISTS(SELECT 1 FROM library_issues li WHERE li.album_id=a.id) AS has_issue
+       FROM albums a
+       LEFT JOIN library_album_members lm ON lm.album_id=a.id
+       LEFT JOIN library_albums la ON la.id=lm.library_album_id
+       ORDER BY a.id`,
+    )
+    .all() as Record<string, unknown>[];
+}
+
+function zeroFileRetentionReasons(
+  row: Record<string, unknown>,
+  localVersionId: string,
+  auditReferences: ReturnType<typeof readInventoryAuditVersionReferences>,
+): InventoryReason[] {
+  const facts: Array<[boolean, InventoryReason]> = [
+    [Boolean(row.has_delivery_record), "DELIVERY_RECORD"],
+    [Boolean(row.has_delivery_job), "DELIVERY_JOB"],
+    [Boolean(row.has_introduction), "ALBUM_INTRODUCTION"],
+    [Boolean(row.has_candidate), "RELEASE_CANDIDATE"],
+    [
+      row.relationship_status === "USER_CONFIRMED" ||
+        row.relationship_status === "USER_SEPARATE" ||
+        auditReferences.identity.has(localVersionId),
+      "USER_IDENTITY",
+    ],
+    [
+      row.primary_version_source === "USER" && Boolean(row.is_primary),
+      "USER_PRIMARY",
+    ],
+    [Boolean(row.has_version_metadata), "VERSION_METADATA"],
+    [
+      Boolean(row.has_metadata_governance) ||
+        auditReferences.metadata.has(localVersionId),
+      "METADATA_GOVERNANCE",
+    ],
+    [
+      Boolean(row.has_artwork) || auditReferences.artwork.has(localVersionId),
+      "ARTWORK_GOVERNANCE",
+    ],
+    [Boolean(row.has_visibility), "VISIBILITY_GOVERNANCE"],
+    [Boolean(row.has_lifecycle), "LIFECYCLE_GOVERNANCE"],
+    [Boolean(row.has_issue), "LIBRARY_ISSUE"],
+  ];
+  return facts.filter(([present]) => present).map(([, reason]) => reason);
+}
+
+function readInventoryAuditVersionReferences(database: Sqlite): {
+  identity: Set<string>;
+  metadata: Set<string>;
+  artwork: Set<string>;
+} {
+  const result = {
+    identity: new Set<string>(),
+    metadata: new Set<string>(),
+    artwork: new Set<string>(),
+  };
+  const add = (target: Set<string>, value: unknown) => {
+    if (typeof value === "string" && value.length > 0) target.add(value);
+  };
+  const object = (value: unknown): Record<string, unknown> | null =>
+    typeof value === "object" && value !== null && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
+  const array = (value: unknown): unknown[] =>
+    Array.isArray(value) ? value : [];
+  const parsed = (value: unknown): Record<string, unknown> | null =>
+    object(parseJson<unknown>(value, null));
+
+  const identityRows = database
+    .prepare(
+      `SELECT input_json,details_json,before_state_json,after_state_json,result_json
+       FROM library_identity_decisions`,
+    )
+    .all() as Record<string, unknown>[];
+  for (const row of identityRows) {
+    for (const column of [
+      "input_json",
+      "details_json",
+      "before_state_json",
+      "after_state_json",
+      "result_json",
+    ]) {
+      const document = parsed(row[column]);
+      if (!document) continue;
+      add(result.identity, document.primaryVersionId);
+      for (const partitionValue of array(document.partitions)) {
+        const partition = object(partitionValue);
+        if (!partition) continue;
+        add(result.identity, partition.primaryVersionId);
+        for (const id of array(partition.versionIds)) add(result.identity, id);
+      }
+      const details = object(document.details);
+      if (details) {
+        add(result.identity, details.primaryVersionId);
+        for (const partitionValue of array(details.partitions)) {
+          const partition = object(partitionValue);
+          if (!partition) continue;
+          add(result.identity, partition.primaryVersionId);
+          for (const id of array(partition.versionIds))
+            add(result.identity, id);
+        }
+      }
+      for (const groupValue of array(document.groups)) {
+        const group = object(groupValue);
+        if (!group) continue;
+        add(result.identity, group.primaryVersionId);
+        for (const memberValue of array(group.members)) {
+          const member = object(memberValue);
+          if (member) add(result.identity, member.albumId);
+        }
+      }
+    }
+  }
+
+  const metadataRows = database
+    .prepare(
+      `SELECT input_json,commands_json,before_state_json,after_state_json,result_json
+       FROM library_metadata_events`,
+    )
+    .all() as Record<string, unknown>[];
+  for (const row of metadataRows) {
+    for (const column of [
+      "input_json",
+      "commands_json",
+      "before_state_json",
+      "after_state_json",
+      "result_json",
+    ]) {
+      const raw = parseJson<unknown>(row[column], null);
+      const document = object(raw);
+      const commands = Array.isArray(raw) ? raw : array(document?.commands);
+      for (const commandValue of commands) {
+        const command = object(commandValue);
+        if (command) add(result.metadata, command.versionId);
+      }
+      if (!document) continue;
+      for (const id of array(document.memberVersionIds))
+        add(result.metadata, id);
+      for (const valueItem of array(document.values)) {
+        const value = object(valueItem);
+        if (value?.scopeType === "VERSION") add(result.metadata, value.ownerId);
+      }
+    }
+  }
+
+  const artworkRows = database
+    .prepare(
+      `SELECT input_json,before_state_json,after_state_json,result_json
+       FROM library_artwork_events`,
+    )
+    .all() as Record<string, unknown>[];
+  for (const row of artworkRows) {
+    for (const column of [
+      "input_json",
+      "before_state_json",
+      "after_state_json",
+      "result_json",
+    ]) {
+      const document = parsed(row[column]);
+      if (!document) continue;
+      add(result.artwork, document.localVersionId);
+      for (const candidateValue of array(document.candidates)) {
+        const candidate = object(candidateValue);
+        if (candidate) add(result.artwork, candidate.localVersionId);
+      }
+      const artwork = object(document.artwork);
+      for (const candidateValue of array(artwork?.candidates)) {
+        const candidate = object(candidateValue);
+        if (candidate) add(result.artwork, candidate.localVersionId);
+      }
+    }
+  }
+  return result;
 }
 
 function normalizedStringArray(value: unknown): string[] {

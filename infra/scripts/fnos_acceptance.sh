@@ -18,6 +18,8 @@ MANIFEST_HASH=sha256
 BACKUP_READY=0
 BACKUP_ID=""
 DEPLOYMENT_STARTED=0
+ACCEPTANCE_SESSION_CLEANUP=0
+ACCEPTANCE_COOKIE_FILE=""
 
 usage() {
   cat <<'EOF'
@@ -89,6 +91,15 @@ finalize() {
   result=$incoming
   [ "$FINALIZED" -eq 0 ] || return "$result"
   FINALIZED=1
+  if [ "$ACCEPTANCE_SESSION_CLEANUP" -eq 1 ]; then
+    if compose --profile maintenance run --rm --no-deps acceptance-session revoke \
+      >/dev/null 2>&1; then
+      ACCEPTANCE_SESSION_CLEANUP=0
+    else
+      printf 'fnos-acceptance: FAIL: temporary acceptance session could not be revoked\n' >&2
+      [ "$result" -ne 0 ] || result=1
+    fi
+  fi
   if [ "$BASELINE_READY" -eq 1 ]; then
     current_hash=$(digest_file "$BASELINE_FILE" 2>/dev/null || true)
     if [ -z "$current_hash" ] || [ "$current_hash" != "$BASELINE_HASH" ]; then
@@ -159,6 +170,7 @@ case "$MANIFEST_HASH" in
   *) fail_now 64 "COCEAN_ACCEPTANCE_MANIFEST_HASH must be sha256 or none" ;;
 esac
 BASELINE_FILE="${data_dir%/}/acceptance/music-before.jsonl"
+ACCEPTANCE_COOKIE_FILE="${data_dir%/}/acceptance/admin-session-cookie"
 digest_file "$ENV_FILE" >/dev/null 2>&1 || fail_now 69 "a SHA-256 utility is required"
 
 printf 'fnos-acceptance: stage 2/8 prepare immutable application images\n'
@@ -214,9 +226,25 @@ if ! COCEAN_DOCKER_BIN="$DOCKER_BIN" sh "$SCRIPT_DIR/fnos_runtime_inspect.sh" \
 fi
 
 printf 'fnos-acceptance: stage 7/8 acquire scan evidence and verify every API surface\n'
+ACCEPTANCE_SESSION_CLEANUP=1
+if ! compose --profile maintenance run --rm --no-deps acceptance-session revoke \
+  >/dev/null 2>&1; then
+  fail_now 1 "stale temporary ADMIN acceptance session could not be cleaned"
+fi
+if ! compose --profile maintenance run --rm --no-deps acceptance-session issue \
+  >/dev/null 2>&1; then
+  fail_now 1 "temporary ADMIN acceptance session could not be issued"
+fi
+[ -f "$ACCEPTANCE_COOKIE_FILE" ] || fail_now 1 "temporary acceptance Cookie file is absent"
 if ! compose --profile acceptance run --rm --no-deps acceptance-api; then
   fail_now 1 "full-library API acceptance failed"
 fi
+if ! compose --profile maintenance run --rm --no-deps acceptance-session revoke \
+  >/dev/null 2>&1; then
+  fail_now 1 "temporary ADMIN acceptance session could not be revoked"
+fi
+ACCEPTANCE_SESSION_CLEANUP=0
+[ ! -e "$ACCEPTANCE_COOKIE_FILE" ] || fail_now 1 "temporary acceptance Cookie file survived revocation"
 
 printf 'fnos-acceptance: stage 8/8 verify Music manifest on exit\n'
 exit 0

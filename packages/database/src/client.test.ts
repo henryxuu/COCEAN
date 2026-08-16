@@ -8,6 +8,7 @@ import {
   AlbumMetadataDecisionError,
   CoceanDatabase,
   LibraryLifecycleError,
+  countClosedInventoryPartitionEntries,
 } from "./client.js";
 import {
   createVerifiedDatabaseBackup,
@@ -29,6 +30,20 @@ afterEach(async () => {
 });
 
 describe("CoceanDatabase", () => {
+  it("counts only members of the closed inventory partition", () => {
+    expect(
+      countClosedInventoryPartitionEntries([
+        "CURRENT_DIGITAL",
+        "PHYSICAL_ONLY",
+        "REFERENCED_HISTORY",
+        "ORPHAN",
+      ]),
+    ).toBe(4);
+    expect(
+      countClosedInventoryPartitionEntries(["CURRENT_DIGITAL", "UNKNOWN"]),
+    ).toBe(1);
+  });
+
   it("persists model verification and invalidates it when the connection changes", () => {
     const database = new CoceanDatabase(":memory:");
     open.push(database);
@@ -946,7 +961,11 @@ describe("CoceanDatabase", () => {
       },
     ]);
 
-    expect(database.getAlbum("album-copy")).toBeNull();
+    expect(
+      database.raw
+        .prepare("SELECT COUNT(*) AS count FROM albums WHERE id='album-copy'")
+        .get(),
+    ).toEqual({ count: 1 });
     expect(database.getAlbum("album-primary")).toEqual(
       expect.objectContaining({ physicalMedia: ["CD"] }),
     );
@@ -3008,10 +3027,10 @@ describe("CoceanDatabase", () => {
         albumArtist: "Artist",
       },
     ]);
-    expect(database.getAlbumSummary(groupId)!.revision).toBe(3);
+    expect(database.getAlbumSummary(groupId)!.revision).toBe(2);
     expect(
       database.getAlbum(groupId)?.localVersions.map((item) => item.id),
-    ).toEqual(["revision-b", "revision-c"]);
+    ).toEqual(["revision-a", "revision-b", "revision-c"]);
   });
 
   it("advances revision when automatic primary selection changes on rescan", () => {
@@ -3735,6 +3754,752 @@ describe("CoceanDatabase", () => {
     ).toThrow(/immutable|frozen/);
   });
 
+  it("builds an authoritative mutually-exclusive inventory partition from explicit facts", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    createRunningScan(database, "inventory-scan");
+    const file = observedFile("Artist/Digital/01.flac", 10);
+    database.recordScanDiscovery({
+      scanJobId: "inventory-scan",
+      rulesVersion: "inventory-test/1",
+      candidates: 1,
+      regularFiles: 1,
+      auxiliaryFiles: 0,
+      ignoredFiles: 0,
+      skippedSymlinks: 0,
+      traversalErrors: 0,
+    });
+    database.recordScanFileResult({
+      scanJobId: "inventory-scan",
+      rootId: "music",
+      relativePath: file.relativePath,
+      extension: ".flac",
+      candidateKind: "SUPPORTED_AUDIO",
+      outcome: "PARSED",
+      mediaFileId: "inventory-file",
+      sizeBytes: file.sizeBytes,
+      modifiedAtMs: file.modifiedAtMs,
+      errorCode: null,
+      errorStage: null,
+      warningCodes: [],
+    });
+    database.finalizeSuccessfulScan({
+      scanJobId: "inventory-scan",
+      rootId: "music",
+      stagedFiles: [{ id: "inventory-file", file }],
+      seenRelativePaths: [file.relativePath],
+      albums: [albumInput("digital-version", ["inventory-file"])],
+      withWarnings: false,
+    });
+    const now = "2026-08-16T00:00:00.000Z";
+    database.createPhysicalCopy({
+      id: "digital-copy",
+      albumId: "digital-version",
+      medium: "CD",
+      label: null,
+      catalogNumber: null,
+      barcode: null,
+      country: null,
+      releaseYear: null,
+      quantity: 2,
+      conditionNote: null,
+      storageLocation: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    database.createPhysicalOnlyAlbum({
+      id: "physical-version",
+      groupKey: "physical-version",
+      title: "Physical",
+      albumArtist: "Artist",
+      year: null,
+    });
+    database.createPhysicalCopy({
+      id: "physical-copy",
+      albumId: "physical-version",
+      medium: "VINYL",
+      label: null,
+      catalogNumber: null,
+      barcode: null,
+      country: null,
+      releaseYear: null,
+      quantity: 1,
+      conditionNote: null,
+      storageLocation: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    database.createPhysicalOnlyAlbum({
+      id: "history-version",
+      groupKey: "history-version",
+      title: "History",
+      albumArtist: "Artist",
+      year: null,
+    });
+    database.raw
+      .prepare(
+        `INSERT INTO album_introductions
+         (album_id,content,model,factual_basis_json,source_hash,generated_at)
+         VALUES ('history-version','history','local','{}',?,?)`,
+      )
+      .run("a".repeat(64), now);
+    const historyLibraryAlbumId =
+      database.getAlbumSummary("history-version")!.id;
+    database.raw
+      .prepare("UPDATE library_albums SET visibility='HIDDEN' WHERE id=?")
+      .run(historyLibraryAlbumId);
+
+    const report = database.getLibraryInventoryReport("inventory-scan");
+    const independentAlbumBase = Number(
+      (
+        database.raw.prepare("SELECT COUNT(*) AS count FROM albums").get() as {
+          count: number;
+        }
+      ).count,
+    );
+    expect(report.findings).toEqual([]);
+    expect(report.valid).toBe(true);
+    expect(report.counts.localVersions).toBe(independentAlbumBase);
+    expect(
+      report.counts.currentDigital +
+        report.counts.physicalOnly +
+        report.counts.referencedHistory +
+        report.counts.orphan,
+    ).toBe(independentAlbumBase);
+    expect(report.counts).toEqual(
+      expect.objectContaining({
+        localVersions: 3,
+        currentDigital: 1,
+        physicalOnly: 1,
+        referencedHistory: 1,
+        orphan: 0,
+        physicalVersions: 2,
+        digitalPhysicalOverlap: 1,
+        physicalCopies: 2,
+        physicalQuantity: 3,
+        scanAlbumCount: 1,
+        scanParsedFiles: 1,
+      }),
+    );
+    expect(report.versions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          localVersionId: "digital-version",
+          classification: "CURRENT_DIGITAL",
+          reasons: ["CURRENT_FILES"],
+        }),
+        expect.objectContaining({
+          localVersionId: "physical-version",
+          classification: "PHYSICAL_ONLY",
+          reasons: ["PHYSICAL_COPY"],
+        }),
+        expect.objectContaining({
+          localVersionId: "history-version",
+          classification: "REFERENCED_HISTORY",
+          reasons: expect.arrayContaining(["ALBUM_INTRODUCTION"]),
+        }),
+      ]),
+    );
+    expect(report.scanParsedMediaIds).toEqual(["inventory-file"]);
+    expect(report.currentRootMediaIds).toEqual(["inventory-file"]);
+    expect(JSON.stringify(report)).not.toContain("/library/music");
+  });
+
+  it("fails inventory closed when a visible LibraryAlbum has no primary version", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    finalizeEmptyInventoryScan(database, "missing-primary-scan");
+    database.createPhysicalOnlyAlbum({
+      id: "missing-primary-version",
+      groupKey: "missing-primary-version",
+      title: "Missing Primary",
+      albumArtist: "Artist",
+      year: null,
+    });
+    const libraryAlbumId = database.getAlbumSummary(
+      "missing-primary-version",
+    )!.id;
+    database.raw
+      .prepare("UPDATE library_albums SET primary_version_id=NULL WHERE id=?")
+      .run(libraryAlbumId);
+
+    const report = database.getLibraryInventoryReport("missing-primary-scan");
+    expect(
+      report.libraryAlbums.find(
+        (album) => album.libraryAlbumId === libraryAlbumId,
+      ),
+    ).toEqual(
+      expect.objectContaining({ visible: true, primaryVersionId: null }),
+    );
+    expect(report.findings).toContainEqual({
+      code: "LIBRARY_ALBUM_WITHOUT_PRIMARY_VERSION",
+      localVersionId: null,
+      libraryAlbumId,
+      mediaFileId: null,
+    });
+    expect(report.valid).toBe(false);
+  });
+
+  it("fails inventory closed when a visible LibraryAlbum points at another group's member", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    finalizeEmptyInventoryScan(database, "cross-group-primary-scan");
+    for (const id of ["primary-group-a", "primary-group-b"])
+      database.createPhysicalOnlyAlbum({
+        id,
+        groupKey: id,
+        title: id,
+        albumArtist: "Artist",
+        year: null,
+      });
+    const firstGroupId = database.getAlbumSummary("primary-group-a")!.id;
+    const secondGroupId = database.getAlbumSummary("primary-group-b")!.id;
+    expect(firstGroupId).not.toBe(secondGroupId);
+    database.raw
+      .prepare(
+        "UPDATE library_albums SET primary_version_id='primary-group-b' WHERE id=?",
+      )
+      .run(firstGroupId);
+
+    const report = database.getLibraryInventoryReport(
+      "cross-group-primary-scan",
+    );
+    expect(
+      report.libraryAlbums.find(
+        (album) => album.libraryAlbumId === firstGroupId,
+      ),
+    ).toEqual(
+      expect.objectContaining({
+        visible: true,
+        primaryVersionId: "primary-group-b",
+      }),
+    );
+    expect(report.findings).toContainEqual({
+      code: "PRIMARY_VERSION_NOT_MEMBER",
+      localVersionId: "primary-group-b",
+      libraryAlbumId: firstGroupId,
+      mediaFileId: null,
+    });
+    expect(report.valid).toBe(false);
+  });
+
+  it("fails inventory closed for a visible all-history LibraryAlbum", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    finalizeEmptyInventoryScan(database, "visible-history-scan");
+    database.createPhysicalOnlyAlbum({
+      id: "visible-history-version",
+      groupKey: "visible-history-version",
+      title: "Visible History",
+      albumArtist: "Artist",
+      year: null,
+    });
+    database.raw
+      .prepare(
+        `INSERT INTO album_introductions
+         (album_id,content,model,factual_basis_json,source_hash,generated_at)
+         VALUES ('visible-history-version','history','local','{}',?,?)`,
+      )
+      .run("b".repeat(64), "2026-08-16T00:00:00.000Z");
+    const libraryAlbumId = database.getAlbumSummary(
+      "visible-history-version",
+    )!.id;
+
+    const report = database.getLibraryInventoryReport("visible-history-scan");
+    expect(report.findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "VISIBLE_ALBUM_WITHOUT_CURRENT_MEMBER",
+          libraryAlbumId,
+        }),
+        expect.objectContaining({
+          code: "PRIMARY_VERSION_WITHOUT_FILES",
+          localVersionId: "visible-history-version",
+          libraryAlbumId,
+        }),
+      ]),
+    );
+    expect(report.valid).toBe(false);
+  });
+
+  it("fails inventory closed for an ungrouped local version", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    finalizeSingleFileInventoryScan(database, "ungrouped-version-scan");
+    database.raw
+      .prepare(
+        "DELETE FROM library_album_members WHERE album_id='ungrouped-version-scan-version'",
+      )
+      .run();
+
+    const report = database.getLibraryInventoryReport("ungrouped-version-scan");
+    expect(report.findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "LOCAL_VERSION_WITHOUT_LIBRARY_ALBUM",
+          localVersionId: "ungrouped-version-scan-version",
+        }),
+      ]),
+    );
+    expect(report.valid).toBe(false);
+  });
+
+  it("fails inventory closed when Album, media, and scan roots diverge", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    finalizeSingleFileInventoryScan(database, "cross-root-scan");
+    database.raw
+      .prepare("UPDATE media_files SET root_id='physical' WHERE id=?")
+      .run("cross-root-scan-file");
+
+    const report = database.getLibraryInventoryReport("cross-root-scan");
+    expect(report.findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "MEDIA_FILE_ROOT_MISMATCH",
+          localVersionId: "cross-root-scan-version",
+          mediaFileId: "cross-root-scan-file",
+        }),
+        expect.objectContaining({
+          code: "SCAN_MEDIA_ROOT_MISMATCH",
+          mediaFileId: "cross-root-scan-file",
+        }),
+      ]),
+    );
+    expect(report.valid).toBe(false);
+  });
+
+  it("fails inventory closed when frozen PARSED media identifiers repeat", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    finalizeSingleFileInventoryScan(database, "duplicate-parsed-scan");
+    database.raw.exec("DROP TRIGGER scan_file_results_no_late_insert");
+    database.raw
+      .prepare(
+        `INSERT INTO scan_file_results
+         (scan_job_id,root_id,relative_path,extension,candidate_kind,outcome,
+          media_file_id,size_bytes,modified_at_ms,error_code,error_stage,
+          warning_codes_json,created_at)
+         SELECT scan_job_id,root_id,'Artist/Duplicate/02.flac',extension,
+                candidate_kind,outcome,media_file_id,size_bytes,modified_at_ms,
+                error_code,error_stage,warning_codes_json,created_at
+         FROM scan_file_results WHERE scan_job_id=? AND outcome='PARSED' LIMIT 1`,
+      )
+      .run("duplicate-parsed-scan");
+
+    const report = database.getLibraryInventoryReport("duplicate-parsed-scan");
+    expect(report.scanParsedMediaIds).toEqual([
+      "duplicate-parsed-scan-file",
+      "duplicate-parsed-scan-file",
+    ]);
+    expect(report.findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: "SCAN_PARSED_MEDIA_ID_DUPLICATE" }),
+        expect.objectContaining({ code: "SCAN_PARSED_FILE_COUNT_MISMATCH" }),
+      ]),
+    );
+    expect(report.valid).toBe(false);
+  });
+
+  it("fails inventory closed when the frozen scan album count drifts from current state", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    finalizeSingleFileInventoryScan(database, "album-count-drift-scan");
+    database.raw.exec("DROP TRIGGER scan_reports_immutable_update");
+    database.raw
+      .prepare(
+        "UPDATE scan_reports SET album_count=album_count+1 WHERE scan_job_id=?",
+      )
+      .run("album-count-drift-scan");
+
+    const report = database.getLibraryInventoryReport("album-count-drift-scan");
+    expect(report.counts.scanAlbumCount).toBe(2);
+    expect(report.counts.currentDigital).toBe(1);
+    expect(report.findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: "SCAN_ALBUM_COUNT_MISMATCH" }),
+      ]),
+    );
+    expect(report.valid).toBe(false);
+  });
+
+  it("fails inventory closed when the frozen PARSED media set drifts from current state", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    finalizeSingleFileInventoryScan(database, "parsed-media-drift-scan");
+    database.raw.exec("DROP TRIGGER scan_file_results_immutable_update");
+    database.raw
+      .prepare(
+        `UPDATE scan_file_results SET media_file_id='different-parsed-media'
+         WHERE scan_job_id=? AND outcome='PARSED'`,
+      )
+      .run("parsed-media-drift-scan");
+
+    const report = database.getLibraryInventoryReport(
+      "parsed-media-drift-scan",
+    );
+    expect(report.scanParsedMediaIds).toEqual(["different-parsed-media"]);
+    expect(report.currentRootMediaIds).toEqual([
+      "parsed-media-drift-scan-file",
+    ]);
+    expect(report.findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: "SCAN_MEDIA_ID_MISMATCH" }),
+      ]),
+    );
+    expect(report.valid).toBe(false);
+  });
+
+  it("fails inventory closed for an orphan and an unplayable visible primary", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    createRunningScan(database, "invalid-inventory-scan");
+    const file = observedFile("Artist/Valid/01.flac", 10);
+    database.recordScanDiscovery({
+      scanJobId: "invalid-inventory-scan",
+      rulesVersion: "inventory-test/1",
+      candidates: 1,
+      regularFiles: 1,
+      auxiliaryFiles: 0,
+      ignoredFiles: 0,
+      skippedSymlinks: 0,
+      traversalErrors: 0,
+    });
+    database.recordScanFileResult({
+      scanJobId: "invalid-inventory-scan",
+      rootId: "music",
+      relativePath: file.relativePath,
+      extension: ".flac",
+      candidateKind: "SUPPORTED_AUDIO",
+      outcome: "PARSED",
+      mediaFileId: "valid-file",
+      sizeBytes: file.sizeBytes,
+      modifiedAtMs: file.modifiedAtMs,
+      errorCode: null,
+      errorStage: null,
+      warningCodes: [],
+    });
+    database.finalizeSuccessfulScan({
+      scanJobId: "invalid-inventory-scan",
+      rootId: "music",
+      stagedFiles: [{ id: "valid-file", file }],
+      seenRelativePaths: [file.relativePath],
+      albums: [
+        { ...albumInput("valid-version", ["valid-file"]), title: "Grouped" },
+        { ...albumInput("stale-version", []), title: "Grouped" },
+      ],
+      withWarnings: false,
+    });
+    const groupId = database.getAlbumSummary("valid-version")!.id;
+    database.createPhysicalOnlyAlbum({
+      id: "orphan-version",
+      groupKey: "orphan-version",
+      title: "Orphan",
+      albumArtist: "Nobody",
+      year: null,
+    });
+    database.raw
+      .prepare("DELETE FROM library_issues WHERE album_id='orphan-version'")
+      .run();
+    database.raw
+      .prepare(
+        `UPDATE library_albums SET primary_version_id='stale-version'
+         WHERE id=?`,
+      )
+      .run(groupId);
+
+    const report = database.getLibraryInventoryReport("invalid-inventory-scan");
+    expect(report.valid).toBe(false);
+    expect(report.counts.orphan).toBeGreaterThan(0);
+    expect(report.findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "PRIMARY_VERSION_WITHOUT_FILES",
+          localVersionId: "stale-version",
+        }),
+      ]),
+    );
+  });
+
+  it("accepts only known structured audit references and never fuzzy JSON text", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    createRunningScan(database, "audit-inventory-scan");
+    database.recordScanDiscovery({
+      scanJobId: "audit-inventory-scan",
+      rulesVersion: "inventory-test/1",
+      candidates: 0,
+      regularFiles: 0,
+      auxiliaryFiles: 0,
+      ignoredFiles: 0,
+      skippedSymlinks: 0,
+      traversalErrors: 0,
+    });
+    database.finalizeSuccessfulScan({
+      scanJobId: "audit-inventory-scan",
+      rootId: "music",
+      stagedFiles: [],
+      seenRelativePaths: [],
+      albums: [],
+      withWarnings: false,
+    });
+    for (const id of ["audit-version", "fuzzy-version"])
+      database.createPhysicalOnlyAlbum({
+        id,
+        groupKey: id,
+        title: id,
+        albumArtist: "Audit",
+        year: null,
+      });
+    database.raw
+      .prepare(
+        `DELETE FROM library_issues
+         WHERE album_id IN ('audit-version','fuzzy-version')`,
+      )
+      .run();
+    database.raw
+      .prepare(
+        `INSERT INTO library_identity_decisions
+         (id,request_id,library_album_id,decision_type,actor_id,actor_display_name,
+          expected_revision,resulting_revision,input_json,details_json,
+          before_state_json,after_state_json,result_json,created_at)
+         VALUES ('audit-decision','audit-request','retired-group','CONFIRM','admin','Admin',
+                 0,1,?, '{}', ?, ?, ?, ?)`,
+      )
+      .run(
+        JSON.stringify({ note: "fuzzy-version" }),
+        JSON.stringify({
+          groups: [
+            {
+              primaryVersionId: "audit-version",
+              members: [{ albumId: "audit-version" }],
+            },
+          ],
+        }),
+        "{}",
+        "{}",
+        "2026-08-16T00:00:00.000Z",
+      );
+
+    const report = database.getLibraryInventoryReport("audit-inventory-scan");
+    expect(report.versions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          localVersionId: "audit-version",
+          classification: "REFERENCED_HISTORY",
+          reasons: expect.arrayContaining(["USER_IDENTITY"]),
+        }),
+        expect.objectContaining({
+          localVersionId: "fuzzy-version",
+          classification: "ORPHAN",
+          reasons: ["NO_CURRENT_FACT"],
+        }),
+      ]),
+    );
+  });
+
+  it("retains exact structured audit history through an isolated rescan but deletes fuzzy text", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    database.replaceAlbumsForRoot("music", [
+      albumInput("retained-audit-version", []),
+      albumInput("fuzzy-audit-version", []),
+    ]);
+    database.raw
+      .prepare(
+        `DELETE FROM library_issues
+         WHERE album_id IN ('retained-audit-version','fuzzy-audit-version')`,
+      )
+      .run();
+    const libraryAlbumId = database.getAlbumSummary(
+      "retained-audit-version",
+    )!.id;
+    database.raw
+      .prepare(
+        `INSERT INTO library_identity_decisions
+         (id,request_id,library_album_id,decision_type,actor_id,actor_display_name,
+          expected_revision,resulting_revision,input_json,details_json,
+          before_state_json,after_state_json,result_json,created_at)
+         VALUES ('retention-audit-decision','retention-audit-request',?,'CONFIRM',
+                 'admin','Admin',0,1,?,'{}','{}',?,'{}',?)`,
+      )
+      .run(
+        libraryAlbumId,
+        JSON.stringify({ note: "fuzzy-audit-version" }),
+        JSON.stringify({
+          groups: [
+            {
+              primaryVersionId: "retained-audit-version",
+              members: [{ albumId: "retained-audit-version" }],
+            },
+          ],
+        }),
+        "2026-08-16T00:00:00.000Z",
+      );
+
+    finalizeEmptyInventoryScan(database, "audit-retention-rescan");
+    expect(
+      database.raw
+        .prepare("SELECT COUNT(*) AS count FROM albums WHERE id=?")
+        .get("retained-audit-version"),
+    ).toEqual({ count: 1 });
+    expect(
+      database.raw
+        .prepare("SELECT COUNT(*) AS count FROM albums WHERE id=?")
+        .get("fuzzy-audit-version"),
+    ).toEqual({ count: 0 });
+    expect(
+      database
+        .getLibraryInventoryReport("audit-retention-rescan")
+        .versions.find(
+          (version) => version.localVersionId === "retained-audit-version",
+        ),
+    ).toEqual(
+      expect.objectContaining({
+        classification: "REFERENCED_HISTORY",
+        reasons: expect.arrayContaining(["USER_IDENTITY"]),
+      }),
+    );
+  });
+
+  it("uses the last successful published snapshot and rejects superseded success", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    const completeEmpty = (id: string) => {
+      createRunningScan(database, id);
+      database.recordScanDiscovery({
+        scanJobId: id,
+        rulesVersion: "inventory-test/1",
+        candidates: 0,
+        regularFiles: 0,
+        auxiliaryFiles: 0,
+        ignoredFiles: 0,
+        skippedSymlinks: 0,
+        traversalErrors: 0,
+      });
+      database.finalizeSuccessfulScan({
+        scanJobId: id,
+        rootId: "music",
+        stagedFiles: [],
+        seenRelativePaths: [],
+        albums: [],
+        withWarnings: false,
+      });
+    };
+    completeEmpty("last-good-one");
+    createRunningScan(database, "later-failed");
+    database.recordScanDiscovery({
+      scanJobId: "later-failed",
+      rulesVersion: "inventory-test/1",
+      candidates: 0,
+      regularFiles: 0,
+      auxiliaryFiles: 0,
+      ignoredFiles: 0,
+      skippedSymlinks: 0,
+      traversalErrors: 0,
+    });
+    database.finalizeFailedScan("later-failed", "failed");
+    expect(database.getLibraryInventoryReport("last-good-one").scanJobId).toBe(
+      "last-good-one",
+    );
+    completeEmpty("last-good-two");
+    expect(() => database.getLibraryInventoryReport("last-good-one")).toThrow(
+      /latest published snapshot/,
+    );
+  });
+
+  it("uses scan report row order when successful snapshots share one timestamp", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    finalizeEmptyInventoryScan(database, "z-older-same-millisecond");
+    finalizeEmptyInventoryScan(database, "a-newer-same-millisecond");
+    database.raw.exec("DROP TRIGGER scan_reports_immutable_update");
+    database.raw
+      .prepare(
+        "UPDATE scan_reports SET created_at=? WHERE scan_job_id IN (?,?)",
+      )
+      .run(
+        "2026-08-16T00:00:00.000Z",
+        "z-older-same-millisecond",
+        "a-newer-same-millisecond",
+      );
+
+    expect(
+      database.getLibraryInventoryReport("a-newer-same-millisecond").scanJobId,
+    ).toBe("a-newer-same-millisecond");
+    expect(() =>
+      database.getLibraryInventoryReport("z-older-same-millisecond"),
+    ).toThrow(/latest published snapshot/);
+  });
+
+  it("fails closed when one media file is assigned to multiple local versions", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    createRunningScan(database, "duplicate-owner-scan");
+    const file = observedFile("Artist/Album/01.flac", 10);
+    database.recordScanDiscovery({
+      scanJobId: "duplicate-owner-scan",
+      rulesVersion: "inventory-test/1",
+      candidates: 1,
+      regularFiles: 1,
+      auxiliaryFiles: 0,
+      ignoredFiles: 0,
+      skippedSymlinks: 0,
+      traversalErrors: 0,
+    });
+    database.recordScanFileResult({
+      scanJobId: "duplicate-owner-scan",
+      rootId: "music",
+      relativePath: file.relativePath,
+      extension: ".flac",
+      candidateKind: "SUPPORTED_AUDIO",
+      outcome: "PARSED",
+      mediaFileId: "shared-file",
+      sizeBytes: file.sizeBytes,
+      modifiedAtMs: file.modifiedAtMs,
+      errorCode: null,
+      errorStage: null,
+      warningCodes: [],
+    });
+    database.finalizeSuccessfulScan({
+      scanJobId: "duplicate-owner-scan",
+      rootId: "music",
+      stagedFiles: [{ id: "shared-file", file }],
+      seenRelativePaths: [file.relativePath],
+      albums: [albumInput("first-owner", ["shared-file"])],
+      withWarnings: false,
+    });
+    database.createPhysicalOnlyAlbum({
+      id: "second-owner",
+      groupKey: "second-owner",
+      title: "Second",
+      albumArtist: "Owner",
+      year: null,
+    });
+    database.raw
+      .prepare("UPDATE albums SET root_id='music' WHERE id='second-owner'")
+      .run();
+    database.raw.exec("DROP INDEX album_files_one_album_per_media_idx");
+    database.raw
+      .prepare(
+        `INSERT INTO album_files(album_id,media_file_id,is_primary,disc_number_override)
+         VALUES ('second-owner','shared-file',1,NULL)`,
+      )
+      .run();
+
+    const report = database.getLibraryInventoryReport("duplicate-owner-scan");
+    expect(report.valid).toBe(false);
+    expect(report.findings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "MEDIA_FILE_MULTIPLE_OWNERS",
+          mediaFileId: "shared-file",
+        }),
+        expect.objectContaining({ code: "CURRENT_ROOT_MEDIA_ID_DUPLICATE" }),
+      ]),
+    );
+  });
+
   it("rolls back a failed library finalize and preserves the previous snapshot", () => {
     const database = new CoceanDatabase(":memory:");
     open.push(database);
@@ -4428,6 +5193,72 @@ function createRunningScan(database: CoceanDatabase, id: string): void {
     cancelRequestedAt: null,
   });
   expect(database.claimNextScanJob()?.id).toBe(id);
+}
+
+function finalizeEmptyInventoryScan(
+  database: CoceanDatabase,
+  scanJobId: string,
+): void {
+  createRunningScan(database, scanJobId);
+  database.recordScanDiscovery({
+    scanJobId,
+    rulesVersion: "inventory-test/1",
+    candidates: 0,
+    regularFiles: 0,
+    auxiliaryFiles: 0,
+    ignoredFiles: 0,
+    skippedSymlinks: 0,
+    traversalErrors: 0,
+  });
+  database.finalizeSuccessfulScan({
+    scanJobId,
+    rootId: "music",
+    stagedFiles: [],
+    seenRelativePaths: [],
+    albums: [],
+    withWarnings: false,
+  });
+}
+
+function finalizeSingleFileInventoryScan(
+  database: CoceanDatabase,
+  scanJobId: string,
+): void {
+  createRunningScan(database, scanJobId);
+  const mediaFileId = `${scanJobId}-file`;
+  const file = observedFile(`Artist/${scanJobId}/01.flac`, 10);
+  database.recordScanDiscovery({
+    scanJobId,
+    rulesVersion: "inventory-test/1",
+    candidates: 1,
+    regularFiles: 1,
+    auxiliaryFiles: 0,
+    ignoredFiles: 0,
+    skippedSymlinks: 0,
+    traversalErrors: 0,
+  });
+  database.recordScanFileResult({
+    scanJobId,
+    rootId: "music",
+    relativePath: file.relativePath,
+    extension: ".flac",
+    candidateKind: "SUPPORTED_AUDIO",
+    outcome: "PARSED",
+    mediaFileId,
+    sizeBytes: file.sizeBytes,
+    modifiedAtMs: file.modifiedAtMs,
+    errorCode: null,
+    errorStage: null,
+    warningCodes: [],
+  });
+  database.finalizeSuccessfulScan({
+    scanJobId,
+    rootId: "music",
+    stagedFiles: [{ id: mediaFileId, file }],
+    seenRelativePaths: [file.relativePath],
+    albums: [albumInput(`${scanJobId}-version`, [mediaFileId])],
+    withWarnings: false,
+  });
 }
 
 function observedFile(relativePath: string, sizeBytes: number) {

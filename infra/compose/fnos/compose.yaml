@@ -310,6 +310,28 @@ services:
     networks:
       - backend
 
+  acceptance-session:
+    profiles:
+      - maintenance
+    image: "${COCEAN_REGISTRY:-ghcr.io}/${COCEAN_IMAGE_NAMESPACE:-cocean-project}/server:${COCEAN_VERSION:-edge}"
+    user: "${PUID:-1000}:${PGID:-1000}"
+    restart: "no"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    entrypoint: ["node", "/app/acceptance-session.mjs"]
+    volumes:
+      - type: bind
+        source: "${COCEAN_DATA_DIR:?set COCEAN_DATA_DIR in .env}"
+        target: /var/lib/cocean
+        bind:
+          create_host_path: false
+    network_mode: none
+
   db-maintenance:
     profiles:
       - maintenance

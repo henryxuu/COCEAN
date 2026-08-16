@@ -444,7 +444,11 @@ describe("scan job runner evidence and snapshot safety", () => {
     expect(database.getAlbum("exact-group-owner")?.tracks).toEqual([
       expect.objectContaining({ id: "current-file" }),
     ]);
-    expect(database.getAlbum("overlap-owner")).toBeNull();
+    expect(
+      database.raw
+        .prepare("SELECT COUNT(*) AS count FROM albums WHERE id=?")
+        .get("overlap-owner"),
+    ).toEqual({ count: 1 });
     database.close();
   });
 

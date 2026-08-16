@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import time
 from typing import Any, Callable
@@ -21,6 +22,8 @@ import urllib.request
 
 SCHEMA = "cocean.fnos-api-acceptance/v2"
 MUSIC_MANIFEST_SCHEMA = "cocean.music-manifest/v2"
+ACCEPTANCE_INTERNAL_URL = "http://server:8080"
+ACCEPTANCE_SESSION_FILE = "/var/lib/cocean/acceptance/admin-session-cookie"
 TERMINAL_SCAN_STATUSES = {
     "COMPLETED",
     "COMPLETED_WITH_WARNINGS",
@@ -59,6 +62,46 @@ FILE_KINDS = {
     "TRAVERSAL_ERROR",
 }
 FILE_OUTCOMES = {"PARSED", "UNSUPPORTED", "FAILED", "SKIPPED"}
+INVENTORY_CLASSES = {
+    "CURRENT_DIGITAL",
+    "PHYSICAL_ONLY",
+    "REFERENCED_HISTORY",
+    "ORPHAN",
+}
+INVENTORY_REASONS = {
+    "CURRENT_FILES",
+    "PHYSICAL_COPY",
+    "DELIVERY_RECORD",
+    "DELIVERY_JOB",
+    "ALBUM_INTRODUCTION",
+    "RELEASE_CANDIDATE",
+    "USER_IDENTITY",
+    "USER_PRIMARY",
+    "VERSION_METADATA",
+    "METADATA_GOVERNANCE",
+    "ARTWORK_GOVERNANCE",
+    "VISIBILITY_GOVERNANCE",
+    "LIFECYCLE_GOVERNANCE",
+    "LIBRARY_ISSUE",
+    "NO_CURRENT_FACT",
+}
+INVENTORY_FINDINGS = {
+    "EMPTY_IDENTIFIER",
+    "LOCAL_VERSION_WITHOUT_LIBRARY_ALBUM",
+    "LIBRARY_ALBUM_WITHOUT_PRIMARY_VERSION",
+    "PRIMARY_VERSION_NOT_MEMBER",
+    "PRIMARY_VERSION_WITHOUT_FILES",
+    "VISIBLE_ALBUM_WITHOUT_CURRENT_MEMBER",
+    "MEDIA_FILE_MULTIPLE_OWNERS",
+    "MEDIA_FILE_ROOT_MISMATCH",
+    "SCAN_MEDIA_ROOT_MISMATCH",
+    "SCAN_PARSED_MEDIA_ID_DUPLICATE",
+    "CURRENT_ROOT_MEDIA_ID_DUPLICATE",
+    "SCAN_ALBUM_COUNT_MISMATCH",
+    "SCAN_PARSED_FILE_COUNT_MISMATCH",
+    "SCAN_MEDIA_ID_MISMATCH",
+    "PARTITION_COUNT_MISMATCH",
+}
 
 
 class AcceptanceError(RuntimeError):
@@ -193,6 +236,36 @@ def parse_optional_scan_id(value: str) -> str | None:
     return value
 
 
+def read_session_cookie(path_value: str) -> str:
+    path = Path(path_value)
+    try:
+        metadata = path.lstat()
+    except OSError:
+        raise AcceptanceError("acceptance session Cookie file is unavailable") from None
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise AcceptanceError("acceptance session Cookie file permissions are unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            raw = os.read(descriptor, 1024)
+            if os.read(descriptor, 1):
+                raise AcceptanceError("acceptance session Cookie file is too large")
+        finally:
+            os.close(descriptor)
+    except AcceptanceError:
+        raise
+    except OSError:
+        raise AcceptanceError("acceptance session Cookie file could not be read") from None
+    try:
+        value = raw.decode("ascii").strip()
+    except UnicodeDecodeError:
+        raise AcceptanceError("acceptance session Cookie file is invalid") from None
+    if not re.fullmatch(r"cocean_session=[A-Za-z0-9_-]{43}", value):
+        raise AcceptanceError("acceptance session Cookie file is invalid")
+    return value
+
+
 def parse_allowed_unsupported_extensions(value: str) -> dict[str, int]:
     if len(value) > 16 * 1024:
         raise AcceptanceError("allowed unsupported extensions policy is too large")
@@ -238,7 +311,7 @@ def parse_allowed_unsupported_extensions(value: str) -> dict[str, int]:
 
 
 class ApiClient:
-    def __init__(self, base_url: str, timeout: float):
+    def __init__(self, base_url: str, timeout: float, session_cookie: str):
         parsed = urllib.parse.urlsplit(base_url)
         if (
             parsed.scheme not in {"http", "https"}
@@ -255,6 +328,7 @@ class ApiClient:
         )
         self.origin = (parsed.scheme, parsed.hostname, parsed.port)
         self.timeout = timeout
+        self.session_cookie = session_cookie
         self.opener = urllib.request.build_opener(NoRedirect())
 
     def url(self, path: str) -> str:
@@ -284,7 +358,7 @@ class ApiClient:
         expected: tuple[int, ...] = (200,),
     ) -> tuple[int, dict[str, Any]]:
         body = None
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": "application/json", "Cookie": self.session_cookie}
         if payload is not None:
             body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
             headers["Content-Type"] = "application/json"
@@ -330,7 +404,9 @@ class ApiClient:
         max_bytes: int = 64 * 1024 * 1024,
     ) -> tuple[int, dict[str, str], bytes]:
         request = urllib.request.Request(
-            self.url(path), headers=headers or {}, method="GET"
+            self.url(path),
+            headers={"Cookie": self.session_cookie, **(headers or {})},
+            method="GET",
         )
         try:
             with self.opener.open(request, timeout=self.timeout) as response:
@@ -356,7 +432,22 @@ class AcceptanceRun:
         self.arguments = arguments
         self.started_wall = utc_now()
         self.started_monotonic = time.monotonic()
-        self.client = ApiClient(arguments.base_url, arguments.request_timeout)
+        session_real_path = os.path.realpath(os.path.abspath(arguments.session_file))
+        production_session_real_path = os.path.realpath(
+            os.path.abspath(ACCEPTANCE_SESSION_FILE)
+        )
+        if (
+            session_real_path == production_session_real_path
+            and arguments.base_url != ACCEPTANCE_INTERNAL_URL
+        ):
+            raise AcceptanceError(
+                "acceptance session may only be sent to the fixed internal API origin"
+            )
+        self.client = ApiClient(
+            arguments.base_url,
+            arguments.request_timeout,
+            read_session_cookie(arguments.session_file),
+        )
         self.excluded_directories = parse_excluded_directories(
             arguments.exclude_directories_json
         )
@@ -537,6 +628,10 @@ class AcceptanceRun:
 
         self.gate("scan-count-reconciliation", reconcile_scan)
 
+        inventory = self.gate(
+            "inventory-report", lambda: self.fetch_inventory_report(scan)
+        )
+
         stats = self.gate(
             "library-stats",
             lambda: self.client.request_json(
@@ -578,6 +673,7 @@ class AcceptanceRun:
                 raise AcceptanceError("library tracks does not equal detail track count")
             represented_local_versions = 0
             represented_local_files = 0
+            detail_version_ids: set[str] = set()
             for album, detail in zip(albums, details):
                 if album.get("hasDigital") is not True:
                     continue
@@ -598,17 +694,43 @@ class AcceptanceRun:
                     raise AcceptanceError(
                         "digital Album does not expose a represented local version"
                     )
-                represented_local_versions += len(versions)
-                represented_local_files += sum(
-                    require_count(
-                        require_object(version, "Album localVersion").get("fileCount"),
-                        "Album localVersion fileCount",
+                digital_versions = 0
+                for version_value in versions:
+                    version = require_object(version_value, "Album localVersion")
+                    version_id = require_string(
+                        version.get("id"), "Album localVersion id"
                     )
-                    for version in versions
-                )
+                    if version_id in detail_version_ids:
+                        raise AcceptanceError(
+                            "Album details contain a duplicate localVersion id"
+                        )
+                    detail_version_ids.add(version_id)
+                    file_count = require_count(
+                        version.get("fileCount"), "Album localVersion fileCount"
+                    )
+                    if file_count > 0:
+                        digital_versions += 1
+                        represented_local_files += file_count
+                if digital_versions == 0:
+                    raise AcceptanceError(
+                        "digital Album has no local version with current files"
+                    )
+                represented_local_versions += digital_versions
             if evidence["albumCount"] != represented_local_versions:
                 raise AcceptanceError(
-                    "scan report albumCount does not equal represented local versions"
+                    "scan report albumCount does not equal current digital local versions"
+                )
+            if inventory["scanAlbumCount"] != evidence["albumCount"]:
+                raise AcceptanceError(
+                    "inventory scan Album count does not equal frozen scan evidence"
+                )
+            if inventory["displayedAlbums"] != len(albums):
+                raise AcceptanceError(
+                    "inventory displayed Album count does not equal paged Album results"
+                )
+            if inventory["displayedAlbumIds"] != {require_string(item.get("id"), "Album id") for item in albums}:
+                raise AcceptanceError(
+                    "inventory displayed Album ids do not equal paged Album results"
                 )
             album_issues = sum(
                 len(require_list(item.get("aggregationIssues", []), "Album aggregationIssues"))
@@ -666,6 +788,16 @@ class AcceptanceRun:
 
         self.gate("library-count-reconciliation", reconcile_library)
         self.report["library"] = stats_counts
+        self.report["inventory"] = {
+            "currentDigital": inventory["currentDigital"],
+            "physicalOnly": inventory["physicalOnly"],
+            "referencedHistory": inventory["referencedHistory"],
+            "orphan": inventory["orphan"],
+            "physicalVersions": inventory["physicalVersions"],
+            "digitalPhysicalOverlap": inventory["digitalPhysicalOverlap"],
+            "displayedAlbums": inventory["displayedAlbums"],
+            "findingCount": inventory["findingCount"],
+        }
         self.report["coverage"] = {
             "albumPages": album_pages,
             "albumSummaries": len(albums),
@@ -1243,6 +1375,302 @@ class AcceptanceRun:
             digest.update(js_json(ledger_line).encode("utf-8"))
         return digest.hexdigest()
 
+    def fetch_inventory_report(self, scan: dict[str, Any]) -> dict[str, Any]:
+        scan_id = require_string(scan.get("id"), "scan id")
+        report = self.client.request_json(
+            "GET",
+            "/api/v1/library/inventory-report?scanJobId="
+            + urllib.parse.quote(scan_id, safe=""),
+            "library inventory report",
+        )
+        if report.get("schema") != "cocean.library-inventory/v1":
+            raise AcceptanceError("inventory report schema is unknown")
+        if report.get("scanJobId") != scan_id or report.get("rootId") != "music":
+            raise AcceptanceError("inventory report is bound to the wrong scan snapshot")
+        versions = require_list(report.get("versions"), "inventory versions")
+        albums = require_list(report.get("libraryAlbums"), "inventory libraryAlbums")
+        counts = require_object(report.get("counts"), "inventory counts")
+        findings = require_list(report.get("findings"), "inventory findings")
+        version_ids: set[str] = set()
+        media_owners: dict[str, str] = {}
+        partition_counts = Counter()
+        physical_versions = 0
+        digital_physical_overlap = 0
+        physical_copies = 0
+        physical_quantity = 0
+        current_root_media: set[str] = set()
+        current_root_versions = 0
+        version_album_ids: dict[str, str | None] = {}
+        version_primary_flags: dict[str, bool] = {}
+        recomputed_findings: set[
+            tuple[str, str | None, str | None, str | None]
+        ] = set()
+        for version_value in versions:
+            version = require_object(version_value, "inventory version")
+            version_id = require_string(
+                version.get("localVersionId"), "inventory localVersionId"
+            )
+            root_id = require_string(version.get("rootId"), "inventory rootId")
+            if version_id in version_ids:
+                raise AcceptanceError("inventory contains a duplicate localVersion id")
+            version_ids.add(version_id)
+            library_album_id = version.get("libraryAlbumId")
+            if library_album_id is not None:
+                library_album_id = require_string(
+                    library_album_id, "inventory libraryAlbumId"
+                )
+            version_album_ids[version_id] = library_album_id
+            is_primary = version.get("isPrimary")
+            if not isinstance(is_primary, bool):
+                raise AcceptanceError("inventory isPrimary is not a boolean")
+            version_primary_flags[version_id] = is_primary
+            classification = version.get("classification")
+            if classification not in INVENTORY_CLASSES:
+                raise AcceptanceError("inventory classification is unknown")
+            reasons_value = require_list(version.get("reasons"), "inventory reasons")
+            reasons = set(reasons_value)
+            if (
+                not reasons_value
+                or len(reasons) != len(reasons_value)
+                or not reasons.issubset(INVENTORY_REASONS)
+            ):
+                raise AcceptanceError("inventory reasons are invalid")
+            media_values = require_list(
+                version.get("mediaFileIds"), "inventory mediaFileIds"
+            )
+            media_ids = [
+                require_string(item, "inventory mediaFileId") for item in media_values
+            ]
+            if len(media_ids) != len(set(media_ids)):
+                raise AcceptanceError("inventory version repeats a media file id")
+            file_count = require_count(version.get("fileCount"), "inventory fileCount")
+            copy_count = require_count(
+                version.get("physicalCopyCount"), "inventory physicalCopyCount"
+            )
+            quantity = require_count(
+                version.get("physicalQuantity"), "inventory physicalQuantity"
+            )
+            if (copy_count == 0 and quantity != 0) or (
+                copy_count > 0 and quantity < copy_count
+            ):
+                raise AcceptanceError(
+                    "inventory physical copy count and quantity are inconsistent"
+                )
+            if file_count != len(media_ids):
+                raise AcceptanceError("inventory fileCount is not independently reproducible")
+            for media_id in media_ids:
+                if media_id in media_owners:
+                    recomputed_findings.add(
+                        (
+                            "MEDIA_FILE_MULTIPLE_OWNERS",
+                            media_owners[media_id],
+                            None,
+                            media_id,
+                        )
+                    )
+                else:
+                    media_owners[media_id] = version_id
+            if classification == "CURRENT_DIGITAL":
+                if file_count == 0 or reasons != {"CURRENT_FILES"}:
+                    raise AcceptanceError("CURRENT_DIGITAL semantics are invalid")
+                if root_id == "music":
+                    current_root_versions += 1
+                    current_root_media.update(media_ids)
+            elif classification == "PHYSICAL_ONLY":
+                if file_count != 0 or copy_count == 0 or reasons != {"PHYSICAL_COPY"}:
+                    raise AcceptanceError("PHYSICAL_ONLY semantics are invalid")
+            elif classification == "REFERENCED_HISTORY":
+                if (
+                    file_count != 0
+                    or copy_count != 0
+                    or "NO_CURRENT_FACT" in reasons
+                    or reasons.intersection({"CURRENT_FILES", "PHYSICAL_COPY"})
+                ):
+                    raise AcceptanceError("REFERENCED_HISTORY semantics are invalid")
+            elif file_count != 0 or copy_count != 0 or reasons != {"NO_CURRENT_FACT"}:
+                raise AcceptanceError("ORPHAN semantics are invalid")
+            partition_counts[classification] += 1
+            if copy_count > 0:
+                physical_versions += 1
+            if copy_count > 0 and classification == "CURRENT_DIGITAL":
+                digital_physical_overlap += 1
+            physical_copies += copy_count
+            physical_quantity += quantity
+
+        library_album_ids: set[str] = set()
+        displayed_album_ids: set[str] = set()
+        album_memberships: dict[str, set[str]] = {}
+        primary_by_album: dict[str, str | None] = {}
+        versions_by_id = {
+            require_string(item.get("localVersionId"), "inventory localVersionId"): item
+            for item in map(lambda value: require_object(value, "inventory version"), versions)
+        }
+        for version_id, version in versions_by_id.items():
+            if version.get("libraryAlbumId") is None:
+                recomputed_findings.add(
+                    ("LOCAL_VERSION_WITHOUT_LIBRARY_ALBUM", version_id, None, None)
+                )
+        for album_value in albums:
+            album = require_object(album_value, "inventory libraryAlbum")
+            album_id = require_string(
+                album.get("libraryAlbumId"), "inventory libraryAlbumId"
+            )
+            if album_id in library_album_ids:
+                raise AcceptanceError("inventory contains a duplicate library Album id")
+            library_album_ids.add(album_id)
+            members_value = require_list(
+                album.get("memberVersionIds"), "inventory memberVersionIds"
+            )
+            members = {
+                require_string(item, "inventory memberVersionId")
+                for item in members_value
+            }
+            if len(members) != len(members_value):
+                raise AcceptanceError("inventory repeats a member version id")
+            album_memberships[album_id] = members
+            if any(
+                version_id not in versions_by_id
+                or versions_by_id[version_id].get("libraryAlbumId") != album_id
+                for version_id in members
+            ):
+                raise AcceptanceError("inventory Album membership is inconsistent")
+            primary = album.get("primaryVersionId")
+            if primary is None:
+                recomputed_findings.add(
+                    ("LIBRARY_ALBUM_WITHOUT_PRIMARY_VERSION", None, album_id, None)
+                )
+            else:
+                primary = require_string(primary, "inventory primaryVersionId")
+                if primary not in members:
+                    recomputed_findings.add(
+                        ("PRIMARY_VERSION_NOT_MEMBER", primary, album_id, None)
+                    )
+            primary_by_album[album_id] = primary
+            visible = album.get("visible")
+            displayed = album.get("displayed")
+            if not isinstance(visible, bool) or not isinstance(displayed, bool):
+                raise AcceptanceError("inventory Album display facts are invalid")
+            current_members = {
+                item
+                for item in members
+                if versions_by_id[item].get("classification")
+                in {"CURRENT_DIGITAL", "PHYSICAL_ONLY"}
+            }
+            if visible and not current_members:
+                recomputed_findings.add(
+                    ("VISIBLE_ALBUM_WITHOUT_CURRENT_MEMBER", None, album_id, None)
+                )
+            primary_is_usable = (
+                primary in members
+                and primary is not None
+                and versions_by_id[primary].get("classification")
+                in {"CURRENT_DIGITAL", "PHYSICAL_ONLY"}
+            )
+            if visible and primary in members and not primary_is_usable:
+                recomputed_findings.add(
+                    ("PRIMARY_VERSION_WITHOUT_FILES", primary, album_id, None)
+                )
+            expected_displayed = visible and primary_is_usable
+            if displayed != expected_displayed:
+                raise AcceptanceError("inventory displayed Album fact is inconsistent")
+            if displayed:
+                displayed_album_ids.add(album_id)
+
+        for version_id, album_id in version_album_ids.items():
+            if album_id is not None and version_id not in album_memberships.get(
+                album_id, set()
+            ):
+                raise AcceptanceError(
+                    "inventory version-to-Album membership is incomplete"
+                )
+            expected_primary = (
+                album_id is not None and primary_by_album.get(album_id) == version_id
+            )
+            if version_primary_flags[version_id] is not expected_primary:
+                raise AcceptanceError("inventory isPrimary facts are inconsistent")
+
+        parsed_values = [
+            require_string(item, "inventory scanParsedMediaId")
+            for item in require_list(
+                report.get("scanParsedMediaIds"), "inventory scanParsedMediaIds"
+            )
+        ]
+        current_values = [
+            require_string(item, "inventory currentRootMediaId")
+            for item in require_list(
+                report.get("currentRootMediaIds"), "inventory currentRootMediaIds"
+            )
+        ]
+        parsed_ids = set(parsed_values)
+        reported_current_ids = set(current_values)
+        if len(parsed_values) != len(parsed_ids):
+            recomputed_findings.add(
+                ("SCAN_PARSED_MEDIA_ID_DUPLICATE", None, None, None)
+            )
+        if len(current_values) != len(reported_current_ids):
+            recomputed_findings.add(
+                ("CURRENT_ROOT_MEDIA_ID_DUPLICATE", None, None, None)
+            )
+        if parsed_ids != self.parsed_media_ids or reported_current_ids != current_root_media:
+            recomputed_findings.add(("SCAN_MEDIA_ID_MISMATCH", None, None, None))
+        scan_album_count = require_count(
+            counts.get("scanAlbumCount"), "inventory scanAlbumCount"
+        )
+        scan_parsed_files = require_count(
+            counts.get("scanParsedFiles"), "inventory scanParsedFiles"
+        )
+        if scan_album_count != current_root_versions:
+            recomputed_findings.add(("SCAN_ALBUM_COUNT_MISMATCH", None, None, None))
+        if scan_parsed_files != len(parsed_values):
+            recomputed_findings.add(
+                ("SCAN_PARSED_FILE_COUNT_MISMATCH", None, None, None)
+            )
+        if sum(partition_counts.values()) != len(versions):
+            recomputed_findings.add(("PARTITION_COUNT_MISMATCH", None, None, None))
+
+        expected_counts = {
+            "localVersions": len(versions),
+            "currentDigital": partition_counts["CURRENT_DIGITAL"],
+            "physicalOnly": partition_counts["PHYSICAL_ONLY"],
+            "referencedHistory": partition_counts["REFERENCED_HISTORY"],
+            "orphan": partition_counts["ORPHAN"],
+            "physicalVersions": physical_versions,
+            "digitalPhysicalOverlap": digital_physical_overlap,
+            "physicalCopies": physical_copies,
+            "physicalQuantity": physical_quantity,
+            "libraryAlbums": len(albums),
+            "displayedAlbums": len(displayed_album_ids),
+        }
+        for key, expected in expected_counts.items():
+            if require_count(counts.get(key), f"inventory {key}") != expected:
+                raise AcceptanceError(f"inventory {key} is not independently reproducible")
+        reported_findings: set[tuple[str, str | None, str | None, str | None]] = set()
+        for finding_value in findings:
+            finding = require_object(finding_value, "inventory finding")
+            code = finding.get("code")
+            if code not in INVENTORY_FINDINGS:
+                raise AcceptanceError("inventory finding code is unknown")
+            identifiers: list[str | None] = []
+            for key in ("localVersionId", "libraryAlbumId", "mediaFileId"):
+                value = finding.get(key)
+                identifiers.append(
+                    None if value is None else require_string(value, f"finding {key}")
+                )
+            reported_findings.add((str(code), *identifiers))
+        if len(reported_findings) != len(findings):
+            raise AcceptanceError("inventory repeats a finding")
+        if reported_findings != recomputed_findings:
+            raise AcceptanceError("inventory findings are not independently reproducible")
+        recomputed_valid = not recomputed_findings and partition_counts["ORPHAN"] == 0
+        if report.get("valid") is not recomputed_valid or not recomputed_valid:
+            raise AcceptanceError("inventory report is not valid")
+        return {
+            **expected_counts,
+            "scanAlbumCount": scan_album_count,
+            "displayedAlbumIds": displayed_album_ids,
+            "findingCount": len(reported_findings),
+        }
+
     def fetch_albums(self) -> tuple[list[dict[str, Any]], int]:
         albums: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
@@ -1496,6 +1924,11 @@ def parser() -> argparse.ArgumentParser:
             "COCEAN_ACCEPTANCE_MANIFEST",
             "/var/lib/cocean/acceptance/music-before.jsonl",
         ),
+    )
+    result.add_argument(
+        "--session-file",
+        default=ACCEPTANCE_SESSION_FILE,
+        help=argparse.SUPPRESS,
     )
     result.add_argument(
         "--manifest-hash",

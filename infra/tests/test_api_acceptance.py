@@ -181,10 +181,71 @@ class MockState:
         self.scan_conflicts_remaining = scan_conflicts
         self.scan_conflict_error = scan_conflict_error
         self.grouped_local_versions = grouped_local_versions
+        self.omit_local_versions = False
+        self.zero_detail_file_counts = False
         self.detail_album_issue_count = detail_album_issue_count
         self.albums = [album_summary("one", True)]
         if not grouped_local_versions:
             self.albums.append(album_summary("two", False))
+        version_specs = (
+            [("one-version-1", "one", "track-one"), ("one-version-2", "one", "track-two")]
+            if grouped_local_versions
+            else [("one-version-1", "one", "track-one"), ("two-version-1", "two", "track-two")]
+        )
+        self.inventory_report = {
+            "schema": "cocean.library-inventory/v1",
+            "scanJobId": "scan-test",
+            "rootId": "music",
+            "generatedAt": "2026-08-12T00:00:02Z",
+            "versions": [
+                {
+                    "localVersionId": version_id,
+                    "libraryAlbumId": library_album_id,
+                    "rootId": "music",
+                    "classification": "CURRENT_DIGITAL",
+                    "reasons": ["CURRENT_FILES"],
+                    "mediaFileIds": [media_id],
+                    "fileCount": 1,
+                    "physicalCopyCount": 0,
+                    "physicalQuantity": 0,
+                    "isPrimary": index == 0 or not grouped_local_versions,
+                }
+                for index, (version_id, library_album_id, media_id) in enumerate(version_specs)
+            ],
+            "libraryAlbums": [
+                {
+                    "libraryAlbumId": str(album["id"]),
+                    "primaryVersionId": f"{album['id']}-version-1",
+                    "memberVersionIds": [
+                        version_id
+                        for version_id, library_album_id, _media_id in version_specs
+                        if library_album_id == album["id"]
+                    ],
+                    "visible": True,
+                    "displayed": True,
+                }
+                for album in self.albums
+            ],
+            "scanParsedMediaIds": ["track-one", "track-two"],
+            "currentRootMediaIds": ["track-one", "track-two"],
+            "counts": {
+                "localVersions": 2,
+                "currentDigital": 2,
+                "physicalOnly": 0,
+                "referencedHistory": 0,
+                "orphan": 0,
+                "physicalVersions": 0,
+                "digitalPhysicalOverlap": 0,
+                "physicalCopies": 0,
+                "physicalQuantity": 0,
+                "libraryAlbums": len(self.albums),
+                "displayedAlbums": len(self.albums),
+                "scanAlbumCount": 2,
+                "scanParsedFiles": 2,
+            },
+            "findings": [],
+            "valid": True,
+        }
         failure_count = 2 if incomplete_failures else 1
         self.job = {
             "id": "scan-test",
@@ -435,6 +496,9 @@ def handler_for(state: MockState) -> type[BaseHTTPRequestHandler]:
             parsed = urlsplit(self.path)
             query = parse_qs(parsed.query)
             path = parsed.path
+            if self.headers.get("Cookie") != f"cocean_session={'a' * 43}":
+                self.json_response(401, {"error": "AUTHENTICATION_REQUIRED"})
+                return
             if path == "/api/v1/readiness":
                 self.json_response(
                     200,
@@ -504,6 +568,9 @@ def handler_for(state: MockState) -> type[BaseHTTPRequestHandler]:
                     },
                 )
                 return
+            if path == "/api/v1/library/inventory-report":
+                self.json_response(200, state.inventory_report)
+                return
             if path == "/api/v1/albums":
                 offset = int(query.get("offset", ["0"])[0])
                 limit = int(query.get("limit", ["500"])[0])
@@ -519,22 +586,26 @@ def handler_for(state: MockState) -> type[BaseHTTPRequestHandler]:
                 return
             if path in {"/api/v1/albums/one", "/api/v1/albums/two"}:
                 album_id = path.rsplit("/", 1)[-1]
+                detail = album_detail(
+                    album_id,
+                    album_id == "one",
+                    unknown_audio=state.unknown_audio and album_id == "one",
+                    warning_codes=(state.warning_codes if album_id == "one" else []),
+                    local_version_count=(
+                        2
+                        if state.grouped_local_versions and album_id == "one"
+                        else 1
+                    ),
+                )
+                if state.omit_local_versions:
+                    detail.pop("localVersions", None)
+                elif state.zero_detail_file_counts:
+                    for version in detail["localVersions"]:  # type: ignore[index]
+                        version["fileCount"] = 0
                 self.json_response(
                     200,
                     {
-                        **album_detail(
-                        album_id,
-                        album_id == "one",
-                        unknown_audio=state.unknown_audio and album_id == "one",
-                        warning_codes=(
-                            state.warning_codes if album_id == "one" else []
-                        ),
-                        local_version_count=(
-                            2
-                            if state.grouped_local_versions and album_id == "one"
-                            else 1
-                        ),
-                        ),
+                        **detail,
                         "aggregationIssues": [
                             {
                                 "code": "DUPLICATE_TRACK_SLOT",
@@ -587,6 +658,56 @@ def mock_server(state: MockState):  # type: ignore[no-untyped-def]
 
 
 class ApiAcceptanceTests(unittest.TestCase):
+    def test_production_cookie_can_only_target_the_fixed_internal_origin(self) -> None:
+        process = subprocess.run(
+            [
+                "python3",
+                str(SCRIPT),
+                "--base-url",
+                "http://127.0.0.1:1",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("fixed internal API origin", process.stderr)
+
+    def test_production_cookie_path_alias_cannot_bypass_the_fixed_origin(self) -> None:
+        process = subprocess.run(
+            [
+                "python3",
+                str(SCRIPT),
+                "--base-url",
+                "http://127.0.0.1:1",
+                "--session-file",
+                "/var/lib/cocean/acceptance/../acceptance/admin-session-cookie",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("fixed internal API origin", process.stderr)
+
+    def test_production_cookie_rejects_even_a_trailing_slash_origin_alias(self) -> None:
+        process = subprocess.run(
+            [
+                "python3",
+                str(SCRIPT),
+                "--base-url",
+                "http://server:8080/",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn("fixed internal API origin", process.stderr)
+
     def run_acceptance(
         self,
         state: MockState,
@@ -599,6 +720,11 @@ class ApiAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, mock_server(state) as base_url:
             report_path = Path(directory) / "report.json"
             manifest_path = Path(directory) / "music-before.jsonl"
+            session_path = Path(directory) / "admin-session-cookie"
+            session_path.write_text(
+                f"cocean_session={'a' * 43}\n", encoding="ascii"
+            )
+            session_path.chmod(0o600)
             with manifest_path.open("w", encoding="utf-8", newline="\n") as stream:
                 stream.write(
                     json.dumps(
@@ -622,6 +748,8 @@ class ApiAcceptanceTests(unittest.TestCase):
                     str(report_path),
                     "--manifest",
                     str(manifest_path),
+                    "--session-file",
+                    str(session_path),
                     "--request-timeout",
                     "2",
                     "--scan-timeout",
@@ -776,6 +904,278 @@ class ApiAcceptanceTests(unittest.TestCase):
         process, report, report_text = self.run_acceptance(state)
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual(report["status"], "passed")
+        self.assert_report_is_private(report_text)
+
+    def test_referenced_history_is_preserved_but_not_counted_as_digital(self) -> None:
+        state = MockState()
+        state.inventory_report["versions"].append(  # type: ignore[index,union-attr]
+            {
+                "localVersionId": "history-version",
+                "libraryAlbumId": "history-album",
+                "rootId": "physical",
+                "classification": "REFERENCED_HISTORY",
+                "reasons": ["DELIVERY_RECORD"],
+                "mediaFileIds": [],
+                "fileCount": 0,
+                "physicalCopyCount": 0,
+                "physicalQuantity": 0,
+                "isPrimary": True,
+            }
+        )
+        state.inventory_report["libraryAlbums"].append(  # type: ignore[index,union-attr]
+            {
+                "libraryAlbumId": "history-album",
+                "primaryVersionId": "history-version",
+                "memberVersionIds": ["history-version"],
+                "visible": False,
+                "displayed": False,
+            }
+        )
+        counts = state.inventory_report["counts"]
+        assert isinstance(counts, dict)
+        counts["localVersions"] = 3
+        counts["referencedHistory"] = 1
+        counts["libraryAlbums"] = 3
+        process, report, report_text = self.run_acceptance(state)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(report["inventory"]["referencedHistory"], 1)  # type: ignore[index]
+        self.assert_report_is_private(report_text)
+
+    def test_inventory_orphan_fails_closed(self) -> None:
+        state = MockState()
+        version = state.inventory_report["versions"][0]  # type: ignore[index]
+        assert isinstance(version, dict)
+        version.update(
+            classification="ORPHAN",
+            reasons=["NO_CURRENT_FACT"],
+            mediaFileIds=[],
+            fileCount=0,
+        )
+        counts = state.inventory_report["counts"]
+        assert isinstance(counts, dict)
+        counts["currentDigital"] = 1
+        counts["orphan"] = 1
+        state.inventory_report["currentRootMediaIds"] = ["track-two"]
+        state.inventory_report["valid"] = False
+        process, report, report_text = self.run_acceptance(state)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(report["failure"]["gate"], "inventory-report")  # type: ignore[index]
+        self.assert_report_is_private(report_text)
+
+    def test_inventory_rejects_an_unknown_reason(self) -> None:
+        state = MockState()
+        version = state.inventory_report["versions"][0]  # type: ignore[index]
+        assert isinstance(version, dict)
+        version["reasons"] = ["ROOT_LOOKS_DIGITAL"]
+        process, report, report_text = self.run_acceptance(state)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(report["failure"]["gate"], "inventory-report")  # type: ignore[index]
+        self.assert_report_is_private(report_text)
+
+    def test_inventory_rejects_duplicate_reasons(self) -> None:
+        state = MockState()
+        version = state.inventory_report["versions"][0]  # type: ignore[index]
+        assert isinstance(version, dict)
+        version["reasons"] = ["CURRENT_FILES", "CURRENT_FILES"]
+        process, report, report_text = self.run_acceptance(state)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(report["failure"]["gate"], "inventory-report")  # type: ignore[index]
+        self.assert_report_is_private(report_text)
+
+    def test_inventory_rejects_non_boolean_or_multiple_primary_flags(self) -> None:
+        for mutation in ("wrong-type", "multiple"):
+            with self.subTest(mutation=mutation):
+                state = MockState(grouped_local_versions=True)
+                versions = state.inventory_report["versions"]
+                assert isinstance(versions, list)
+                assert isinstance(versions[1], dict)
+                versions[1]["isPrimary"] = "true" if mutation == "wrong-type" else True
+                process, report, report_text = self.run_acceptance(state)
+                self.assertNotEqual(process.returncode, 0)
+                self.assertEqual(report["failure"]["gate"], "inventory-report")  # type: ignore[index]
+                self.assert_report_is_private(report_text)
+
+    def test_inventory_rejects_incomplete_bidirectional_membership(self) -> None:
+        state = MockState(grouped_local_versions=True)
+        albums = state.inventory_report["libraryAlbums"]
+        assert isinstance(albums, list) and isinstance(albums[0], dict)
+        albums[0]["memberVersionIds"] = ["one-version-1"]
+        process, report, report_text = self.run_acceptance(state)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(report["failure"]["gate"], "inventory-report")  # type: ignore[index]
+        self.assert_report_is_private(report_text)
+
+    def test_inventory_rejects_invalid_physical_count_quantity_relationship(self) -> None:
+        state = MockState()
+        version = state.inventory_report["versions"][0]  # type: ignore[index]
+        assert isinstance(version, dict)
+        version["physicalCopyCount"] = 2
+        version["physicalQuantity"] = 1
+        process, report, report_text = self.run_acceptance(state)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(report["failure"]["gate"], "inventory-report")  # type: ignore[index]
+        self.assert_report_is_private(report_text)
+
+    def test_inventory_rejects_duplicate_reported_media_sets(self) -> None:
+        for key in ("scanParsedMediaIds", "currentRootMediaIds"):
+            with self.subTest(key=key):
+                state = MockState()
+                values = state.inventory_report[key]
+                assert isinstance(values, list)
+                values.append(values[0])
+                state.inventory_report["valid"] = False
+                process, report, report_text = self.run_acceptance(state)
+                self.assertNotEqual(process.returncode, 0)
+                self.assertEqual(report["failure"]["gate"], "inventory-report")  # type: ignore[index]
+                self.assert_report_is_private(report_text)
+
+    def test_inventory_recomputes_duplicate_media_ownership_findings(self) -> None:
+        state = MockState()
+        versions = state.inventory_report["versions"]
+        assert isinstance(versions, list) and isinstance(versions[1], dict)
+        versions[1]["mediaFileIds"] = ["track-one"]
+        state.inventory_report["currentRootMediaIds"] = ["track-one", "track-one"]
+        state.inventory_report["findings"] = [
+            {
+                "code": "MEDIA_FILE_MULTIPLE_OWNERS",
+                "localVersionId": "one-version-1",
+                "libraryAlbumId": None,
+                "mediaFileId": "track-one",
+            },
+            {
+                "code": "CURRENT_ROOT_MEDIA_ID_DUPLICATE",
+                "localVersionId": None,
+                "libraryAlbumId": None,
+                "mediaFileId": None,
+            },
+            {
+                "code": "SCAN_MEDIA_ID_MISMATCH",
+                "localVersionId": None,
+                "libraryAlbumId": None,
+                "mediaFileId": None,
+            },
+        ]
+        state.inventory_report["valid"] = False
+        process, report, report_text = self.run_acceptance(state)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(report["failure"]["gate"], "inventory-report")  # type: ignore[index]
+        self.assert_report_is_private(report_text)
+
+    def test_inventory_rejects_visible_all_history_group(self) -> None:
+        state = MockState()
+        version = state.inventory_report["versions"][0]  # type: ignore[index]
+        album = state.inventory_report["libraryAlbums"][0]  # type: ignore[index]
+        assert isinstance(version, dict) and isinstance(album, dict)
+        version.update(
+            classification="REFERENCED_HISTORY",
+            reasons=["DELIVERY_RECORD"],
+            mediaFileIds=[],
+            fileCount=0,
+        )
+        album["displayed"] = False
+        counts = state.inventory_report["counts"]
+        assert isinstance(counts, dict)
+        counts["currentDigital"] = 1
+        counts["referencedHistory"] = 1
+        counts["displayedAlbums"] = 1
+        state.inventory_report["currentRootMediaIds"] = ["track-two"]
+        state.inventory_report["findings"] = [
+            {
+                "code": "VISIBLE_ALBUM_WITHOUT_CURRENT_MEMBER",
+                "localVersionId": None,
+                "libraryAlbumId": "one",
+                "mediaFileId": None,
+            },
+            {
+                "code": "PRIMARY_VERSION_WITHOUT_FILES",
+                "localVersionId": "one-version-1",
+                "libraryAlbumId": "one",
+                "mediaFileId": None,
+            },
+            {
+                "code": "SCAN_ALBUM_COUNT_MISMATCH",
+                "localVersionId": None,
+                "libraryAlbumId": None,
+                "mediaFileId": None,
+            },
+            {
+                "code": "SCAN_MEDIA_ID_MISMATCH",
+                "localVersionId": None,
+                "libraryAlbumId": None,
+                "mediaFileId": None,
+            },
+        ]
+        state.inventory_report["valid"] = False
+        process, report, report_text = self.run_acceptance(state)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(report["failure"]["gate"], "inventory-report")  # type: ignore[index]
+        self.assert_report_is_private(report_text)
+
+    def test_inventory_rejects_missing_or_cross_group_primary(self) -> None:
+        for mutation in ("missing", "cross-group"):
+            with self.subTest(mutation=mutation):
+                state = MockState()
+                versions = state.inventory_report["versions"]
+                albums = state.inventory_report["libraryAlbums"]
+                counts = state.inventory_report["counts"]
+                assert isinstance(versions, list) and isinstance(versions[0], dict)
+                assert isinstance(albums, list) and isinstance(albums[0], dict)
+                assert isinstance(counts, dict)
+                versions[0]["isPrimary"] = False
+                albums[0]["displayed"] = False
+                counts["displayedAlbums"] = 1
+                if mutation == "missing":
+                    albums[0]["primaryVersionId"] = None
+                    finding = {
+                        "code": "LIBRARY_ALBUM_WITHOUT_PRIMARY_VERSION",
+                        "localVersionId": None,
+                        "libraryAlbumId": "one",
+                        "mediaFileId": None,
+                    }
+                else:
+                    albums[0]["primaryVersionId"] = "two-version-1"
+                    finding = {
+                        "code": "PRIMARY_VERSION_NOT_MEMBER",
+                        "localVersionId": "two-version-1",
+                        "libraryAlbumId": "one",
+                        "mediaFileId": None,
+                    }
+                state.inventory_report["findings"] = [finding]
+                state.inventory_report["valid"] = False
+                process, report, report_text = self.run_acceptance(state)
+                self.assertNotEqual(process.returncode, 0)
+                self.assertEqual(report["failure"]["gate"], "inventory-report")  # type: ignore[index]
+                self.assert_report_is_private(report_text)
+
+    def test_inventory_display_ids_must_match_actual_pagination(self) -> None:
+        state = MockState()
+        albums = state.inventory_report["libraryAlbums"]
+        assert isinstance(albums, list)
+        album = albums[0]
+        assert isinstance(album, dict)
+        album["displayed"] = False
+        counts = state.inventory_report["counts"]
+        assert isinstance(counts, dict)
+        counts["displayedAlbums"] = 1
+        process, report, report_text = self.run_acceptance(state)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(report["failure"]["gate"], "inventory-report")  # type: ignore[index]
+        self.assert_report_is_private(report_text)
+
+    def test_legacy_details_without_local_versions_keep_single_version_compatibility(self) -> None:
+        state = MockState()
+        state.omit_local_versions = True
+        process, report, report_text = self.run_acceptance(state)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(report["status"], "passed")
+        self.assert_report_is_private(report_text)
+
+    def test_has_digital_with_only_zero_file_versions_fails_closed(self) -> None:
+        state = MockState()
+        state.zero_detail_file_counts = True
+        process, report, report_text = self.run_acceptance(state)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(report["failure"]["gate"], "library-count-reconciliation")  # type: ignore[index]
         self.assert_report_is_private(report_text)
 
     def test_version_file_counts_cannot_drop_parsed_media(self) -> None:

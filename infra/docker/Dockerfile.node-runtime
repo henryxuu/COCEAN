@@ -42,7 +42,10 @@ RUN pnpm --filter "@cocean/${COCEAN_APP}" run build:container
 # Each app must emit a self-contained runtime directory containing at least:
 # start.mjs, healthcheck.mjs, package.json and all production dependencies.
 RUN test -f "apps/${COCEAN_APP}/.cocean-runtime/start.mjs" \
-    && test -f "apps/${COCEAN_APP}/.cocean-runtime/healthcheck.mjs"
+    && test -f "apps/${COCEAN_APP}/.cocean-runtime/healthcheck.mjs" \
+    && if [ "${COCEAN_APP}" = "server" ]; then \
+         test -f "apps/${COCEAN_APP}/.cocean-runtime/acceptance-session.mjs"; \
+       fi
 
 FROM base AS runtime
 

@@ -28,6 +28,7 @@ import {
   deviceCategorySchema,
   deviceOwnershipSchema,
   libraryIdentityDecisionCommandSchema,
+  libraryInventoryReportSchema,
   importMusicBrainzArtworkCommandSchema,
   physicalMediumSchema,
   scanFileOutcomeSchema,
@@ -45,6 +46,7 @@ import {
   CoceanDatabase,
   LibraryIdentityDecisionError,
   LibraryLifecycleError,
+  LibraryInventoryReportError,
 } from "@cocean/database";
 import { parseRuntimeStillCatalog } from "@cocean/still-catalog";
 import { z } from "zod";
@@ -1743,6 +1745,29 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       });
     }
     return report;
+  });
+
+  app.get("/api/v1/library/inventory-report", async (request, reply) => {
+    const admin = requireAdmin(request, reply);
+    if (!admin) return;
+    const { scanJobId } = z
+      .object({ scanJobId: z.string().trim().min(1).max(128) })
+      .parse(request.query);
+    try {
+      return libraryInventoryReportSchema.parse(
+        database.getLibraryInventoryReport(scanJobId),
+      );
+    } catch (error) {
+      if (!(error instanceof LibraryInventoryReportError)) throw error;
+      if (error.code === "SCAN_NOT_FOUND")
+        return reply
+          .code(404)
+          .send({ error: error.code, message: "没有找到扫描任务" });
+      return reply.code(409).send({
+        error: error.code,
+        message: "该扫描不是当前可用于库存对账的权威快照",
+      });
+    }
   });
 
   app.get("/api/v1/scans/:id/files", async (request, reply) => {

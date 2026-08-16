@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -52,6 +59,139 @@ function testConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
 }
 
 describe("COCEAN HTTP API", () => {
+  it("issues and idempotently revokes a bounded file-only acceptance ADMIN session", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "cocean-acceptance-session-"),
+    );
+    close.push(() => rm(directory, { recursive: true, force: true }));
+    const databasePath = join(directory, "cocean.sqlite");
+    const database = new CoceanDatabase(databasePath);
+    const now = new Date().toISOString();
+    const admin = {
+      id: "acceptance-admin",
+      username: "acceptance-admin",
+      displayName: "Acceptance Admin",
+      role: "ADMIN" as const,
+      enabled: true,
+      createdAt: now,
+      updatedAt: now,
+      lastLoginAt: null,
+    };
+    database.createUser(admin, "unused");
+    const ordinary = createSession(database, admin, 24);
+    database.close();
+    const script = join(
+      import.meta.dirname,
+      "../container/acceptance-session.mjs",
+    );
+    const environment = {
+      ...process.env,
+      NODE_ENV: "test",
+      COCEAN_ACCEPTANCE_SESSION_TEST_ROOT: directory,
+    };
+    await execFileAsync(process.execPath, [script, "issue"], {
+      env: environment,
+    });
+    const cookiePath = join(directory, "acceptance/admin-session-cookie");
+    expect((await stat(cookiePath)).mode & 0o777).toBe(0o600);
+    const cookie = (await readFile(cookiePath, "utf8")).trim();
+    expect(cookie).toMatch(/^cocean_session=[A-Za-z0-9_-]{43}$/);
+    const token = cookie.slice("cocean_session=".length);
+    let inspection = new CoceanDatabase(databasePath);
+    const session = inspection.raw
+      .prepare(
+        `SELECT id,token_hash,expires_at,created_at FROM app_sessions
+         WHERE id='cocean-acceptance-admin-session-v1'`,
+      )
+      .get() as {
+      id: string;
+      token_hash: string;
+      expires_at: string;
+      created_at: string;
+    };
+    expect(session.id).toBe("cocean-acceptance-admin-session-v1");
+    expect(session.token_hash).toBe(
+      createHash("sha256").update(token).digest("hex"),
+    );
+    expect(session.token_hash).not.toBe(token);
+    expect(
+      Date.parse(session.expires_at) - Date.parse(session.created_at),
+    ).toBe(3 * 60 * 60 * 1000);
+    inspection.close();
+
+    await expect(
+      execFileAsync(process.execPath, [script, "issue"], { env: environment }),
+    ).rejects.toThrow();
+    expect((await readFile(cookiePath, "utf8")).trim()).toBe(cookie);
+
+    await writeFile(cookiePath, "corrupt-cookie\n", { mode: 0o600 });
+    await execFileAsync(process.execPath, [script, "revoke"], {
+      env: environment,
+    });
+    inspection = new CoceanDatabase(databasePath);
+    expect(
+      inspection.raw
+        .prepare("SELECT COUNT(*) AS count FROM app_sessions WHERE id=?")
+        .get("cocean-acceptance-admin-session-v1"),
+    ).toEqual({ count: 0 });
+    expect(
+      inspection.raw
+        .prepare(
+          "SELECT COUNT(*) AS count FROM app_sessions WHERE token_hash=?",
+        )
+        .get(createHash("sha256").update(ordinary.token).digest("hex")),
+    ).toEqual({ count: 1 });
+    inspection.close();
+
+    await execFileAsync(process.execPath, [script, "issue"], {
+      env: environment,
+    });
+    await rm(cookiePath);
+    await execFileAsync(process.execPath, [script, "revoke"], {
+      env: environment,
+    });
+    await expect(stat(cookiePath)).rejects.toMatchObject({ code: "ENOENT" });
+
+    await execFileAsync(process.execPath, [script, "issue"], {
+      env: environment,
+    });
+    const expiredCookie = (await readFile(cookiePath, "utf8")).trim();
+    inspection = new CoceanDatabase(databasePath);
+    inspection.raw
+      .prepare("UPDATE app_sessions SET expires_at=? WHERE id=?")
+      .run("2000-01-01T00:00:00.000Z", "cocean-acceptance-admin-session-v1");
+    inspection.close();
+    await execFileAsync(process.execPath, [script, "issue"], {
+      env: environment,
+    });
+    expect((await readFile(cookiePath, "utf8")).trim()).not.toBe(expiredCookie);
+    await execFileAsync(process.execPath, [script, "revoke"], {
+      env: environment,
+    });
+
+    const concurrent = await Promise.allSettled([
+      execFileAsync(process.execPath, [script, "issue"], { env: environment }),
+      execFileAsync(process.execPath, [script, "issue"], { env: environment }),
+    ]);
+    expect(
+      concurrent.filter((result) => result.status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      concurrent.filter((result) => result.status === "rejected"),
+    ).toHaveLength(1);
+    await execFileAsync(process.execPath, [script, "revoke"], {
+      env: environment,
+    });
+    await execFileAsync(process.execPath, [script, "revoke"], {
+      env: environment,
+    });
+    const revoked = new CoceanDatabase(databasePath);
+    expect(
+      revoked.raw.prepare("SELECT COUNT(*) AS count FROM app_sessions").get(),
+    ).toEqual({ count: 1 });
+    revoked.close();
+  });
+
   it("exposes an empty but valid library", async () => {
     const database = new CoceanDatabase(":memory:");
     const app = await buildApp({ config: testConfig(), database });
@@ -1042,6 +1182,215 @@ describe("COCEAN HTTP API", () => {
       offset: 0,
       total: 1,
     });
+  });
+
+  it("serves the private inventory report only to ADMIN and distinguishes 404 from 409", async () => {
+    const database = new CoceanDatabase(":memory:");
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    database.createScanJob({
+      id: "inventory-ready",
+      rootId: "music",
+      mode: "FULL",
+      status: "RUNNING",
+      totalFiles: 0,
+      processedFiles: 0,
+      parsedFiles: 0,
+      failedFiles: 0,
+      reusedFiles: 0,
+      createdAt: "2026-08-16T00:00:00.000Z",
+      startedAt: "2026-08-16T00:00:00.000Z",
+      finishedAt: null,
+      error: null,
+      cancelRequestedAt: null,
+    });
+    const inventoryFile = {
+      absolutePath: "/library/private/Artist/Inventory/01 Secret.flac",
+      relativePath: "Artist/Inventory/01 Secret.flac",
+      extension: ".flac",
+      sizeBytes: 10,
+      modifiedAtMs: 1,
+      audio: {
+        kind: "PCM" as const,
+        codec: "flac",
+        container: "flac",
+        lossless: true,
+        bitDepth: 24,
+        sampleRate: 96_000,
+        bitrate: null,
+        channels: 2,
+        dsdRate: null,
+      },
+      durationSeconds: 1,
+      tags: {
+        album: "Inventory",
+        albumArtist: "Artist",
+        title: "Secret",
+        artists: ["Artist"],
+        year: 2026,
+        date: "2026",
+        genre: [],
+        composer: [],
+        label: [],
+        catalogNumber: null,
+        barcode: null,
+        musicBrainzReleaseId: null,
+        discNumber: 1,
+        discTotal: 1,
+        trackNumber: 1,
+        trackTotal: 1,
+      },
+      artwork: [],
+      warnings: [],
+    };
+    database.recordScanDiscovery({
+      scanJobId: "inventory-ready",
+      rulesVersion: "inventory-api/1",
+      candidates: 1,
+      regularFiles: 1,
+      auxiliaryFiles: 0,
+      ignoredFiles: 0,
+      skippedSymlinks: 0,
+      traversalErrors: 0,
+    });
+    database.recordScanFileResult({
+      scanJobId: "inventory-ready",
+      rootId: "music",
+      relativePath: inventoryFile.relativePath,
+      extension: ".flac",
+      candidateKind: "SUPPORTED_AUDIO",
+      outcome: "PARSED",
+      mediaFileId: "inventory-media-stable-id",
+      sizeBytes: inventoryFile.sizeBytes,
+      modifiedAtMs: inventoryFile.modifiedAtMs,
+      errorCode: null,
+      errorStage: null,
+      warningCodes: [],
+    });
+    database.finalizeSuccessfulScan({
+      scanJobId: "inventory-ready",
+      rootId: "music",
+      stagedFiles: [{ id: "inventory-media-stable-id", file: inventoryFile }],
+      seenRelativePaths: [inventoryFile.relativePath],
+      albums: [
+        {
+          id: "inventory-version-stable-id",
+          rootId: "music",
+          groupKey: "inventory-version-stable-id",
+          title: "Inventory",
+          albumArtist: "Artist",
+          year: 2026,
+          discCount: 1,
+          fileIds: ["inventory-media-stable-id"],
+          audioSummary: null,
+          mixedAudioSpecs: false,
+          artwork: {
+            source: "NONE",
+            url: null,
+            mimeType: null,
+            width: null,
+            height: null,
+          },
+          matchStatus: "NEEDS_REVIEW",
+          aggregationIssues: [],
+        },
+      ],
+      withWarnings: false,
+    });
+    database.createScanJob({
+      id: "inventory-running",
+      rootId: "music",
+      mode: "FULL",
+      status: "QUEUED",
+      totalFiles: 0,
+      processedFiles: 0,
+      parsedFiles: 0,
+      failedFiles: 0,
+      reusedFiles: 0,
+      createdAt: "2026-08-16T00:01:00.000Z",
+      startedAt: null,
+      finishedAt: null,
+      error: null,
+      cancelRequestedAt: null,
+    });
+    const admin = adminCookie(database);
+    const member = sessionCookieFor(database, "MEMBER");
+    const url = "/api/v1/library/inventory-report?scanJobId=inventory-ready";
+    expect((await app.inject({ method: "GET", url })).statusCode).toBe(401);
+    expect(
+      (await app.inject({ method: "GET", url, headers: { cookie: member } }))
+        .statusCode,
+    ).toBe(403);
+    const response = await app.inject({
+      method: "GET",
+      url,
+      headers: { cookie: admin },
+    });
+    expect(response.statusCode, response.body).toBe(200);
+    const inventory = response.json();
+    expect(inventory).toEqual(
+      expect.objectContaining({
+        schema: "cocean.library-inventory/v1",
+        scanJobId: "inventory-ready",
+        findings: [],
+        valid: true,
+      }),
+    );
+    expect(inventory.versions).toHaveLength(1);
+    expect(inventory.versions[0]).toEqual(
+      expect.objectContaining({
+        localVersionId: "inventory-version-stable-id",
+        mediaFileIds: ["inventory-media-stable-id"],
+      }),
+    );
+    expect(inventory.versions[0].localVersionId).not.toBe("");
+    expect(inventory.versions[0].libraryAlbumId).not.toBe("");
+    expect(inventory.versions[0].mediaFileIds[0]).not.toBe("");
+    expect(response.body).not.toContain("/library/");
+    expect(response.body).not.toMatch(/cookie|token|password/i);
+    const missing = await app.inject({
+      method: "GET",
+      url: "/api/v1/library/inventory-report?scanJobId=missing",
+      headers: { cookie: admin },
+    });
+    expect(missing.statusCode).toBe(404);
+    const pending = await app.inject({
+      method: "GET",
+      url: "/api/v1/library/inventory-report?scanJobId=inventory-running",
+      headers: { cookie: admin },
+    });
+    expect(pending.statusCode).toBe(409);
+    expect(database.claimNextScanJob()?.id).toBe("inventory-running");
+    database.recordScanDiscovery({
+      scanJobId: "inventory-running",
+      rulesVersion: "inventory-api/1",
+      candidates: 0,
+      regularFiles: 0,
+      auxiliaryFiles: 0,
+      ignoredFiles: 0,
+      skippedSymlinks: 0,
+      traversalErrors: 0,
+    });
+    database.finalizeSuccessfulScan({
+      scanJobId: "inventory-running",
+      rootId: "music",
+      stagedFiles: [],
+      seenRelativePaths: [],
+      albums: [],
+      withWarnings: false,
+    });
+    const superseded = await app.inject({
+      method: "GET",
+      url,
+      headers: { cookie: admin },
+    });
+    expect(superseded.statusCode).toBe(409);
+    expect(superseded.json()).toEqual(
+      expect.objectContaining({ error: "SCAN_NOT_AUTHORITATIVE" }),
+    );
   });
 
   it("rejects source-library writeback in v1", async () => {

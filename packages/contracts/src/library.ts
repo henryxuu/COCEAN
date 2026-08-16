@@ -561,3 +561,127 @@ export const libraryStatsSchema = z.object({
   recentlyAdded: z.number().int().nonnegative(),
 });
 export type LibraryStats = z.infer<typeof libraryStatsSchema>;
+
+export const inventoryClassificationSchema = z.enum([
+  "CURRENT_DIGITAL",
+  "PHYSICAL_ONLY",
+  "REFERENCED_HISTORY",
+  "ORPHAN",
+]);
+export type InventoryClassification = z.infer<
+  typeof inventoryClassificationSchema
+>;
+
+export const inventoryReasonSchema = z.enum([
+  "CURRENT_FILES",
+  "PHYSICAL_COPY",
+  "DELIVERY_RECORD",
+  "DELIVERY_JOB",
+  "ALBUM_INTRODUCTION",
+  "RELEASE_CANDIDATE",
+  "USER_IDENTITY",
+  "USER_PRIMARY",
+  "VERSION_METADATA",
+  "METADATA_GOVERNANCE",
+  "ARTWORK_GOVERNANCE",
+  "VISIBILITY_GOVERNANCE",
+  "LIFECYCLE_GOVERNANCE",
+  "LIBRARY_ISSUE",
+  "NO_CURRENT_FACT",
+]);
+export type InventoryReason = z.infer<typeof inventoryReasonSchema>;
+
+export const inventoryFindingCodeSchema = z.enum([
+  "EMPTY_IDENTIFIER",
+  "LOCAL_VERSION_WITHOUT_LIBRARY_ALBUM",
+  "LIBRARY_ALBUM_WITHOUT_PRIMARY_VERSION",
+  "PRIMARY_VERSION_NOT_MEMBER",
+  "PRIMARY_VERSION_WITHOUT_FILES",
+  "VISIBLE_ALBUM_WITHOUT_CURRENT_MEMBER",
+  "MEDIA_FILE_MULTIPLE_OWNERS",
+  "MEDIA_FILE_ROOT_MISMATCH",
+  "SCAN_MEDIA_ROOT_MISMATCH",
+  "SCAN_PARSED_MEDIA_ID_DUPLICATE",
+  "CURRENT_ROOT_MEDIA_ID_DUPLICATE",
+  "SCAN_ALBUM_COUNT_MISMATCH",
+  "SCAN_PARSED_FILE_COUNT_MISMATCH",
+  "SCAN_MEDIA_ID_MISMATCH",
+  "PARTITION_COUNT_MISMATCH",
+]);
+export type InventoryFindingCode = z.infer<typeof inventoryFindingCodeSchema>;
+
+export const inventoryVersionSchema = z
+  .object({
+    localVersionId: z.string().min(1),
+    libraryAlbumId: z.string().min(1).nullable(),
+    rootId: z.string().min(1),
+    classification: inventoryClassificationSchema,
+    reasons: z.array(inventoryReasonSchema).min(1),
+    mediaFileIds: z.array(z.string().min(1)),
+    fileCount: z.number().int().nonnegative(),
+    physicalCopyCount: z.number().int().nonnegative(),
+    physicalQuantity: z.number().int().nonnegative(),
+    isPrimary: z.boolean(),
+  })
+  .superRefine((version, context) => {
+    if (
+      (version.physicalCopyCount === 0 && version.physicalQuantity !== 0) ||
+      (version.physicalCopyCount > 0 &&
+        version.physicalQuantity < version.physicalCopyCount)
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["physicalQuantity"],
+        message:
+          "physicalQuantity must be zero without copy records and at least physicalCopyCount otherwise",
+      });
+  });
+export type InventoryVersion = z.infer<typeof inventoryVersionSchema>;
+
+export const inventoryFindingSchema = z.object({
+  code: inventoryFindingCodeSchema,
+  localVersionId: z.string().min(1).nullable(),
+  libraryAlbumId: z.string().min(1).nullable(),
+  mediaFileId: z.string().min(1).nullable(),
+});
+export type InventoryFinding = z.infer<typeof inventoryFindingSchema>;
+
+export const inventoryLibraryAlbumSchema = z.object({
+  libraryAlbumId: z.string().min(1),
+  primaryVersionId: z.string().min(1).nullable(),
+  memberVersionIds: z.array(z.string().min(1)),
+  visible: z.boolean(),
+  displayed: z.boolean(),
+});
+export type InventoryLibraryAlbum = z.infer<typeof inventoryLibraryAlbumSchema>;
+
+export const libraryInventoryReportSchema = z.object({
+  schema: z.literal("cocean.library-inventory/v1"),
+  scanJobId: z.string().min(1),
+  rootId: z.string().min(1),
+  generatedAt: z.string().min(1),
+  versions: z.array(inventoryVersionSchema),
+  libraryAlbums: z.array(inventoryLibraryAlbumSchema),
+  scanParsedMediaIds: z.array(z.string().min(1)),
+  currentRootMediaIds: z.array(z.string().min(1)),
+  counts: z.object({
+    localVersions: z.number().int().nonnegative(),
+    currentDigital: z.number().int().nonnegative(),
+    physicalOnly: z.number().int().nonnegative(),
+    referencedHistory: z.number().int().nonnegative(),
+    orphan: z.number().int().nonnegative(),
+    physicalVersions: z.number().int().nonnegative(),
+    digitalPhysicalOverlap: z.number().int().nonnegative(),
+    physicalCopies: z.number().int().nonnegative(),
+    physicalQuantity: z.number().int().nonnegative(),
+    libraryAlbums: z.number().int().nonnegative(),
+    displayedAlbums: z.number().int().nonnegative(),
+    scanAlbumCount: z.number().int().nonnegative(),
+    scanParsedFiles: z.number().int().nonnegative(),
+  }),
+  findings: z.array(inventoryFindingSchema),
+  valid: z.boolean(),
+});
+export type LibraryInventoryReport = z.infer<
+  typeof libraryInventoryReportSchema
+>;

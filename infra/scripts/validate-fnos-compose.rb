@@ -25,7 +25,7 @@ unless missing_variables.empty?
   errors << "required variables absent from .env.example: #{missing_variables.join(', ')}"
 end
 
-required_services = %w[web server worker provider-qobuz music-manifest acceptance-api db-maintenance]
+required_services = %w[web server worker provider-qobuz music-manifest acceptance-api acceptance-session db-maintenance]
 missing_services = required_services - services.keys
 errors << "missing services: #{missing_services.join(', ')}" unless missing_services.empty?
 
@@ -208,6 +208,34 @@ end
 if Array(acceptance_api["volumes"]).any? { |volume| volume.is_a?(Hash) && volume["read_only"] != true && volume["target"] != "/var/lib/cocean" }
   errors << "acceptance-api: only the data report mount may be writable"
 end
+
+acceptance_session = services.fetch("acceptance-session", {})
+unless acceptance_session["image"] == services.fetch("server", {})["image"]
+  errors << "acceptance-session: image must exactly match server image"
+end
+errors << "acceptance-session: maintenance profile missing" unless Array(acceptance_session["profiles"]).include?("maintenance")
+errors << "acceptance-session: restart must be disabled" unless acceptance_session["restart"] == "no"
+errors << "acceptance-session: read_only must be true" unless acceptance_session["read_only"] == true
+errors << "acceptance-session: user must be explicit" unless acceptance_session["user"].is_a?(String)
+errors << "acceptance-session: cap_drop ALL missing" unless Array(acceptance_session["cap_drop"]).include?("ALL")
+unless Array(acceptance_session["security_opt"]).include?("no-new-privileges:true")
+  errors << "acceptance-session: no-new-privileges missing"
+end
+errors << "acceptance-session: network must be disabled" unless acceptance_session["network_mode"] == "none"
+unless Array(acceptance_session["entrypoint"]) == ["node", "/app/acceptance-session.mjs"]
+  errors << "acceptance-session: entrypoint mismatch"
+end
+session_data = volume_for(acceptance_session, "/var/lib/cocean")
+errors << "acceptance-session: data mount missing" unless session_data
+unless session_data && session_data["source"].to_s.include?("COCEAN_DATA_DIR")
+  errors << "acceptance-session: data mount must use COCEAN_DATA_DIR"
+end
+unless session_data && session_data.dig("bind", "create_host_path") == false
+  errors << "acceptance-session: data mount must refuse implicit host-path creation"
+end
+errors << "acceptance-session: only the data mount is permitted" unless Array(acceptance_session["volumes"]).length == 1
+errors << "acceptance-session: environment is forbidden" unless acceptance_session.fetch("environment", {}).empty?
+errors << "acceptance-session: secrets are forbidden" unless Array(acceptance_session["secrets"]).empty?
 %w[web worker].each do |dependency|
   unless acceptance_api.dig("depends_on", dependency, "condition") == "service_healthy"
     errors << "acceptance-api: #{dependency} healthy dependency missing"
