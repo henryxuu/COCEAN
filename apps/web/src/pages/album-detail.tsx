@@ -456,7 +456,7 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
     setIdentitySearchError(null);
     if (!query.trim()) return setIdentitySearchResults([]);
     try {
-      const result = await api.albumPage({ search: query, limit: 25 });
+      const result = await api.albumPage(mergeTargetAlbumQuery(query));
       if (identitySearchGeneration.current.isLatest(generation))
         setIdentitySearchResults(
           result.items.filter((candidate) => candidate.id !== item.id),
@@ -2783,6 +2783,10 @@ export function createLatestRequestTracker() {
       generation += 1;
     },
   };
+}
+
+export function mergeTargetAlbumQuery(search: string) {
+  return { search, sort: "ARTIST" as const, limit: 25 };
 }
 
 export function AlbumIdentityHistory({

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { api, buildDemoAlbumPage } from "./api.js";
+import { api, buildDemoAlbumPage, sortAlbumSummaries } from "./api.js";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -23,6 +23,27 @@ describe("web API client", () => {
     expect(
       new URL(requests[0]!, "http://cocean.test").searchParams.get("issue"),
     ).toBe("LOW_RES_ARTWORK");
+    expect(
+      new URL(requests[0]!, "http://cocean.test").searchParams.get("sort"),
+    ).toBe("ADDED_DESC");
+  });
+
+  it("preserves an explicit legacy sort in live album page requests", async () => {
+    const requests: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        requests.push(String(input));
+        return new Response(
+          JSON.stringify({ items: [], limit: 96, offset: 0, total: 0 }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }),
+    );
+    await api.albumPage({ sort: "ARTIST" });
+    expect(
+      new URL(requests[0]!, "http://cocean.test").searchParams.get("sort"),
+    ).toBe("ARTIST");
   });
 
   it("binds visibility and lifecycle governance commands to exact routes", async () => {
@@ -139,6 +160,73 @@ describe("web API client", () => {
       "MISSING_ARTWORK",
     );
     expect(buildDemoAlbumPage({ issue: "INCOMPLETE_TRACKS" }).total).toBe(0);
+  });
+
+  it("sorts demo albums before pagination with latest-added as the default", () => {
+    const all = buildDemoAlbumPage({ limit: 100 });
+    expect(all.items.map((album) => album.addedAt)).toEqual(
+      [...all.items]
+        .sort((left, right) => right.addedAt.localeCompare(left.addedAt))
+        .map((album) => album.addedAt),
+    );
+    expect(buildDemoAlbumPage({ limit: 2, offset: 2 }).items).toEqual(
+      all.items.slice(2, 4),
+    );
+  });
+
+  it("covers every demo sort branch, null years, addedAt ties, and invalid runtime input", () => {
+    const template = buildDemoAlbumPage({ limit: 1 }).items[0]!;
+    const albums = [
+      {
+        ...template,
+        id: "a",
+        addedAt: "2026-08-12T00:00:00.000Z",
+        title: "Gamma",
+        albumArtist: "Mike",
+        year: 2000,
+      },
+      {
+        ...template,
+        id: "b",
+        addedAt: "2026-08-12T00:00:00.000Z",
+        title: "Alpha",
+        albumArtist: "Zulu",
+        year: null,
+      },
+      {
+        ...template,
+        id: "c",
+        addedAt: "2026-08-11T00:00:00.000Z",
+        title: "Beta",
+        albumArtist: "Alpha",
+        year: 2024,
+      },
+      {
+        ...template,
+        id: "d",
+        addedAt: "2026-08-10T00:00:00.000Z",
+        title: "Alpha",
+        albumArtist: "Alpha",
+        year: 1990,
+      },
+      {
+        ...template,
+        id: "e",
+        addedAt: "2026-08-09T00:00:00.000Z",
+        title: "Delta",
+        albumArtist: "Alpha",
+        year: null,
+      },
+    ];
+    const ids = (sort: "ADDED_DESC" | "ARTIST" | "TITLE" | "YEAR_DESC") =>
+      sortAlbumSummaries(albums, sort).map((album) => album.id);
+
+    expect(ids("ADDED_DESC")).toEqual(["a", "b", "c", "d", "e"]);
+    expect(ids("ARTIST")).toEqual(["e", "d", "c", "a", "b"]);
+    expect(ids("TITLE")).toEqual(["d", "b", "c", "e", "a"]);
+    expect(ids("YEAR_DESC")).toEqual(["c", "a", "d", "b", "e"]);
+    expect(() => sortAlbumSummaries(albums, "POPULAR")).toThrow();
+    expect(() => buildDemoAlbumPage({ sort: "POPULAR" as never })).toThrow();
   });
 
   it("does not attach a JSON content type to an empty POST", async () => {

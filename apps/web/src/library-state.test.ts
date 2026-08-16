@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  changeLibraryCriteria,
   consumeLibraryScrollRestoration,
   libraryRoute,
   libraryScrollKey,
@@ -11,6 +12,49 @@ import {
 } from "./library-state.js";
 
 describe("唱片库返回连续性", () => {
+  it("将最新加入作为无参数默认，并保留所有显式旧排序", () => {
+    const defaultState = readLibraryState(new URLSearchParams());
+    expect(defaultState.sort).toBe("ADDED_DESC");
+    expect(libraryRoute(defaultState)).toBe("/library");
+    expect(
+      libraryRoute(readLibraryState(new URLSearchParams("sort=ADDED_DESC"))),
+    ).toBe("/library");
+    expect(
+      libraryRoute(readLibraryState(new URLSearchParams("sort=POPULAR"))),
+    ).toBe("/library");
+
+    for (const sort of ["ARTIST", "TITLE", "YEAR_DESC"] as const) {
+      const state = readLibraryState(new URLSearchParams(`sort=${sort}`));
+      expect(state.sort).toBe(sort);
+      expect(libraryRoute(state)).toBe(`/library?sort=${sort}`);
+    }
+  });
+
+  it("搜索、筛选、问题、可见性和排序变化都回到第一页并保留其他状态", () => {
+    const current = readLibraryState(
+      new URLSearchParams(
+        "q=Bach&filter=CD&sort=ARTIST&issue=MISSING_ARTWORK&visibility=HIDDEN&page=3",
+      ),
+    );
+    const patches: Array<Parameters<typeof changeLibraryCriteria>[1]> = [
+      { query: "Mozart" },
+      { filter: "VINYL" },
+      { issue: "BROKEN_TEXT" },
+      { visibility: "VISIBLE" },
+      { sort: "YEAR_DESC" },
+    ];
+    for (const patch of patches) {
+      const changed = changeLibraryCriteria(current, patch);
+      expect(changed.page).toBe(0);
+      expect(changed).toEqual(expect.objectContaining(patch));
+      expect(changed.query).toBe(patch.query ?? current.query);
+      expect(changed.filter).toBe(patch.filter ?? current.filter);
+      expect(changed.sort).toBe(patch.sort ?? current.sort);
+      expect(changed.issue).toBe(patch.issue ?? current.issue);
+      expect(changed.visibility).toBe(patch.visibility ?? current.visibility);
+    }
+  });
+
   it("把查询、筛选、排序和第 2 页稳定编码为同一个返回 URL", () => {
     const state = readLibraryState(
       new URLSearchParams(

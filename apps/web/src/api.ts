@@ -24,6 +24,7 @@ import type {
   LibraryIdentityDecision,
   LibraryIdentityDecisionCommand,
   LibraryIdentityDecisionResult,
+  LibrarySort,
   ArtworkDecisionCommand,
   UpdateAlbumMetadataCommand,
   ModelConfiguration,
@@ -42,6 +43,7 @@ import type {
   ScanReport,
   StillCatalogStatus,
 } from "@cocean/contracts";
+import { defaultLibrarySort, librarySortSchema } from "@cocean/contracts";
 import {
   demoAlbumDetail,
   demoAlbums,
@@ -135,7 +137,7 @@ export interface AlbumPage {
 export interface AlbumPageInput {
   search?: string;
   filter?: "ALL" | "DIGITAL" | PhysicalMedium;
-  sort?: "ARTIST" | "TITLE" | "YEAR_DESC";
+  sort?: LibrarySort;
   issue?: import("@cocean/contracts").LibraryIssueCode | "ALL";
   limit?: number;
   offset?: number;
@@ -166,13 +168,56 @@ export function buildDemoAlbumPage(input: AlbumPageInput = {}): AlbumPage {
         input.visibility === "ALL" ||
         (album.visibility ?? "VISIBLE") === input.visibility),
   );
+  const sorted = sortAlbumSummaries(filtered, input.sort);
   const offset = input.offset ?? 0;
   const limit = input.limit ?? 96;
   return {
-    items: filtered.slice(offset, offset + limit),
+    items: sorted.slice(offset, offset + limit),
     limit,
     offset,
     total: filtered.length,
+  };
+}
+
+export function sortAlbumSummaries(
+  albums: readonly AlbumSummary[],
+  sort: unknown = defaultLibrarySort,
+): AlbumSummary[] {
+  const parsedSort = librarySortSchema.parse(sort);
+  return [...albums].sort(albumComparator(parsedSort));
+}
+
+function albumComparator(sort: LibrarySort) {
+  const text = (left: string, right: string) =>
+    left.localeCompare(right, undefined, { sensitivity: "base" });
+  const nullableYear = (left: number | null, right: number | null) =>
+    left === right ? 0 : left === null ? -1 : right === null ? 1 : left - right;
+  return (left: AlbumSummary, right: AlbumSummary): number => {
+    let compared = 0;
+    if (sort === "ADDED_DESC")
+      compared = right.addedAt.localeCompare(left.addedAt);
+    else if (sort === "TITLE")
+      compared =
+        text(left.title, right.title) ||
+        text(left.albumArtist, right.albumArtist) ||
+        nullableYear(left.year, right.year);
+    else if (sort === "YEAR_DESC")
+      compared =
+        (left.year === right.year
+          ? 0
+          : left.year === null
+            ? 1
+            : right.year === null
+              ? -1
+              : right.year - left.year) ||
+        text(left.title, right.title) ||
+        text(left.albumArtist, right.albumArtist);
+    else
+      compared =
+        text(left.albumArtist, right.albumArtist) ||
+        nullableYear(left.year, right.year) ||
+        text(left.title, right.title);
+    return compared || left.id.localeCompare(right.id);
   };
 }
 
@@ -231,7 +276,7 @@ export const api = {
     const params = new URLSearchParams({
       search: input.search ?? "",
       filter: input.filter ?? "ALL",
-      sort: input.sort ?? "ARTIST",
+      sort: input.sort ?? defaultLibrarySort,
       issue: input.issue ?? "ALL",
       limit: String(input.limit ?? 96),
       offset: String(input.offset ?? 0),

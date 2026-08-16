@@ -3,6 +3,8 @@ import {
   albumAddedAtSchema,
   albumDetailSchema,
   albumSummarySchema,
+  defaultLibrarySort,
+  librarySortSchema,
 } from "./library.js";
 
 describe("album addedAt contract", () => {
@@ -67,6 +69,33 @@ describe("album addedAt contract", () => {
         addedAt: "2026-08-12T08:00:00+08:00",
       }).success,
     ).toBe(false);
-    expect(albumAddedAtSchema.safeParse("").success).toBe(false);
+    expect(
+      albumAddedAtSchema.safeParse("2026-08-12T00:00:00.000Z").success,
+    ).toBe(true);
+    for (const invalid of [
+      "",
+      "2026-08-12T00:00:00.1Z",
+      "2026-08-12T00:00:00.1001Z",
+      "2026-08-12T08:00:00.000+08:00",
+    ]) {
+      expect(albumAddedAtSchema.safeParse(invalid).success).toBe(false);
+    }
+  });
+});
+
+describe("library sort contract", () => {
+  it("shares four values and defaults browsing to latest added", () => {
+    expect(librarySortSchema.options).toEqual([
+      "ADDED_DESC",
+      "ARTIST",
+      "TITLE",
+      "YEAR_DESC",
+    ]);
+    expect(defaultLibrarySort).toBe("ADDED_DESC");
+  });
+
+  it("rejects unknown sort values", () => {
+    expect(librarySortSchema.safeParse("POPULAR").success).toBe(false);
+    expect(librarySortSchema.safeParse("").success).toBe(false);
   });
 });

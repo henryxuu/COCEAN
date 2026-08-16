@@ -1,12 +1,104 @@
 import type { AlbumSummary } from "@cocean/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
-import { describe, expect, it } from "vitest";
+import TestRenderer, { act } from "react-test-renderer";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { api } from "../api.js";
 import { libraryScrollKey } from "../library-state.js";
 import { AlbumDetailBreadcrumb } from "./album-detail.js";
 import { libraryAlbumQuery, LibraryAlbumCard, LibraryPage } from "./library.js";
 
+afterEach(() => vi.restoreAllMocks());
+
 describe("唱片库页面返回接线", () => {
+  it("无排序参数时选中最新加入并查询共享默认值", () => {
+    const html = renderToStaticMarkup(
+      <MemoryRouter initialEntries={["/library"]}>
+        <LibraryPage canManage={false} />
+      </MemoryRouter>,
+    );
+    expect(html).toContain(
+      '<option value="ADDED_DESC" selected="">最新加入</option>',
+    );
+    expect(
+      libraryAlbumQuery({
+        query: "",
+        filter: "ALL",
+        sort: "ADDED_DESC",
+        issue: "ALL",
+        visibility: "VISIBLE",
+        page: 0,
+      }),
+    ).toEqual(expect.objectContaining({ sort: "ADDED_DESC", offset: 0 }));
+  });
+
+  it("挂载页面后按 canonical 状态请求，并让排序或筛选变化从第 2 页归零", async () => {
+    const pending = new Promise<never>(() => {});
+    const albumPage = vi.spyOn(api, "albumPage").mockReturnValue(pending);
+    vi.spyOn(api, "stats").mockReturnValue(pending);
+    let renderer: TestRenderer.ReactTestRenderer;
+
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <MemoryRouter initialEntries={["/library"]}>
+          <LibraryPage canManage={false} />
+        </MemoryRouter>,
+      );
+    });
+    expect(albumPage).toHaveBeenLastCalledWith({
+      search: "",
+      filter: "ALL",
+      sort: "ADDED_DESC",
+      issue: "ALL",
+      visibility: "VISIBLE",
+      limit: 96,
+      offset: 0,
+    });
+    await act(async () => renderer!.unmount());
+
+    albumPage.mockClear();
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <MemoryRouter initialEntries={["/library?sort=ARTIST&page=2"]}>
+          <LibraryPage canManage={false} />
+        </MemoryRouter>,
+      );
+    });
+    expect(albumPage).toHaveBeenLastCalledWith(
+      expect.objectContaining({ sort: "ARTIST", offset: 96 }),
+    );
+    const sortSelect = renderer!.root
+      .findAllByType("select")
+      .find((candidate) => candidate.props.value === "ARTIST")!;
+    await act(async () =>
+      sortSelect.props.onChange({ target: { value: "TITLE" } }),
+    );
+    expect(albumPage).toHaveBeenLastCalledWith(
+      expect.objectContaining({ sort: "TITLE", offset: 0 }),
+    );
+    await act(async () => renderer!.unmount());
+
+    albumPage.mockClear();
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <MemoryRouter initialEntries={["/library?page=2"]}>
+          <LibraryPage canManage={false} />
+        </MemoryRouter>,
+      );
+    });
+    expect(albumPage).toHaveBeenLastCalledWith(
+      expect.objectContaining({ sort: "ADDED_DESC", offset: 96 }),
+    );
+    const cdFilter = renderer!.root
+      .findAllByType("button")
+      .find((candidate) => rendererText(candidate) === "CD")!;
+    await act(async () => cdFilter.props.onClick());
+    expect(albumPage).toHaveBeenLastCalledWith(
+      expect.objectContaining({ filter: "CD", offset: 0 }),
+    );
+    await act(async () => renderer!.unmount());
+  });
+
   it("页面渲染直接服从当前 URL 的查询、筛选、排序与页码", () => {
     const html = renderToStaticMarkup(
       <MemoryRouter
@@ -155,3 +247,9 @@ const album: AlbumSummary = {
     },
   ],
 };
+
+function rendererText(node: TestRenderer.ReactTestInstance): string {
+  return node.children
+    .map((child) => (typeof child === "string" ? child : rendererText(child)))
+    .join("");
+}

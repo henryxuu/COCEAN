@@ -30,6 +30,7 @@ import {
   deviceOwnershipSchema,
   libraryIdentityDecisionCommandSchema,
   libraryInventoryReportSchema,
+  librarySortSchema,
   orphanGovernancePreviewSchema,
   previewOrphanGovernanceCommandSchema,
   importMusicBrainzArtworkCommandSchema,
@@ -43,6 +44,7 @@ import {
   type LibraryChangePlan,
   type ReleaseCandidate,
 } from "@cocean/contracts";
+import { defaultLibrarySort } from "@cocean/contracts";
 import {
   AlbumMetadataDecisionError,
   AlbumArtworkDecisionError,
@@ -90,7 +92,7 @@ const albumQuerySchema = z.object({
       "OTHER",
     ])
     .default("ALL"),
-  sort: z.enum(["ARTIST", "TITLE", "YEAR_DESC"]).default("ARTIST"),
+  sort: librarySortSchema.default(defaultLibrarySort),
   issue: z
     .enum([
       "ALL",

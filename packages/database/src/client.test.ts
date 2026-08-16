@@ -2321,6 +2321,66 @@ describe("CoceanDatabase", () => {
     }
   });
 
+  it("defaults to latest-added and uses the real library id across page boundaries", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    database.replaceAlbumsForRoot("music", [
+      {
+        ...albumInput("added-old", []),
+        title: "Artist First",
+        albumArtist: "A",
+      },
+      { ...albumInput("added-new", []), title: "Newest", albumArtist: "Z" },
+      {
+        ...albumInput("added-middle", []),
+        title: "Middle",
+        albumArtist: "M",
+      },
+    ]);
+    const albums = ["added-old", "added-new", "added-middle"].map((versionId) =>
+      database.getAlbumSummary(versionId)!,
+    );
+    const addedAtByVersion = new Map([
+      ["added-old", "2026-08-10T00:00:00.000Z"],
+      ["added-new", "2026-08-12T00:00:00.000Z"],
+      ["added-middle", "2026-08-11T00:00:00.000Z"],
+    ]);
+    for (const [versionId, addedAt] of addedAtByVersion) {
+      database.raw
+        .prepare("UPDATE library_albums SET created_at=? WHERE id=?")
+        .run(addedAt, database.getAlbumSummary(versionId)!.id);
+    }
+
+    expect(database.listAlbums().map((album) => album.title)).toEqual([
+      "Newest",
+      "Middle",
+      "Artist First",
+    ]);
+    expect(
+      database.listAlbums({ sort: "ADDED_DESC" }).map((album) => album.title),
+    ).toEqual(["Newest", "Middle", "Artist First"]);
+    expect(
+      database.listAlbums({ sort: "ARTIST" }).map((album) => album.title),
+    ).toEqual(["Artist First", "Middle", "Newest"]);
+
+    for (const album of albums) {
+      database.raw
+        .prepare("UPDATE library_albums SET created_at=? WHERE id=?")
+        .run("2026-08-12T00:00:00.000Z", album.id);
+    }
+    const expectedIds = albums.map((album) => album.id).sort();
+    const pagedIds = [0, 1, 2].map(
+      (offset) => database.listAlbums({ limit: 1, offset })[0]!.id,
+    );
+    expect(pagedIds).toEqual(expectedIds);
+    const acrossPages = [
+      ...database.listAlbums({ limit: 2, offset: 0 }),
+      ...database.listAlbums({ limit: 2, offset: 2 }),
+    ].map((album) => album.id);
+    expect(acrossPages).toEqual(expectedIds);
+    expect(new Set(acrossPages).size).toBe(expectedIds.length);
+  });
+
   it("groups overlapping local versions under a stable identity and exposes concrete integrity evidence", () => {
     const database = new CoceanDatabase(":memory:");
     open.push(database);

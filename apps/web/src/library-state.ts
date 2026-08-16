@@ -1,7 +1,12 @@
-import type { LibraryIssueCode } from "@cocean/contracts";
+import {
+  defaultLibrarySort,
+  librarySortSchema,
+  type LibraryIssueCode,
+  type LibrarySort,
+} from "@cocean/contracts";
 
 export type LibraryFilter = "ALL" | "DIGITAL" | "CD" | "SACD" | "VINYL";
-export type LibrarySort = "ARTIST" | "TITLE" | "YEAR_DESC";
+export type { LibrarySort };
 export type LibraryIssue = "ALL" | LibraryIssueCode;
 export type LibraryVisibility = "VISIBLE" | "HIDDEN";
 
@@ -41,6 +46,7 @@ export const LIBRARY_SCROLL_RESTORATION_TTL_MS = 30 * 60 * 1000;
 export function readLibraryState(searchParams: URLSearchParams): LibraryState {
   const filter = searchParams.get("filter");
   const sort = searchParams.get("sort");
+  const parsedSort = librarySortSchema.safeParse(sort);
   const page = parsePage(searchParams.get("page"));
   const issue = searchParams.get("issue");
   return {
@@ -48,9 +54,7 @@ export function readLibraryState(searchParams: URLSearchParams): LibraryState {
     filter: ["ALL", "DIGITAL", "CD", "SACD", "VINYL"].includes(filter ?? "")
       ? (filter as LibraryFilter)
       : "ALL",
-    sort: ["ARTIST", "TITLE", "YEAR_DESC"].includes(sort ?? "")
-      ? (sort as LibrarySort)
-      : "ARTIST",
+    sort: parsedSort.success ? parsedSort.data : defaultLibrarySort,
     issue: libraryIssues.includes(issue as LibraryIssue)
       ? (issue as LibraryIssue)
       : "ALL",
@@ -64,7 +68,7 @@ export function librarySearchParams(state: LibraryState): URLSearchParams {
   const next = new URLSearchParams();
   if (state.query) next.set("q", state.query);
   if (state.filter !== "ALL") next.set("filter", state.filter);
-  if (state.sort !== "ARTIST") next.set("sort", state.sort);
+  if (state.sort !== defaultLibrarySort) next.set("sort", state.sort);
   if (state.issue !== "ALL") next.set("issue", state.issue);
   if (state.visibility === "HIDDEN") next.set("visibility", "HIDDEN");
   if (state.page > 0) next.set("page", String(state.page + 1));
@@ -74,6 +78,15 @@ export function librarySearchParams(state: LibraryState): URLSearchParams {
 export function libraryRoute(state: LibraryState): string {
   const query = librarySearchParams(state).toString();
   return query ? `/library?${query}` : "/library";
+}
+
+export function changeLibraryCriteria(
+  state: LibraryState,
+  patch: Partial<
+    Pick<LibraryState, "query" | "filter" | "sort" | "issue" | "visibility">
+  >,
+): LibraryState {
+  return { ...state, ...patch, page: 0 };
 }
 
 export function libraryScrollKey(route: string): string {

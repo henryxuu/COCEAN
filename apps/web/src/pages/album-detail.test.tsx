@@ -28,6 +28,7 @@ import {
   buildSplitIdentityCommand,
   createLatestRequestTracker,
   legacyLocalVersions,
+  mergeTargetAlbumQuery,
 } from "./album-detail.js";
 
 afterEach(() => {
@@ -558,6 +559,59 @@ describe("Album 封面治理", () => {
 });
 
 describe("Album 详情身份治理", () => {
+  it("合并目标搜索显式保持 Artist 排序", () => {
+    expect(mergeTargetAlbumQuery("Miles")).toEqual({
+      search: "Miles",
+      sort: "ARTIST",
+      limit: 25,
+    });
+  });
+
+  it("从详情页真实提交合并搜索时调用显式 Artist 查询", async () => {
+    const album = mountedOrphanAlbum();
+    vi.spyOn(api, "album").mockResolvedValue(album);
+    vi.spyOn(api, "deliveryTargets").mockResolvedValue([]);
+    vi.spyOn(api, "albumDeliveries").mockResolvedValue([]);
+    vi.spyOn(api, "albumIntroduction").mockResolvedValue(null);
+    vi.spyOn(api, "identityDecisions").mockResolvedValue([]);
+    vi.spyOn(api, "metadataHistory").mockResolvedValue([]);
+    vi.spyOn(api, "artworkHistory").mockResolvedValue([]);
+    vi.spyOn(api, "orphanGovernanceHistory").mockResolvedValue([]);
+    vi.spyOn(api, "capabilities").mockResolvedValue({} as never);
+    vi.spyOn(api, "lifecyclePlans").mockResolvedValue([]);
+    const albumPage = vi.spyOn(api, "albumPage").mockResolvedValue({
+      items: [],
+      limit: 25,
+      offset: 0,
+      total: 0,
+    });
+    let renderer: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <MemoryRouter initialEntries={["/albums/mounted-library"]}>
+          <Routes>
+            <Route path="/albums/:id" element={<AlbumDetailPage canManage />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+    });
+    const input = renderer!.root
+      .findAllByType("input")
+      .find((candidate) => candidate.props.placeholder === "搜索唱片或艺术家")!;
+    await act(async () => input.props.onChange({ target: { value: "Miles" } }));
+    const form = renderer!.root.find(
+      (candidate) => candidate.props.className === "identity-merge-search",
+    );
+    await act(async () => form.props.onSubmit({ preventDefault: vi.fn() }));
+
+    expect(albumPage).toHaveBeenCalledWith({
+      search: "Miles",
+      sort: "ARTIST",
+      limit: 25,
+    });
+    await act(async () => renderer!.unmount());
+  });
+
   it("为管理员提供确认、设主、拆分和合并入口并明确不修改 NAS", () => {
     const album = {
       id: "library-manual",

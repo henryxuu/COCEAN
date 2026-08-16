@@ -23,6 +23,7 @@ import { useAsync, useToast } from "../hooks.js";
 import {
   libraryRoute,
   librarySearchParams,
+  changeLibraryCriteria,
   consumeLibraryScrollRestoration,
   readLibraryScrollRestoration,
   readLibraryState,
@@ -79,6 +80,14 @@ export function LibraryPage({ canManage }: { canManage: boolean }) {
     setSearchParams(librarySearchParams({ ...currentLibraryState, ...patch }), {
       replace: true,
     });
+  };
+  const updateLibraryCriteria = (
+    patch: Parameters<typeof changeLibraryCriteria>[1],
+  ) => {
+    setSearchParams(
+      librarySearchParams(changeLibraryCriteria(currentLibraryState, patch)),
+      { replace: true },
+    );
   };
   useLayoutEffect(() => {
     if (
@@ -243,7 +252,7 @@ export function LibraryPage({ canManage }: { canManage: boolean }) {
         <SearchField
           value={query}
           onChange={(event) => {
-            updateLibraryState({ query: event.target.value, page: 0 });
+            updateLibraryCriteria({ query: event.target.value });
           }}
           placeholder="搜索 Album、Artist"
           aria-label="搜索唱片库"
@@ -252,17 +261,13 @@ export function LibraryPage({ canManage }: { canManage: boolean }) {
           <div className="filter-row" aria-label="筛选显示状态">
             <FilterPill
               active={visibility === "VISIBLE"}
-              onClick={() =>
-                updateLibraryState({ visibility: "VISIBLE", page: 0 })
-              }
+              onClick={() => updateLibraryCriteria({ visibility: "VISIBLE" })}
             >
               日常唱片
             </FilterPill>
             <FilterPill
               active={visibility === "HIDDEN"}
-              onClick={() =>
-                updateLibraryState({ visibility: "HIDDEN", page: 0 })
-              }
+              onClick={() => updateLibraryCriteria({ visibility: "HIDDEN" })}
             >
               已隐藏
             </FilterPill>
@@ -282,7 +287,7 @@ export function LibraryPage({ canManage }: { canManage: boolean }) {
               key={value}
               active={filter === value}
               onClick={() => {
-                updateLibraryState({ filter: value, page: 0 });
+                updateLibraryCriteria({ filter: value });
               }}
             >
               {label}
@@ -294,9 +299,8 @@ export function LibraryPage({ canManage }: { canManage: boolean }) {
           <select
             value={issue}
             onChange={(event) =>
-              updateLibraryState({
+              updateLibraryCriteria({
                 issue: event.target.value as LibraryIssue,
-                page: 0,
               })
             }
           >
@@ -315,12 +319,12 @@ export function LibraryPage({ canManage }: { canManage: boolean }) {
           <select
             value={sort}
             onChange={(event) => {
-              updateLibraryState({
+              updateLibraryCriteria({
                 sort: event.target.value as Sort,
-                page: 0,
               });
             }}
           >
+            <option value="ADDED_DESC">最新加入</option>
             <option value="ARTIST">Artist</option>
             <option value="TITLE">Album</option>
             <option value="YEAR_DESC">年份 ↓</option>

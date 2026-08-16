@@ -27,6 +27,7 @@ import type {
   LibraryRoot,
   LibraryIssue,
   LibraryIssueCode,
+  LibrarySort,
   LibraryInventoryReport,
   InventoryFinding,
   InventoryReason,
@@ -66,6 +67,7 @@ import type {
 } from "@cocean/contracts";
 import {
   albumAddedAtSchema,
+  defaultLibrarySort,
   formatCompactAudioSpec,
   releaseCandidateSchema,
   stillRuntimeCatalogSchema,
@@ -7999,7 +8001,7 @@ export class CoceanDatabase {
       search?: string;
       filter?: "ALL" | "DIGITAL" | PhysicalMedium;
       issue?: LibraryIssueCode | "ALL";
-      sort?: "ARTIST" | "TITLE" | "YEAR_DESC";
+      sort?: LibrarySort;
       visibility?: "VISIBLE" | "HIDDEN" | "ALL";
       limit?: number;
       offset?: number;
@@ -8007,7 +8009,7 @@ export class CoceanDatabase {
   ): AlbumSummary[] {
     const search = options.search?.trim();
     const filter = options.filter ?? "ALL";
-    const sort = options.sort ?? "ARTIST";
+    const sort = options.sort ?? defaultLibrarySort;
     const issue = options.issue ?? "ALL";
     const visibility = options.visibility ?? "VISIBLE";
     const limit = Math.min(Math.max(options.limit ?? 100, 1), 500);
@@ -8048,11 +8050,13 @@ export class CoceanDatabase {
     }
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
     const order =
-      sort === "TITLE"
-        ? `${effectiveTitle} COLLATE NOCASE, ${effectiveArtist} COLLATE NOCASE, ${effectiveYear}`
-        : sort === "YEAR_DESC"
-          ? `${effectiveYear} IS NULL, ${effectiveYear} DESC, ${effectiveTitle} COLLATE NOCASE, ${effectiveArtist} COLLATE NOCASE`
-          : `${effectiveArtist} COLLATE NOCASE, ${effectiveYear}, ${effectiveTitle} COLLATE NOCASE`;
+      sort === "ADDED_DESC"
+        ? "la.created_at DESC, la.id ASC"
+        : sort === "TITLE"
+          ? `${effectiveTitle} COLLATE NOCASE, ${effectiveArtist} COLLATE NOCASE, ${effectiveYear}, la.id ASC`
+          : sort === "YEAR_DESC"
+            ? `${effectiveYear} IS NULL, ${effectiveYear} DESC, ${effectiveTitle} COLLATE NOCASE, ${effectiveArtist} COLLATE NOCASE, la.id ASC`
+            : `${effectiveArtist} COLLATE NOCASE, ${effectiveYear}, ${effectiveTitle} COLLATE NOCASE, la.id ASC`;
     const rows = this.raw
       .prepare(
         `SELECT a.*, la.id AS library_album_id, la.primary_version_id,
@@ -8065,7 +8069,7 @@ export class CoceanDatabase {
                 ${effectiveYear} AS effective_year,
                 (SELECT COUNT(*) FROM library_album_members WHERE library_album_id=la.id) AS version_count
          FROM library_albums la JOIN albums a ON a.id=la.primary_version_id
-         ${where} ORDER BY ${order}, la.id LIMIT @limit OFFSET @offset`,
+         ${where} ORDER BY ${order} LIMIT @limit OFFSET @offset`,
       )
       .all(parameters);
     return rows.map((row) =>

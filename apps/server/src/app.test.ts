@@ -209,6 +209,121 @@ describe("COCEAN HTTP API", () => {
     });
   });
 
+  it("defaults album browsing to latest-added while preserving explicit sorts", async () => {
+    const database = new CoceanDatabase(":memory:");
+    const base = {
+      rootId: "music",
+      discCount: 1,
+      fileIds: [],
+      audioSummary: null,
+      mixedAudioSpecs: false,
+      artwork: {
+        source: "NONE" as const,
+        url: null,
+        mimeType: null,
+        width: null,
+        height: null,
+      },
+      matchStatus: "UNMATCHED" as const,
+    };
+    database.replaceAlbumsForRoot("music", [
+      {
+        ...base,
+        id: "sort-new",
+        groupKey: "sort-new",
+        title: "Middle",
+        albumArtist: "Zulu",
+        year: 1990,
+      },
+      {
+        ...base,
+        id: "sort-middle",
+        groupKey: "sort-middle",
+        title: "Alpha",
+        albumArtist: "Mike",
+        year: 2000,
+      },
+      {
+        ...base,
+        id: "sort-old",
+        groupKey: "sort-old",
+        title: "Zulu",
+        albumArtist: "Alpha",
+        year: 2026,
+      },
+    ]);
+    for (const [versionId, addedAt] of [
+      ["sort-new", "2026-08-12T00:00:00.000Z"],
+      ["sort-middle", "2026-08-11T00:00:00.000Z"],
+      ["sort-old", "2026-08-10T00:00:00.000Z"],
+    ] as const) {
+      database.raw
+        .prepare("UPDATE library_albums SET created_at=? WHERE id=?")
+        .run(addedAt, database.getAlbumSummary(versionId)!.id);
+    }
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    const titles = async (url: string) => {
+      const response = await app.inject({ method: "GET", url });
+      expect(response.statusCode, response.body).toBe(200);
+      return response
+        .json()
+        .items.map((album: { title: string }) => album.title);
+    };
+
+    await expect(titles("/api/v1/albums")).resolves.toEqual([
+      "Middle",
+      "Alpha",
+      "Zulu",
+    ]);
+    await expect(titles("/api/v1/albums?sort=ARTIST")).resolves.toEqual([
+      "Zulu",
+      "Alpha",
+      "Middle",
+    ]);
+    await expect(titles("/api/v1/albums?sort=TITLE")).resolves.toEqual([
+      "Alpha",
+      "Middle",
+      "Zulu",
+    ]);
+    await expect(titles("/api/v1/albums?sort=YEAR_DESC")).resolves.toEqual([
+      "Zulu",
+      "Alpha",
+      "Middle",
+    ]);
+
+    const expectedIds = ["sort-new", "sort-middle", "sort-old"]
+      .map((versionId) => database.getAlbumSummary(versionId)!.id)
+      .sort();
+    for (const id of expectedIds) {
+      database.raw
+        .prepare("UPDATE library_albums SET created_at=? WHERE id=?")
+        .run("2026-08-12T00:00:00.000Z", id);
+    }
+    const pagedIds: string[] = [];
+    for (const offset of [0, 1, 2]) {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/v1/albums?limit=1&offset=${offset}`,
+      });
+      expect(response.statusCode, response.body).toBe(200);
+      expect(response.json().items).toHaveLength(1);
+      pagedIds.push(response.json().items[0].id);
+    }
+    expect(pagedIds).toEqual(expectedIds);
+    expect(new Set(pagedIds).size).toBe(expectedIds.length);
+
+    const invalid = await app.inject({
+      method: "GET",
+      url: "/api/v1/albums?sort=POPULAR",
+    });
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json().error).toBe("VALIDATION_ERROR");
+  });
+
   it("filters grouped library albums by a concrete integrity issue", async () => {
     const database = new CoceanDatabase(":memory:");
     const base = {

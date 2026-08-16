@@ -462,7 +462,19 @@ export type AlbumArtworkMutationResult = z.infer<
   typeof albumArtworkMutationResultSchema
 >;
 
-export const albumAddedAtSchema = z.iso.datetime({ offset: false });
+export const albumAddedAtSchema = z.iso.datetime({
+  offset: false,
+  precision: 3,
+});
+
+export const librarySortSchema = z.enum([
+  "ADDED_DESC",
+  "ARTIST",
+  "TITLE",
+  "YEAR_DESC",
+]);
+export type LibrarySort = z.infer<typeof librarySortSchema>;
+export const defaultLibrarySort: LibrarySort = "ADDED_DESC";
 
 export const albumSummarySchema = z.object({
   id: z.string(),
