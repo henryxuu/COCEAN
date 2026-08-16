@@ -1393,6 +1393,307 @@ describe("COCEAN HTTP API", () => {
     );
   });
 
+  it("keeps orphan preview and confirm ADMIN-only and gives MEMBER a redacted history", async () => {
+    const database = new CoceanDatabase(":memory:");
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    database.createScanJob({
+      id: "orphan-api-scan",
+      rootId: "physical",
+      mode: "FULL",
+      status: "RUNNING",
+      totalFiles: 0,
+      processedFiles: 0,
+      parsedFiles: 0,
+      failedFiles: 0,
+      reusedFiles: 0,
+      createdAt: "2026-08-16T00:00:00.000Z",
+      startedAt: "2026-08-16T00:00:00.000Z",
+      finishedAt: null,
+      error: null,
+      cancelRequestedAt: null,
+    });
+    database.recordScanDiscovery({
+      scanJobId: "orphan-api-scan",
+      rulesVersion: "orphan-api/1",
+      candidates: 0,
+      regularFiles: 0,
+      auxiliaryFiles: 0,
+      ignoredFiles: 0,
+      skippedSymlinks: 0,
+      traversalErrors: 0,
+    });
+    database.finalizeSuccessfulScan({
+      scanJobId: "orphan-api-scan",
+      rootId: "physical",
+      stagedFiles: [],
+      seenRelativePaths: [],
+      albums: [],
+      withWarnings: false,
+    });
+    database.createPhysicalOnlyAlbum({
+      id: "orphan-api-version",
+      groupKey: "orphan-api-version",
+      title: "API Orphan",
+      albumArtist: "Artist",
+      year: null,
+    });
+    database.raw
+      .prepare("DELETE FROM library_issues WHERE album_id=?")
+      .run("orphan-api-version");
+    const previewUrl =
+      "/api/v1/local-versions/orphan-api-version/orphan-governance/preview";
+    const confirmUrl =
+      "/api/v1/local-versions/orphan-api-version/orphan-governance/confirm";
+    const historyUrl =
+      "/api/v1/local-versions/orphan-api-version/orphan-governance/history";
+    const admin = adminCookie(database);
+    const member = sessionCookieFor(database, "MEMBER");
+    const body = { localVersionId: "orphan-api-version" };
+    expect(
+      (await app.inject({ method: "POST", url: previewUrl, payload: body }))
+        .statusCode,
+    ).toBe(401);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: previewUrl,
+          headers: { cookie: member },
+          payload: body,
+        })
+      ).statusCode,
+    ).toBe(403);
+    const previewResponse = await app.inject({
+      method: "POST",
+      url: previewUrl,
+      headers: { cookie: admin },
+      payload: body,
+    });
+    expect(previewResponse.statusCode, previewResponse.body).toBe(200);
+    const preview = previewResponse.json();
+    expect(preview).toEqual(
+      expect.objectContaining({
+        action: "CLOSE_ORPHAN_IDENTITY",
+        executable: true,
+        expectedFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+      }),
+    );
+    expect(previewResponse.body).not.toContain("/library/");
+    const crossResource = await app.inject({
+      method: "POST",
+      url: "/api/v1/local-versions/a-different-version/orphan-governance/preview",
+      headers: { cookie: admin },
+      payload: body,
+    });
+    expect(crossResource.statusCode).toBe(409);
+    expect(crossResource.json()).toEqual(
+      expect.objectContaining({ error: "ORPHAN_RESOURCE_MISMATCH" }),
+    );
+    const missing = await app.inject({
+      method: "POST",
+      url: "/api/v1/local-versions/missing-version/orphan-governance/preview",
+      headers: { cookie: admin },
+      payload: { localVersionId: "missing-version" },
+    });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.json()).toEqual(
+      expect.objectContaining({ error: "ORPHAN_TARGET_NOT_FOUND" }),
+    );
+
+    const confirmPayload = {
+      requestId: "orphan-api-request",
+      action: preview.action,
+      expectedFingerprint: preview.expectedFingerprint,
+      scanJobId: preview.expected.scanJobId,
+      localVersionId: "orphan-api-version",
+      expected: preview.expected,
+    };
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: confirmUrl,
+          payload: confirmPayload,
+        })
+      ).statusCode,
+    ).toBe(401);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: confirmUrl,
+          headers: { cookie: member },
+          payload: confirmPayload,
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(
+      database.raw
+        .prepare(
+          "SELECT COUNT(*) AS count FROM library_orphan_governance_events",
+        )
+        .get(),
+    ).toEqual({ count: 0 });
+    const mismatchedConfirm = await app.inject({
+      method: "POST",
+      url: "/api/v1/local-versions/a-different-version/orphan-governance/confirm",
+      headers: { cookie: admin },
+      payload: confirmPayload,
+    });
+    expect(mismatchedConfirm.statusCode).toBe(409);
+    expect(mismatchedConfirm.json()).toEqual(
+      expect.objectContaining({ error: "ORPHAN_RESOURCE_MISMATCH" }),
+    );
+    expect(
+      database.raw
+        .prepare(
+          "SELECT COUNT(*) AS count FROM library_orphan_governance_events",
+        )
+        .get(),
+    ).toEqual({ count: 0 });
+    const confirmResponse = await app.inject({
+      method: "POST",
+      url: confirmUrl,
+      headers: { cookie: admin },
+      payload: confirmPayload,
+    });
+    expect(confirmResponse.statusCode, confirmResponse.body).toBe(200);
+    expect(confirmResponse.json()).toEqual(
+      expect.objectContaining({ status: "APPLIED" }),
+    );
+
+    expect(
+      (await app.inject({ method: "GET", url: historyUrl })).statusCode,
+    ).toBe(401);
+    const memberHistory = await app.inject({
+      method: "GET",
+      url: historyUrl,
+      headers: { cookie: member },
+    });
+    expect(memberHistory.statusCode, memberHistory.body).toBe(200);
+    expect(memberHistory.json().items[0]).toEqual(
+      expect.objectContaining({ status: "APPLIED" }),
+    );
+    expect(memberHistory.body).not.toMatch(
+      /actor|requestId|expectedFingerprint|before|after|NO_CURRENT_FACT/,
+    );
+    const adminHistory = await app.inject({
+      method: "GET",
+      url: historyUrl,
+      headers: { cookie: admin },
+    });
+    expect(adminHistory.statusCode, adminHistory.body).toBe(200);
+    expect(adminHistory.json().items[0]).toEqual(
+      expect.objectContaining({
+        requestId: "orphan-api-request",
+        actor: expect.objectContaining({ id: expect.any(String) }),
+      }),
+    );
+  });
+
+  it("audits a version-scoped confirm when its target disappeared", async () => {
+    const database = new CoceanDatabase(":memory:");
+    const app = await buildApp({ config: testConfig(), database });
+    close.push(
+      () => app.close(),
+      () => database.close(),
+    );
+    database.createScanJob({
+      id: "disappeared-api-scan",
+      rootId: "physical",
+      mode: "FULL",
+      status: "RUNNING",
+      totalFiles: 0,
+      processedFiles: 0,
+      parsedFiles: 0,
+      failedFiles: 0,
+      reusedFiles: 0,
+      createdAt: "2026-08-16T00:00:00.000Z",
+      startedAt: "2026-08-16T00:00:00.000Z",
+      finishedAt: null,
+      error: null,
+      cancelRequestedAt: null,
+    });
+    database.recordScanDiscovery({
+      scanJobId: "disappeared-api-scan",
+      rulesVersion: "orphan-api/1",
+      candidates: 0,
+      regularFiles: 0,
+      auxiliaryFiles: 0,
+      ignoredFiles: 0,
+      skippedSymlinks: 0,
+      traversalErrors: 0,
+    });
+    database.finalizeSuccessfulScan({
+      scanJobId: "disappeared-api-scan",
+      rootId: "physical",
+      stagedFiles: [],
+      seenRelativePaths: [],
+      albums: [],
+      withWarnings: false,
+    });
+    database.createPhysicalOnlyAlbum({
+      id: "disappeared-api-version",
+      groupKey: "disappeared-api-version",
+      title: "Disappeared",
+      albumArtist: "Artist",
+      year: null,
+    });
+    database.raw
+      .prepare(
+        "DELETE FROM library_issues WHERE album_id='disappeared-api-version'",
+      )
+      .run();
+    const cookie = adminCookie(database);
+    const preview = (
+      await app.inject({
+        method: "POST",
+        url: "/api/v1/local-versions/disappeared-api-version/orphan-governance/preview",
+        headers: { cookie },
+        payload: { localVersionId: "disappeared-api-version" },
+      })
+    ).json();
+    database.raw
+      .prepare(
+        "DELETE FROM library_album_members WHERE album_id='disappeared-api-version'",
+      )
+      .run();
+    database.raw
+      .prepare("DELETE FROM albums WHERE id='disappeared-api-version'")
+      .run();
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/local-versions/disappeared-api-version/orphan-governance/confirm",
+      headers: { cookie },
+      payload: {
+        requestId: "disappeared-api-request",
+        action: preview.action,
+        expectedFingerprint: preview.expectedFingerprint,
+        scanJobId: preview.expected.scanJobId,
+        localVersionId: "disappeared-api-version",
+        expected: preview.expected,
+      },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual(
+      expect.objectContaining({
+        error: "ORPHAN_TARGET_NOT_FOUND",
+        result: expect.objectContaining({ status: "REJECTED" }),
+      }),
+    );
+    const history = await app.inject({
+      method: "GET",
+      url: "/api/v1/local-versions/disappeared-api-version/orphan-governance/history",
+      headers: { cookie },
+    });
+    expect(history.statusCode).toBe(200);
+    expect(history.json().items).toHaveLength(1);
+  });
+
   it("rejects source-library writeback in v1", async () => {
     const database = new CoceanDatabase(":memory:");
     const app = await buildApp({ config: testConfig(), database });

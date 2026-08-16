@@ -1254,4 +1254,44 @@ export const migrations = [
         BEGIN SELECT RAISE(ABORT, 'library change event ledger is append-only'); END;
     `,
   },
+  {
+    version: 21,
+    name: "safe_orphan_governance",
+    sql: `
+      CREATE TABLE library_orphan_governance_events (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        local_version_id TEXT NOT NULL,
+        library_album_id TEXT,
+        resulting_library_album_id TEXT,
+        status TEXT NOT NULL CHECK(status IN ('APPLIED','REJECTED')),
+        action TEXT NOT NULL CHECK(action IN (
+          'DETACH_TO_HIDDEN_HISTORY','HIDE_HISTORY_GROUP','CLOSE_ORPHAN_IDENTITY'
+        )),
+        actor_id TEXT NOT NULL,
+        actor_display_name TEXT NOT NULL,
+        input_json TEXT NOT NULL,
+        expected_fingerprint TEXT NOT NULL CHECK(length(expected_fingerprint)=64),
+        before_state_json TEXT,
+        expected_state_json TEXT,
+        after_state_json TEXT,
+        result_json TEXT NOT NULL,
+        error_code TEXT CHECK(error_code IS NULL OR error_code IN (
+          'ORPHAN_TARGET_NOT_FOUND','NO_AUTHORITATIVE_SCAN',
+          'ORPHAN_GOVERNANCE_CONFLICT','ORPHAN_GOVERNANCE_NOT_EXECUTABLE'
+        )),
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX library_orphan_governance_events_version_idx
+        ON library_orphan_governance_events(local_version_id,created_at DESC,id DESC);
+      CREATE INDEX library_orphan_governance_events_album_idx
+        ON library_orphan_governance_events(library_album_id,created_at DESC,id DESC);
+      CREATE TRIGGER library_orphan_governance_events_no_update
+        BEFORE UPDATE ON library_orphan_governance_events
+        BEGIN SELECT RAISE(ABORT, 'library orphan governance event ledger is append-only'); END;
+      CREATE TRIGGER library_orphan_governance_events_no_delete
+        BEFORE DELETE ON library_orphan_governance_events
+        BEGIN SELECT RAISE(ABORT, 'library orphan governance event ledger is append-only'); END;
+    `,
+  },
 ] as const;

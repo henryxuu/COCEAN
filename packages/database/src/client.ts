@@ -21,6 +21,7 @@ import type {
   AuthSession,
   AuthUser,
   CoceanSettings,
+  ConfirmOrphanGovernanceCommand,
   DeliveryJob,
   DeliveryTarget,
   LibraryRoot,
@@ -43,9 +44,16 @@ import type {
   ModelConfiguration,
   ModelVerificationStatus,
   ObservedMediaFile,
+  OrphanGovernanceAction,
+  OrphanGovernanceErrorCode,
+  OrphanGovernanceEvent,
+  OrphanGovernanceExpected,
+  OrphanGovernancePreview,
+  OrphanGovernanceResult,
   OwnedDevice,
   PhysicalCopy,
   PhysicalMedium,
+  PreviewOrphanGovernanceCommand,
   ReleaseCandidate,
   ScanFailure,
   ScanFileOutcome,
@@ -180,6 +188,17 @@ export class LibraryInventoryReportError extends Error {
   ) {
     super(message);
     this.name = "LibraryInventoryReportError";
+  }
+}
+
+export class OrphanGovernanceError extends Error {
+  constructor(
+    public readonly code: OrphanGovernanceErrorCode,
+    message: string,
+    public readonly result: OrphanGovernanceResult | null = null,
+  ) {
+    super(message);
+    this.name = "OrphanGovernanceError";
   }
 }
 
@@ -1636,6 +1655,734 @@ export class CoceanDatabase {
         valid: findings.length === 0 && counts.orphan === 0,
       };
     })();
+  }
+
+  previewOrphanGovernance(
+    localVersionId: string,
+    command: PreviewOrphanGovernanceCommand,
+  ): OrphanGovernancePreview {
+    if (command.localVersionId !== localVersionId)
+      throw new OrphanGovernanceError(
+        "ORPHAN_RESOURCE_MISMATCH",
+        "URL 中的本地版本与请求正文不一致",
+      );
+    const version = this.raw
+      .prepare("SELECT id,root_id FROM albums WHERE id=?")
+      .get(localVersionId) as { id: string; root_id: string } | undefined;
+    if (!version)
+      throw new OrphanGovernanceError(
+        "ORPHAN_TARGET_NOT_FOUND",
+        "本地版本不存在，无法生成治理预览",
+      );
+    const scanJobId =
+      command.scanJobId ??
+      (
+        this.raw
+          .prepare(
+            `SELECT sr.scan_job_id FROM scan_reports sr
+             JOIN scan_jobs sj ON sj.id=sr.scan_job_id
+             WHERE sr.root_id=? AND sj.status IN ('COMPLETED','COMPLETED_WITH_WARNINGS')
+               AND sr.album_count IS NOT NULL
+             ORDER BY sr.created_at DESC,sr.rowid DESC LIMIT 1`,
+          )
+          .get(version.root_id) as { scan_job_id: string } | undefined
+      )?.scan_job_id;
+    if (!scanJobId)
+      throw new OrphanGovernanceError(
+        "NO_AUTHORITATIVE_SCAN",
+        "该版本没有可用于安全治理的权威扫描快照",
+      );
+    const report = this.getLibraryInventoryReport(scanJobId);
+    if (report.rootId !== version.root_id)
+      throw new OrphanGovernanceError(
+        "NO_AUTHORITATIVE_SCAN",
+        "治理快照必须来自目标版本所属根目录",
+      );
+    const target = report.versions.find(
+      (item) => item.localVersionId === command.localVersionId,
+    );
+    if (!target || target.rootId !== version.root_id)
+      throw new OrphanGovernanceError(
+        "ORPHAN_TARGET_NOT_FOUND",
+        "权威扫描快照中没有该本地版本",
+      );
+
+    const group = target.libraryAlbumId
+      ? report.libraryAlbums.find(
+          (item) => item.libraryAlbumId === target.libraryAlbumId,
+        )
+      : undefined;
+    const groupRow = target.libraryAlbumId
+      ? (this.raw
+          .prepare(
+            `SELECT revision,visibility,visibility_revision
+             FROM library_albums WHERE id=?`,
+          )
+          .get(target.libraryAlbumId) as
+          | {
+              revision: number;
+              visibility: "VISIBLE" | "HIDDEN";
+              visibility_revision: number;
+            }
+          | undefined)
+      : undefined;
+    const memberVersions = target.libraryAlbumId
+      ? report.versions.filter(
+          (item) => item.libraryAlbumId === target.libraryAlbumId,
+        )
+      : [target];
+    const memberFacts = memberVersions
+      .map((item) => ({
+        localVersionId: item.localVersionId,
+        classification: item.classification,
+        reasons: [...item.reasons].sort(),
+        isPrimary: item.isPrimary,
+        referenceFingerprint: inventoryReferenceFingerprint(
+          this.raw,
+          item.localVersionId,
+          item.libraryAlbumId,
+        ),
+      }))
+      .sort((left, right) =>
+        left.localVersionId.localeCompare(right.localVersionId),
+      );
+    const currentMemberVersionIds = memberFacts
+      .filter((item) =>
+        ["CURRENT_DIGITAL", "PHYSICAL_ONLY"].includes(item.classification),
+      )
+      .map((item) => item.localVersionId)
+      .sort();
+    const expected: OrphanGovernanceExpected = {
+      scanJobId,
+      rootId: target.rootId,
+      localVersionId: target.localVersionId,
+      classification: target.classification,
+      reasons: [...target.reasons].sort(),
+      libraryAlbumId: target.libraryAlbumId,
+      libraryRevision: groupRow ? Number(groupRow.revision) : null,
+      visibility: groupRow?.visibility ?? null,
+      visibilityRevision: groupRow
+        ? Number(groupRow.visibility_revision)
+        : null,
+      primaryVersionId: group?.primaryVersionId ?? null,
+      memberVersionIds: group
+        ? [...group.memberVersionIds].sort()
+        : [target.localVersionId],
+      currentMemberVersionIds,
+      referenceFingerprint: inventoryReferenceFingerprint(
+        this.raw,
+        target.localVersionId,
+        target.libraryAlbumId,
+      ),
+      memberFacts,
+    };
+    const blockers: OrphanGovernancePreview["blockers"] = [];
+    const addBlocker = (
+      code: OrphanGovernancePreview["blockers"][number]["code"],
+      message: string,
+    ) => {
+      if (!blockers.some((blocker) => blocker.code === code))
+        blockers.push({ code, message });
+    };
+    const toleratedFindings = new Set<InventoryFinding["code"]>([
+      "LOCAL_VERSION_WITHOUT_LIBRARY_ALBUM",
+      "LIBRARY_ALBUM_WITHOUT_PRIMARY_VERSION",
+      "PRIMARY_VERSION_NOT_MEMBER",
+      "PRIMARY_VERSION_WITHOUT_FILES",
+      "VISIBLE_ALBUM_WITHOUT_CURRENT_MEMBER",
+    ]);
+    if (report.findings.some((finding) => !toleratedFindings.has(finding.code)))
+      addBlocker(
+        "INVENTORY_INTEGRITY_BLOCKED",
+        "库存快照存在与孤立治理无关的完整性异常，必须先完成对账",
+      );
+    if (
+      this.raw
+        .prepare(
+          `SELECT 1 FROM library_change_plans
+           WHERE (local_version_id=? OR library_album_id=?)
+             AND status IN ('PREVIEWED','QUEUED','RUNNING','RECOVERY_REQUIRED') LIMIT 1`,
+        )
+        .get(target.localVersionId, target.libraryAlbumId ?? "")
+    )
+      addBlocker(
+        "ACTIVE_LIFECYCLE_PLAN",
+        "该版本存在未结束的文件管理计划，请先完成或取消计划",
+      );
+
+    let action: OrphanGovernanceAction | null = null;
+    let replacementPrimaryVersionId: string | null = null;
+    const hiddenClosedGroup =
+      groupRow?.visibility === "HIDDEN" &&
+      memberFacts.length > 0 &&
+      currentMemberVersionIds.length === 0;
+    if (hiddenClosedGroup) {
+      addBlocker("ALREADY_GOVERNED", "该版本已经处于隐藏历史身份");
+    } else if (
+      !["ORPHAN", "REFERENCED_HISTORY"].includes(target.classification)
+    ) {
+      addBlocker(
+        "TARGET_NOT_ABNORMAL",
+        "当前版本仍有数字文件或实体副本，不属于孤立治理范围",
+      );
+    } else if (currentMemberVersionIds.length > 0) {
+      action = "DETACH_TO_HIDDEN_HISTORY";
+      replacementPrimaryVersionId = currentMemberVersionIds.includes(
+        group?.primaryVersionId ?? "",
+      )
+        ? group!.primaryVersionId
+        : [...memberFacts]
+            .filter((item) =>
+              currentMemberVersionIds.includes(item.localVersionId),
+            )
+            .sort((left, right) => {
+              const rank = (value: typeof left) =>
+                value.classification === "CURRENT_DIGITAL" ? 0 : 1;
+              return (
+                rank(left) - rank(right) ||
+                left.localVersionId.localeCompare(right.localVersionId)
+              );
+            })[0]!.localVersionId;
+    } else if (
+      groupRow?.visibility === "VISIBLE" &&
+      memberFacts.length > 0 &&
+      memberFacts.every((item) => item.classification === "REFERENCED_HISTORY")
+    ) {
+      action = "HIDE_HISTORY_GROUP";
+    } else if (target.classification === "ORPHAN") {
+      action = "CLOSE_ORPHAN_IDENTITY";
+    } else {
+      addBlocker(
+        "INVENTORY_INTEGRITY_BLOCKED",
+        "当前历史身份结构无法按唯一安全动作处置",
+      );
+    }
+    const expectedFingerprint = governanceExpectedFingerprint(expected);
+    return {
+      schema: "cocean.library-orphan-governance-preview/v1",
+      action,
+      executable: action !== null && blockers.length === 0,
+      before: expected,
+      replacementPrimaryVersionId,
+      affectedLibraryAlbumIds: target.libraryAlbumId
+        ? [target.libraryAlbumId]
+        : [],
+      expected,
+      expectedFingerprint,
+      blockers,
+    };
+  }
+
+  confirmOrphanGovernance(
+    localVersionId: string,
+    command: ConfirmOrphanGovernanceCommand,
+    actor: LibraryIdentityActor,
+  ): OrphanGovernanceResult {
+    if (command.localVersionId !== localVersionId)
+      throw new OrphanGovernanceError(
+        "ORPHAN_RESOURCE_MISMATCH",
+        "URL 中的本地版本与请求正文不一致",
+      );
+    const inputJson = canonicalJson(command);
+    const transaction = this.raw.transaction(() => {
+      const replay = this.orphanGovernanceResultByRequestId(
+        command.requestId,
+        inputJson,
+      );
+      if (replay) return replay;
+
+      if (
+        command.expected.localVersionId !== command.localVersionId ||
+        command.expected.scanJobId !== command.scanJobId ||
+        governanceExpectedFingerprint(command.expected) !==
+          command.expectedFingerprint
+      )
+        return this.recordRejectedOrphanGovernanceWithoutPreview(
+          command,
+          inputJson,
+          actor,
+          "ORPHAN_GOVERNANCE_CONFLICT",
+        );
+
+      let preview: OrphanGovernancePreview;
+      try {
+        preview = this.previewOrphanGovernance(localVersionId, {
+          localVersionId: command.localVersionId,
+          scanJobId: command.scanJobId,
+        });
+      } catch (error) {
+        if (
+          error instanceof LibraryInventoryReportError ||
+          error instanceof OrphanGovernanceError
+        )
+          return this.recordRejectedOrphanGovernanceWithoutPreview(
+            command,
+            inputJson,
+            actor,
+            error instanceof OrphanGovernanceError &&
+              ["ORPHAN_TARGET_NOT_FOUND", "NO_AUTHORITATIVE_SCAN"].includes(
+                error.code,
+              )
+              ? error.code
+              : "ORPHAN_GOVERNANCE_CONFLICT",
+          );
+        throw error;
+      }
+      if (
+        !preview.executable ||
+        preview.action !== command.action ||
+        preview.expectedFingerprint !== command.expectedFingerprint
+      )
+        return this.recordRejectedOrphanGovernance(
+          command,
+          inputJson,
+          actor,
+          preview,
+        );
+
+      const before = preview.expected;
+      const now = new Date().toISOString();
+      const applied = this.applyOrphanGovernanceIdentity(
+        command.action,
+        before,
+        preview.replacementPrimaryVersionId,
+        actor,
+        now,
+      );
+      const current = this.previewOrphanGovernance(command.localVersionId, {
+        localVersionId: command.localVersionId,
+        scanJobId: command.scanJobId,
+      });
+      const after = withOrphanGovernanceRetention(
+        current.expected,
+        command.localVersionId,
+      );
+      const event = this.insertOrphanGovernanceEvent({
+        command,
+        inputJson,
+        actor,
+        status: "APPLIED",
+        libraryAlbumId: before.libraryAlbumId,
+        resultingLibraryAlbumId: applied.resultingLibraryAlbumId,
+        before,
+        expected: command.expected,
+        after,
+        errorCode: null,
+        createdAt: now,
+      });
+      return {
+        status: "APPLIED" as const,
+        action: command.action,
+        localVersionId: command.localVersionId,
+        libraryAlbumId: before.libraryAlbumId,
+        resultingLibraryAlbumId: applied.resultingLibraryAlbumId,
+        event,
+      };
+    });
+    let outcome: OrphanGovernanceResult;
+    try {
+      outcome = transaction.immediate();
+    } catch (error) {
+      if (!isSqliteBusyOrUnique(error)) throw error;
+      const replay = this.orphanGovernanceResultByRequestId(
+        command.requestId,
+        inputJson,
+      );
+      if (!replay)
+        throw new OrphanGovernanceError(
+          "ORPHAN_GOVERNANCE_CONFLICT",
+          "治理请求正在竞争写入，请使用相同 requestId 重试",
+        );
+      outcome = replay;
+    }
+    if (outcome.status === "REJECTED")
+      throw new OrphanGovernanceError(
+        outcome.event.errorCode ?? "ORPHAN_GOVERNANCE_CONFLICT",
+        outcome.event.errorCode === "ORPHAN_GOVERNANCE_NOT_EXECUTABLE"
+          ? "该治理动作当前不可执行，请重新预览"
+          : "库存事实已经变化，请重新预览后确认",
+        outcome,
+      );
+    return outcome;
+  }
+
+  listOrphanGovernanceHistory(localVersionId: string): OrphanGovernanceEvent[] {
+    return (
+      this.raw
+        .prepare(
+          `SELECT * FROM library_orphan_governance_events
+           WHERE local_version_id=?
+           ORDER BY rowid DESC LIMIT 100`,
+        )
+        .all(localVersionId) as Record<string, unknown>[]
+    ).map((row) => this.mapOrphanGovernanceEvent(row));
+  }
+
+  private recordRejectedOrphanGovernance(
+    command: ConfirmOrphanGovernanceCommand,
+    inputJson: string,
+    actor: LibraryIdentityActor,
+    preview: OrphanGovernancePreview,
+  ): OrphanGovernanceResult {
+    const errorCode: OrphanGovernanceErrorCode = preview.executable
+      ? "ORPHAN_GOVERNANCE_CONFLICT"
+      : "ORPHAN_GOVERNANCE_NOT_EXECUTABLE";
+    const event = this.insertOrphanGovernanceEvent({
+      command,
+      inputJson,
+      actor,
+      status: "REJECTED",
+      libraryAlbumId: preview.expected.libraryAlbumId,
+      resultingLibraryAlbumId: preview.expected.libraryAlbumId,
+      before: preview.expected,
+      expected: command.expected,
+      after: null,
+      errorCode,
+      createdAt: new Date().toISOString(),
+    });
+    return {
+      status: "REJECTED",
+      action: command.action,
+      localVersionId: command.localVersionId,
+      libraryAlbumId: preview.expected.libraryAlbumId,
+      resultingLibraryAlbumId: preview.expected.libraryAlbumId,
+      event,
+    };
+  }
+
+  private recordRejectedOrphanGovernanceWithoutPreview(
+    command: ConfirmOrphanGovernanceCommand,
+    inputJson: string,
+    actor: LibraryIdentityActor,
+    errorCode: OrphanGovernanceErrorCode,
+  ): OrphanGovernanceResult {
+    const event = this.insertOrphanGovernanceEvent({
+      command,
+      inputJson,
+      actor,
+      status: "REJECTED",
+      libraryAlbumId: null,
+      resultingLibraryAlbumId: null,
+      before: null,
+      expected: command.expected,
+      after: null,
+      errorCode,
+      createdAt: new Date().toISOString(),
+    });
+    return {
+      status: "REJECTED",
+      action: command.action,
+      localVersionId: command.localVersionId,
+      libraryAlbumId: null,
+      resultingLibraryAlbumId: null,
+      event,
+    };
+  }
+
+  private applyOrphanGovernanceIdentity(
+    action: OrphanGovernanceAction,
+    before: OrphanGovernanceExpected,
+    replacementPrimaryVersionId: string | null,
+    actor: LibraryIdentityActor,
+    now: string,
+  ): { resultingLibraryAlbumId: string } {
+    const sourceId = before.libraryAlbumId;
+    let resultingLibraryAlbumId = sourceId;
+    let visibilityBefore: "VISIBLE" | "HIDDEN" = "VISIBLE";
+    let visibilityExpectedRevision = 0;
+
+    if (action === "HIDE_HISTORY_GROUP") {
+      if (!sourceId) throw new Error("history group disappeared");
+      const primary = before.memberVersionIds.includes(
+        before.primaryVersionId ?? "",
+      )
+        ? before.primaryVersionId
+        : (before.memberVersionIds[0] ?? before.localVersionId);
+      const identityChanged = primary !== before.primaryVersionId;
+      this.raw
+        .prepare(
+          `UPDATE library_albums SET visibility='HIDDEN',
+             visibility_revision=visibility_revision+1,visibility_updated_at=?,
+             primary_version_id=?,
+             primary_version_source=CASE WHEN ? THEN 'USER' ELSE primary_version_source END,
+             decision_source=CASE WHEN ? THEN 'USER' ELSE decision_source END,
+             revision=revision+?,updated_at=? WHERE id=?`,
+        )
+        .run(
+          now,
+          primary,
+          identityChanged ? 1 : 0,
+          identityChanged ? 1 : 0,
+          identityChanged ? 1 : 0,
+          now,
+          sourceId,
+        );
+      visibilityBefore = before.visibility ?? "VISIBLE";
+      visibilityExpectedRevision = before.visibilityRevision ?? 0;
+    } else {
+      const sourceMembers = sourceId
+        ? before.memberVersionIds
+        : [before.localVersionId];
+      const reuseSource = sourceId !== null && sourceMembers.length === 1;
+      if (reuseSource) {
+        resultingLibraryAlbumId = sourceId;
+        this.raw
+          .prepare(
+            `UPDATE library_albums SET visibility='HIDDEN',
+               visibility_revision=visibility_revision+1,visibility_updated_at=?,
+               primary_version_id=?,primary_version_source='USER',decision_source='USER',
+               revision=revision+1,updated_at=? WHERE id=?`,
+          )
+          .run(now, before.localVersionId, now, sourceId);
+        this.raw
+          .prepare(
+            `UPDATE library_album_members SET relationship_status='USER_SEPARATE',updated_at=?
+             WHERE library_album_id=? AND album_id=?`,
+          )
+          .run(now, sourceId, before.localVersionId);
+        visibilityBefore = before.visibility ?? "VISIBLE";
+        visibilityExpectedRevision = before.visibilityRevision ?? 0;
+      } else {
+        const version = this.raw
+          .prepare("SELECT title,album_artist,group_key FROM albums WHERE id=?")
+          .get(before.localVersionId) as
+          | { title: string; album_artist: string; group_key: string }
+          | undefined;
+        if (!version) throw new Error("local version disappeared");
+        const createdId = `library-${randomUUID()}`;
+        const identityKey = sourceId
+          ? String(
+              (
+                this.raw
+                  .prepare("SELECT identity_key FROM library_albums WHERE id=?")
+                  .get(sourceId) as { identity_key: string }
+              ).identity_key,
+            )
+          : `orphan:${before.localVersionId}`;
+        this.raw
+          .prepare(
+            `INSERT INTO library_albums
+             (id,identity_key,title,album_artist,primary_version_id,decision_source,
+              primary_version_source,revision,visibility,visibility_revision,
+              visibility_updated_at,created_at,updated_at)
+             VALUES (?,?,?,?,?,'USER','USER',1,'HIDDEN',1,?,?,?)`,
+          )
+          .run(
+            createdId,
+            identityKey,
+            version.title,
+            version.album_artist,
+            before.localVersionId,
+            now,
+            now,
+            now,
+          );
+        if (sourceId) {
+          const sourceMetadataSignature =
+            this.albumMetadataEffectiveSignature(sourceId);
+          this.raw
+            .prepare(
+              `UPDATE library_album_members SET library_album_id=?,
+                 relationship_status='USER_SEPARATE',updated_at=?
+               WHERE library_album_id=? AND album_id=?`,
+            )
+            .run(createdId, now, sourceId, before.localVersionId);
+          this.raw
+            .prepare(
+              `UPDATE library_issues SET library_album_id=?,updated_at=?
+               WHERE library_album_id=? AND album_id=?`,
+            )
+            .run(createdId, now, sourceId, before.localVersionId);
+          const remaining = before.memberVersionIds.filter(
+            (id) => id !== before.localVersionId,
+          );
+          const replacement =
+            replacementPrimaryVersionId ??
+            this.preferredPrimaryVersion(remaining);
+          this.raw
+            .prepare(
+              `UPDATE library_albums SET primary_version_id=?,primary_version_source='USER',
+                 decision_source='USER',revision=revision+1,updated_at=? WHERE id=?`,
+            )
+            .run(replacement, now, sourceId);
+          this.inheritSplitAlbumMetadata(sourceId, [createdId], now);
+          this.inheritSplitAlbumArtwork(sourceId, [createdId], now);
+          this.bumpMetadataRevisionForEffectiveChange(
+            sourceId,
+            sourceMetadataSignature,
+            now,
+          );
+          this.refreshMetadataIssueStatus(sourceId);
+          this.refreshEffectiveArtwork(sourceId, true, now);
+        } else {
+          this.raw
+            .prepare(
+              `INSERT INTO library_album_members
+               (library_album_id,album_id,relationship_status,created_at,updated_at)
+               VALUES (?,?,'USER_SEPARATE',?,?)`,
+            )
+            .run(createdId, before.localVersionId, now, now);
+        }
+        resultingLibraryAlbumId = createdId;
+        visibilityBefore = "VISIBLE";
+        visibilityExpectedRevision = 0;
+      }
+    }
+
+    this.raw
+      .prepare(
+        `INSERT INTO library_visibility_events
+         (id,request_id,library_album_id,event_type,actor_id,actor_display_name,
+          expected_visibility_revision,resulting_visibility_revision,
+          before_visibility,after_visibility,input_json,result_json,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        randomUUID(),
+        `orphan-visibility:${randomUUID()}`,
+        resultingLibraryAlbumId,
+        "HIDE",
+        actor.id,
+        actor.displayName,
+        visibilityExpectedRevision,
+        visibilityExpectedRevision + 1,
+        visibilityBefore,
+        "HIDDEN",
+        JSON.stringify({
+          action: "HIDE",
+          libraryAlbumId: resultingLibraryAlbumId,
+          expectedVisibilityRevision: visibilityExpectedRevision,
+          source: "ORPHAN_GOVERNANCE",
+        }),
+        JSON.stringify({
+          libraryAlbumId: resultingLibraryAlbumId,
+          visibility: "HIDDEN",
+          visibilityRevision: visibilityExpectedRevision + 1,
+        }),
+        now,
+      );
+    return { resultingLibraryAlbumId: resultingLibraryAlbumId! };
+  }
+
+  private insertOrphanGovernanceEvent(input: {
+    command: ConfirmOrphanGovernanceCommand;
+    inputJson: string;
+    actor: LibraryIdentityActor;
+    status: "APPLIED" | "REJECTED";
+    libraryAlbumId: string | null;
+    resultingLibraryAlbumId: string | null;
+    before: OrphanGovernanceExpected | null;
+    expected: OrphanGovernanceExpected | null;
+    after: OrphanGovernanceExpected | null;
+    errorCode: OrphanGovernanceErrorCode | null;
+    createdAt: string;
+  }): OrphanGovernanceEvent {
+    const event: OrphanGovernanceEvent = {
+      id: randomUUID(),
+      requestId: input.command.requestId,
+      localVersionId: input.command.localVersionId,
+      libraryAlbumId: input.libraryAlbumId,
+      resultingLibraryAlbumId: input.resultingLibraryAlbumId,
+      status: input.status,
+      action: input.command.action,
+      expectedFingerprint: input.command.expectedFingerprint,
+      actor: input.actor,
+      errorCode: input.errorCode,
+      before: input.before,
+      expected: input.expected,
+      after: input.after,
+      createdAt: input.createdAt,
+    };
+    const result: OrphanGovernanceResult = {
+      status: input.status,
+      action: input.command.action,
+      localVersionId: input.command.localVersionId,
+      libraryAlbumId: input.libraryAlbumId,
+      resultingLibraryAlbumId: input.resultingLibraryAlbumId,
+      event,
+    };
+    this.raw
+      .prepare(
+        `INSERT INTO library_orphan_governance_events
+         (id,request_id,local_version_id,library_album_id,resulting_library_album_id,
+          status,action,actor_id,actor_display_name,input_json,expected_fingerprint,
+          before_state_json,expected_state_json,after_state_json,result_json,error_code,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        event.id,
+        event.requestId,
+        event.localVersionId,
+        event.libraryAlbumId,
+        event.resultingLibraryAlbumId,
+        event.status,
+        event.action,
+        event.actor.id,
+        event.actor.displayName,
+        input.inputJson,
+        input.command.expectedFingerprint,
+        event.before ? JSON.stringify(event.before) : null,
+        event.expected ? JSON.stringify(event.expected) : null,
+        event.after ? JSON.stringify(event.after) : null,
+        JSON.stringify(result),
+        event.errorCode,
+        event.createdAt,
+      );
+    return event;
+  }
+
+  private orphanGovernanceResultByRequestId(
+    requestId: string,
+    inputJson: string,
+  ): OrphanGovernanceResult | null {
+    const row = this.raw
+      .prepare(
+        "SELECT input_json,result_json FROM library_orphan_governance_events WHERE request_id=?",
+      )
+      .get(requestId) as
+      { input_json: string; result_json: string } | undefined;
+    if (!row) return null;
+    if (row.input_json !== inputJson)
+      throw new OrphanGovernanceError(
+        "ORPHAN_REQUEST_ID_CONFLICT",
+        "requestId 已用于不同的孤立治理请求",
+      );
+    return parseJson<OrphanGovernanceResult>(row.result_json, null as never);
+  }
+
+  private mapOrphanGovernanceEvent(
+    row: Record<string, unknown>,
+  ): OrphanGovernanceEvent {
+    return {
+      id: String(row.id),
+      requestId: String(row.request_id),
+      localVersionId: String(row.local_version_id),
+      libraryAlbumId: nullableString(row.library_album_id),
+      resultingLibraryAlbumId: nullableString(row.resulting_library_album_id),
+      status: row.status as OrphanGovernanceEvent["status"],
+      action: row.action as OrphanGovernanceAction,
+      expectedFingerprint: String(row.expected_fingerprint),
+      actor: {
+        id: String(row.actor_id),
+        displayName: String(row.actor_display_name),
+      },
+      errorCode: nullableString(
+        row.error_code,
+      ) as OrphanGovernanceErrorCode | null,
+      before: parseJson<OrphanGovernanceExpected | null>(
+        row.before_state_json,
+        null,
+      ),
+      expected: parseJson<OrphanGovernanceExpected | null>(
+        row.expected_state_json,
+        null,
+      ),
+      after: parseJson<OrphanGovernanceExpected | null>(
+        row.after_state_json,
+        null,
+      ),
+      createdAt: String(row.created_at),
+    };
   }
 
   finalizeSuccessfulScan(input: FinalizeSuccessfulScanInput): ScanReport {
@@ -6959,6 +7706,12 @@ export class CoceanDatabase {
     );
   }
 
+  localVersionExists(localVersionId: string): boolean {
+    return Boolean(
+      this.raw.prepare("SELECT 1 FROM albums WHERE id=?").get(localVersionId),
+    );
+  }
+
   private expireLifecyclePreviews(localVersionId: string): void {
     const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
     const rows = this.raw
@@ -9536,6 +10289,175 @@ function parseJson<T>(value: unknown, fallback: T): T {
   }
 }
 
+function withOrphanGovernanceRetention(
+  expected: OrphanGovernanceExpected,
+  localVersionId: string,
+): OrphanGovernanceExpected {
+  const retainedReasons = (reasons: readonly InventoryReason[]) =>
+    [
+      ...new Set(
+        reasons
+          .filter((reason) => reason !== "NO_CURRENT_FACT")
+          .concat("ORPHAN_GOVERNANCE"),
+      ),
+    ].sort() as InventoryReason[];
+  return {
+    ...expected,
+    ...(expected.localVersionId === localVersionId
+      ? {
+          classification: "REFERENCED_HISTORY" as const,
+          reasons: retainedReasons(expected.reasons),
+        }
+      : {}),
+    memberFacts: expected.memberFacts.map((fact) =>
+      fact.localVersionId === localVersionId
+        ? {
+            ...fact,
+            classification: "REFERENCED_HISTORY" as const,
+            reasons: retainedReasons(fact.reasons),
+          }
+        : fact,
+    ),
+  };
+}
+
+function governanceExpectedFingerprint(
+  expected: OrphanGovernanceExpected,
+): string {
+  return createHash("sha256").update(canonicalJson(expected)).digest("hex");
+}
+
+function canonicalJson(value: unknown): string {
+  const normalize = (candidate: unknown): unknown => {
+    if (Array.isArray(candidate)) return candidate.map(normalize);
+    if (typeof candidate !== "object" || candidate === null) return candidate;
+    return Object.fromEntries(
+      Object.entries(candidate as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, child]) => [key, normalize(child)]),
+    );
+  };
+  return JSON.stringify(normalize(value));
+}
+
+function isSqliteBusyOrUnique(error: unknown): boolean {
+  const code =
+    typeof error === "object" && error !== null && "code" in error
+      ? String((error as { code?: unknown }).code ?? "")
+      : "";
+  return code === "SQLITE_BUSY" || code.startsWith("SQLITE_CONSTRAINT_UNIQUE");
+}
+
+function inventoryReferenceFingerprint(
+  database: Sqlite,
+  localVersionId: string,
+  libraryAlbumId: string | null,
+): string {
+  const parameters = {
+    localVersionId,
+    libraryAlbumId: libraryAlbumId ?? "",
+  };
+  const facts: Array<{ producer: string; rows: Record<string, unknown>[] }> =
+    [];
+  const capture = (producer: string, sql: string) => {
+    facts.push({
+      producer,
+      rows: database.prepare(sql).all(parameters) as Record<string, unknown>[],
+    });
+  };
+  capture(
+    "physical",
+    "SELECT * FROM physical_copies WHERE album_id=@localVersionId ORDER BY id",
+  );
+  capture(
+    "delivery-jobs",
+    "SELECT * FROM delivery_jobs WHERE album_id=@localVersionId ORDER BY id",
+  );
+  capture(
+    "delivery-records",
+    "SELECT * FROM delivery_records WHERE album_id=@localVersionId ORDER BY id",
+  );
+  capture(
+    "introductions",
+    "SELECT * FROM album_introductions WHERE album_id=@localVersionId ORDER BY generated_at",
+  );
+  capture(
+    "release-candidates",
+    "SELECT * FROM release_match_candidates WHERE album_id=@localVersionId ORDER BY id",
+  );
+  capture(
+    "metadata-values",
+    `SELECT * FROM library_metadata_values
+     WHERE (scope_type='VERSION' AND owner_id=@localVersionId)
+        OR (scope_type='ALBUM' AND owner_id=@libraryAlbumId)
+     ORDER BY scope_type,owner_id,field_name,source_type`,
+  );
+  capture(
+    "metadata-events",
+    `SELECT * FROM library_metadata_events WHERE id IN (
+       SELECT event_id FROM library_metadata_event_groups WHERE library_album_id=@libraryAlbumId
+     ) ORDER BY id`,
+  );
+  capture(
+    "metadata-event-groups",
+    `SELECT * FROM library_metadata_event_groups
+     WHERE library_album_id=@libraryAlbumId ORDER BY event_id`,
+  );
+  capture(
+    "artwork-candidates",
+    `SELECT * FROM library_artwork_candidates
+     WHERE local_version_id=@localVersionId ORDER BY id`,
+  );
+  capture(
+    "artwork-events",
+    `SELECT * FROM library_artwork_events WHERE id IN (
+       SELECT event_id FROM library_artwork_event_groups WHERE library_album_id=@libraryAlbumId
+     ) ORDER BY id`,
+  );
+  capture(
+    "artwork-event-groups",
+    `SELECT * FROM library_artwork_event_groups
+     WHERE library_album_id=@libraryAlbumId ORDER BY event_id`,
+  );
+  capture(
+    "identity-decisions",
+    `SELECT * FROM library_identity_decisions WHERE id IN (
+       SELECT decision_id FROM library_identity_decision_groups
+       WHERE library_album_id=@libraryAlbumId
+     ) ORDER BY id`,
+  );
+  capture(
+    "identity-decision-groups",
+    `SELECT * FROM library_identity_decision_groups
+     WHERE library_album_id=@libraryAlbumId ORDER BY decision_id`,
+  );
+  capture(
+    "visibility-events",
+    `SELECT * FROM library_visibility_events
+     WHERE library_album_id=@libraryAlbumId ORDER BY id`,
+  );
+  capture(
+    "lifecycle-plans",
+    `SELECT * FROM library_change_plans
+     WHERE local_version_id=@localVersionId OR library_album_id=@libraryAlbumId
+     ORDER BY id`,
+  );
+  capture(
+    "lifecycle-events",
+    `SELECT e.* FROM library_change_events e
+     JOIN library_change_plans p ON p.id=e.plan_id
+     WHERE p.local_version_id=@localVersionId OR p.library_album_id=@libraryAlbumId
+     ORDER BY e.id`,
+  );
+  capture(
+    "issues",
+    `SELECT * FROM library_issues
+     WHERE album_id=@localVersionId OR library_album_id=@libraryAlbumId
+     ORDER BY library_album_id,code,album_id`,
+  );
+  return createHash("sha256").update(JSON.stringify(facts)).digest("hex");
+}
+
 function readInventoryVersionFactRows(
   database: Sqlite,
 ): Record<string, unknown>[] {
@@ -9557,6 +10479,7 @@ function readInventoryVersionFactRows(
                 OR EXISTS(SELECT 1 FROM library_artwork_event_groups aeg WHERE aeg.library_album_id=lm.library_album_id)) AS has_artwork,
               EXISTS(SELECT 1 FROM library_visibility_events ve WHERE ve.library_album_id=lm.library_album_id) AS has_visibility,
               EXISTS(SELECT 1 FROM library_change_plans cp WHERE cp.local_version_id=a.id) AS has_lifecycle,
+              EXISTS(SELECT 1 FROM library_orphan_governance_events oge WHERE oge.local_version_id=a.id AND oge.status='APPLIED') AS has_orphan_governance,
               EXISTS(SELECT 1 FROM library_issues li WHERE li.album_id=a.id) AS has_issue
        FROM albums a
        LEFT JOIN library_album_members lm ON lm.album_id=a.id
@@ -9598,6 +10521,7 @@ function zeroFileRetentionReasons(
     ],
     [Boolean(row.has_visibility), "VISIBILITY_GOVERNANCE"],
     [Boolean(row.has_lifecycle), "LIFECYCLE_GOVERNANCE"],
+    [Boolean(row.has_orphan_governance), "ORPHAN_GOVERNANCE"],
     [Boolean(row.has_issue), "LIBRARY_ISSUE"],
   ];
   return facts.filter(([present]) => present).map(([, reason]) => reason);

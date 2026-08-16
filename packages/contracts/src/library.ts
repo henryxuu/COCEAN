@@ -586,6 +586,7 @@ export const inventoryReasonSchema = z.enum([
   "ARTWORK_GOVERNANCE",
   "VISIBILITY_GOVERNANCE",
   "LIFECYCLE_GOVERNANCE",
+  "ORPHAN_GOVERNANCE",
   "LIBRARY_ISSUE",
   "NO_CURRENT_FACT",
 ]);
@@ -684,4 +685,138 @@ export const libraryInventoryReportSchema = z.object({
 });
 export type LibraryInventoryReport = z.infer<
   typeof libraryInventoryReportSchema
+>;
+
+export const orphanGovernanceActionSchema = z.enum([
+  "DETACH_TO_HIDDEN_HISTORY",
+  "HIDE_HISTORY_GROUP",
+  "CLOSE_ORPHAN_IDENTITY",
+]);
+export type OrphanGovernanceAction = z.infer<
+  typeof orphanGovernanceActionSchema
+>;
+
+export const orphanGovernanceBlockerCodeSchema = z.enum([
+  "ALREADY_GOVERNED",
+  "NO_AUTHORITATIVE_SCAN",
+  "TARGET_NOT_FOUND",
+  "TARGET_NOT_ABNORMAL",
+  "INVENTORY_INTEGRITY_BLOCKED",
+  "ACTIVE_LIFECYCLE_PLAN",
+]);
+export type OrphanGovernanceBlockerCode = z.infer<
+  typeof orphanGovernanceBlockerCodeSchema
+>;
+
+export const orphanGovernanceBlockerSchema = z.object({
+  code: orphanGovernanceBlockerCodeSchema,
+  message: z.string(),
+});
+export type OrphanGovernanceBlocker = z.infer<
+  typeof orphanGovernanceBlockerSchema
+>;
+
+export const orphanGovernanceExpectedSchema = z.object({
+  scanJobId: z.string().min(1),
+  rootId: z.string().min(1),
+  localVersionId: z.string().min(1),
+  classification: inventoryClassificationSchema,
+  reasons: z.array(inventoryReasonSchema),
+  libraryAlbumId: z.string().min(1).nullable(),
+  libraryRevision: z.number().int().nonnegative().nullable(),
+  visibility: albumVisibilitySchema.nullable(),
+  visibilityRevision: z.number().int().nonnegative().nullable(),
+  primaryVersionId: z.string().min(1).nullable(),
+  memberVersionIds: z.array(z.string().min(1)),
+  currentMemberVersionIds: z.array(z.string().min(1)),
+  referenceFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  memberFacts: z.array(
+    z.object({
+      localVersionId: z.string().min(1),
+      classification: inventoryClassificationSchema,
+      reasons: z.array(inventoryReasonSchema),
+      isPrimary: z.boolean(),
+      referenceFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    }),
+  ),
+});
+export type OrphanGovernanceExpected = z.infer<
+  typeof orphanGovernanceExpectedSchema
+>;
+
+export const previewOrphanGovernanceCommandSchema = z.object({
+  localVersionId: z.string().trim().min(1),
+  scanJobId: z.string().trim().min(1).max(128).optional(),
+});
+export type PreviewOrphanGovernanceCommand = z.infer<
+  typeof previewOrphanGovernanceCommandSchema
+>;
+
+export const orphanGovernancePreviewSchema = z.object({
+  schema: z.literal("cocean.library-orphan-governance-preview/v1"),
+  action: orphanGovernanceActionSchema.nullable(),
+  executable: z.boolean(),
+  before: orphanGovernanceExpectedSchema,
+  replacementPrimaryVersionId: z.string().min(1).nullable(),
+  affectedLibraryAlbumIds: z.array(z.string().min(1)),
+  expected: orphanGovernanceExpectedSchema,
+  expectedFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  blockers: z.array(orphanGovernanceBlockerSchema),
+});
+export type OrphanGovernancePreview = z.infer<
+  typeof orphanGovernancePreviewSchema
+>;
+
+export const confirmOrphanGovernanceCommandSchema = z.object({
+  requestId: z.string().trim().min(1).max(200),
+  action: orphanGovernanceActionSchema,
+  expectedFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  scanJobId: z.string().trim().min(1).max(128),
+  localVersionId: z.string().trim().min(1),
+  expected: orphanGovernanceExpectedSchema,
+});
+export type ConfirmOrphanGovernanceCommand = z.infer<
+  typeof confirmOrphanGovernanceCommandSchema
+>;
+
+export const orphanGovernanceErrorCodeSchema = z.enum([
+  "ORPHAN_REQUEST_ID_CONFLICT",
+  "ORPHAN_RESOURCE_MISMATCH",
+  "ORPHAN_TARGET_NOT_FOUND",
+  "NO_AUTHORITATIVE_SCAN",
+  "ORPHAN_GOVERNANCE_CONFLICT",
+  "ORPHAN_GOVERNANCE_NOT_EXECUTABLE",
+]);
+export type OrphanGovernanceErrorCode = z.infer<
+  typeof orphanGovernanceErrorCodeSchema
+>;
+
+export const orphanGovernanceEventSchema = z.object({
+  id: z.string().min(1),
+  requestId: z.string().min(1),
+  localVersionId: z.string().min(1),
+  libraryAlbumId: z.string().min(1).nullable(),
+  resultingLibraryAlbumId: z.string().min(1).nullable(),
+  status: z.enum(["APPLIED", "REJECTED"]),
+  action: orphanGovernanceActionSchema,
+  expectedFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  actor: z.object({ id: z.string(), displayName: z.string() }),
+  errorCode: orphanGovernanceErrorCodeSchema.nullable(),
+  before: orphanGovernanceExpectedSchema.nullable(),
+  expected: orphanGovernanceExpectedSchema.nullable(),
+  after: orphanGovernanceExpectedSchema.nullable(),
+  createdAt: z.string(),
+});
+export type OrphanGovernanceEvent = z.infer<typeof orphanGovernanceEventSchema>;
+
+export const orphanGovernanceResultSchema = z.object({
+  status: z.enum(["APPLIED", "REJECTED"]),
+  action: orphanGovernanceActionSchema,
+  localVersionId: z.string().min(1),
+  libraryAlbumId: z.string().min(1).nullable(),
+  resultingLibraryAlbumId: z.string().min(1).nullable(),
+  event: orphanGovernanceEventSchema,
+});
+export type OrphanGovernanceResult = z.infer<
+  typeof orphanGovernanceResultSchema
 >;

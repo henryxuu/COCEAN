@@ -72,6 +72,66 @@ describe("web API client", () => {
     expect(requests[4]!.input).toBe("/api/v1/lifecycle-plans/plan%2Fc/retry");
   });
 
+  it("binds orphan preview, confirm, and history to encoded typed routes", async () => {
+    const requests: Array<{ input: string; init: RequestInit | undefined }> =
+      [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        requests.push({ input: String(input), init });
+        return new Response(JSON.stringify({ items: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+    await api.previewOrphanGovernance("version/b");
+    const expected = {
+      scanJobId: "scan-one",
+      rootId: "music",
+      localVersionId: "version/b",
+      classification: "ORPHAN" as const,
+      reasons: ["NO_CURRENT_FACT" as const],
+      libraryAlbumId: null,
+      libraryRevision: null,
+      visibility: null,
+      visibilityRevision: null,
+      primaryVersionId: null,
+      memberVersionIds: ["version/b"],
+      currentMemberVersionIds: [],
+      referenceFingerprint: "b".repeat(64),
+      memberFacts: [
+        {
+          localVersionId: "version/b",
+          classification: "ORPHAN" as const,
+          reasons: ["NO_CURRENT_FACT" as const],
+          isPrimary: false,
+          referenceFingerprint: "c".repeat(64),
+        },
+      ],
+    };
+    const command = {
+      requestId: "orphan-one",
+      action: "CLOSE_ORPHAN_IDENTITY" as const,
+      expectedFingerprint: "a".repeat(64),
+      scanJobId: "scan-one",
+      localVersionId: "version/b",
+      expected,
+    };
+    await api.confirmOrphanGovernance("version/b", command);
+    await api.orphanGovernanceHistory("version/b");
+    expect(requests.map((request) => request.input)).toEqual([
+      "/api/v1/local-versions/version%2Fb/orphan-governance/preview",
+      "/api/v1/local-versions/version%2Fb/orphan-governance/confirm",
+      "/api/v1/local-versions/version%2Fb/orphan-governance/history",
+    ]);
+    expect(JSON.parse(String(requests[0]!.init?.body))).toEqual({
+      localVersionId: "version/b",
+    });
+    expect(JSON.parse(String(requests[1]!.init?.body))).toEqual(command);
+    expect(requests[2]!.init).toEqual({ headers: {} });
+  });
+
   it("applies concrete issue filtering to demo album pages", () => {
     const page = buildDemoAlbumPage({ issue: "MISSING_ARTWORK" });
     expect(page.total).toBe(1);

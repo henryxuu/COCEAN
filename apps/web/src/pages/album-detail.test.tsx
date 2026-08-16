@@ -6,8 +6,12 @@ import type {
   LocalVersionSummary,
 } from "@cocean/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
+import TestRenderer, { act } from "react-test-renderer";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ApiError, api } from "../api.js";
 import {
+  AlbumDetailPage,
   AlbumDeliveryRecord,
   AlbumDetailHeroActions,
   AlbumArtworkGovernancePanel,
@@ -16,6 +20,7 @@ import {
   AlbumIntegrityIssues,
   AlbumLocalVersions,
   AlbumMetadataGovernance,
+  OrphanGovernancePreviewCard,
   buildConfirmIdentityCommand,
   buildMetadataCommands,
   buildMergeIdentityCommand,
@@ -24,6 +29,11 @@ import {
   createLatestRequestTracker,
   legacyLocalVersions,
 } from "./album-detail.js";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 describe("Album 详情主操作", () => {
   it("以投送为主要入口，并将目标选择默认折叠", () => {
@@ -66,6 +76,208 @@ describe("Album 详情主操作", () => {
     );
     expect(html).not.toContain("Listen");
     expect(html).not.toContain("信息匹配");
+  });
+});
+
+describe("Album 异常版本治理", () => {
+  const expected = {
+    scanJobId: "scan-one",
+    rootId: "music",
+    localVersionId: "orphan-one",
+    classification: "ORPHAN" as const,
+    reasons: ["NO_CURRENT_FACT" as const],
+    libraryAlbumId: "library-one",
+    libraryRevision: 2,
+    visibility: "VISIBLE" as const,
+    visibilityRevision: 0,
+    primaryVersionId: "orphan-one",
+    memberVersionIds: ["orphan-one"],
+    currentMemberVersionIds: [],
+    referenceFingerprint: "c".repeat(64),
+    memberFacts: [
+      {
+        localVersionId: "orphan-one",
+        classification: "ORPHAN" as const,
+        reasons: ["NO_CURRENT_FACT" as const],
+        isPrimary: true,
+        referenceFingerprint: "d".repeat(64),
+      },
+    ],
+  };
+
+  it("只在可执行预览中显示明确保留声明和二次确认", () => {
+    const html = renderToStaticMarkup(
+      <OrphanGovernancePreviewCard
+        preview={{
+          schema: "cocean.library-orphan-governance-preview/v1",
+          action: "CLOSE_ORPHAN_IDENTITY",
+          executable: true,
+          before: expected,
+          replacementPrimaryVersionId: null,
+          affectedLibraryAlbumIds: ["library-one"],
+          expected,
+          expectedFingerprint: "a".repeat(64),
+          blockers: [],
+        }}
+        confirmed={false}
+        stale={false}
+        working={false}
+        onConfirmedChange={() => undefined}
+        onCancel={() => undefined}
+        onConfirm={() => undefined}
+      />,
+    );
+    expect(html).toContain("关闭无依据孤立身份");
+    expect(html).toContain("本地版本、历史账本和音乐文件必须保留");
+    expect(html).toContain("指纹 aaaaaaaaaaaa");
+    expect(html).toContain("disabled");
+    expect(html).not.toContain("/library/");
+  });
+
+  it("阻塞预览保留证据并禁用确认，不显示确认勾选", () => {
+    const html = renderToStaticMarkup(
+      <OrphanGovernancePreviewCard
+        preview={{
+          schema: "cocean.library-orphan-governance-preview/v1",
+          action: null,
+          executable: false,
+          before: expected,
+          replacementPrimaryVersionId: null,
+          affectedLibraryAlbumIds: ["library-one"],
+          expected,
+          expectedFingerprint: "b".repeat(64),
+          blockers: [
+            {
+              code: "ALREADY_GOVERNED",
+              message: "该版本已经处于隐藏历史身份",
+            },
+          ],
+        }}
+        confirmed={false}
+        stale={false}
+        working={false}
+        onConfirmedChange={() => undefined}
+        onCancel={() => undefined}
+        onConfirm={() => undefined}
+      />,
+    );
+    expect(html).toContain("当前不能安全治理");
+    expect(html).toContain("该版本已经处于隐藏历史身份");
+    expect(html).not.toContain('type="checkbox"');
+  });
+
+  it("409 后呈现过期状态并锁定再次确认", () => {
+    const html = renderToStaticMarkup(
+      <OrphanGovernancePreviewCard
+        preview={{
+          schema: "cocean.library-orphan-governance-preview/v1",
+          action: "CLOSE_ORPHAN_IDENTITY",
+          executable: true,
+          before: expected,
+          replacementPrimaryVersionId: null,
+          affectedLibraryAlbumIds: ["library-one"],
+          expected,
+          expectedFingerprint: "e".repeat(64),
+          blockers: [],
+        }}
+        confirmed={false}
+        stale
+        working={false}
+        onConfirmedChange={() => undefined}
+        onCancel={() => undefined}
+        onConfirm={() => undefined}
+      />,
+    );
+    expect(html).toContain("预览已过期，必须重新检查后才能确认");
+    expect(html).not.toContain('type="checkbox"');
+    expect(html).toContain("disabled");
+  });
+
+  it("挂载页面保持 requestId 重试语义，并在 409 后要求重新预览", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("window", {
+      setTimeout,
+      clearTimeout,
+      setInterval,
+      clearInterval,
+    });
+    const album = mountedOrphanAlbum();
+    vi.spyOn(api, "album").mockResolvedValue(album);
+    vi.spyOn(api, "deliveryTargets").mockResolvedValue([]);
+    vi.spyOn(api, "albumDeliveries").mockResolvedValue([]);
+    vi.spyOn(api, "albumIntroduction").mockResolvedValue(null);
+    vi.spyOn(api, "identityDecisions").mockResolvedValue([]);
+    vi.spyOn(api, "metadataHistory").mockResolvedValue([]);
+    vi.spyOn(api, "artworkHistory").mockResolvedValue([]);
+    vi.spyOn(api, "orphanGovernanceHistory").mockResolvedValue([]);
+    vi.spyOn(api, "capabilities").mockResolvedValue({} as never);
+    vi.spyOn(api, "lifecyclePlans").mockResolvedValue([]);
+    const preview = mountedOrphanPreview();
+    const previewCall = vi
+      .spyOn(api, "previewOrphanGovernance")
+      .mockResolvedValue(preview);
+    const confirmCall = vi
+      .spyOn(api, "confirmOrphanGovernance")
+      .mockRejectedValueOnce(new Error("network uncertain"))
+      .mockRejectedValueOnce(
+        new ApiError(409, "ORPHAN_GOVERNANCE_CONFLICT", "stale"),
+      )
+      .mockResolvedValueOnce({
+        status: "APPLIED",
+        action: "CLOSE_ORPHAN_IDENTITY",
+        localVersionId: "mounted-version",
+        libraryAlbumId: "mounted-library",
+        resultingLibraryAlbumId: "mounted-library",
+        event: {} as never,
+      });
+    let renderer: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <MemoryRouter initialEntries={["/albums/mounted-library"]}>
+          <Routes>
+            <Route path="/albums/:id" element={<AlbumDetailPage canManage />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+    });
+    const button = (label: string) =>
+      renderer!.root
+        .findAllByType("button")
+        .find((candidate) => testRendererText(candidate).includes(label))!;
+    await act(async () => void (await button("检查异常状态").props.onClick()));
+    expect(previewCall).toHaveBeenCalledWith("mounted-version");
+    const checkbox = () =>
+      renderer!.root
+        .findAllByType("input")
+        .find((candidate) => candidate.props.type === "checkbox")!;
+    await act(async () =>
+      checkbox().props.onChange({ target: { checked: true } }),
+    );
+    await act(async () => void (await button("确认安全闭合").props.onClick()));
+    await act(async () => void (await button("确认安全闭合").props.onClick()));
+    expect(confirmCall).toHaveBeenCalledTimes(2);
+    expect(confirmCall.mock.calls[0]![1].requestId).toBe(
+      confirmCall.mock.calls[1]![1].requestId,
+    );
+    expect(testRendererText(renderer!.root)).toContain("预览已过期");
+    expect(button("确认安全闭合").props.disabled).toBe(true);
+
+    await act(async () => void (await button("检查异常状态").props.onClick()));
+    expect(
+      renderer!.root
+        .findAll((candidate) => candidate.props.role === "alert")
+        .map(testRendererText),
+    ).not.toContain("预览已过期，必须重新检查后才能确认。");
+    await act(async () =>
+      checkbox().props.onChange({ target: { checked: true } }),
+    );
+    await act(async () => void (await button("确认安全闭合").props.onClick()));
+    expect(confirmCall).toHaveBeenCalledTimes(3);
+    expect(confirmCall.mock.calls[2]![1].requestId).not.toBe(
+      confirmCall.mock.calls[1]![1].requestId,
+    );
+    expect(vi.mocked(api.album).mock.calls.length).toBeGreaterThanOrEqual(3);
+    await act(async () => renderer!.unmount());
   });
 });
 
@@ -564,6 +776,108 @@ describe("Album 详情身份治理", () => {
     expect(history).toContain("撤销");
   });
 });
+
+function testRendererText(node: TestRenderer.ReactTestInstance): string {
+  return node.children
+    .map((child) =>
+      typeof child === "string" ? child : testRendererText(child),
+    )
+    .join("");
+}
+
+function mountedOrphanPreview() {
+  const expected = {
+    scanJobId: "mounted-scan",
+    rootId: "physical",
+    localVersionId: "mounted-version",
+    classification: "ORPHAN" as const,
+    reasons: ["NO_CURRENT_FACT" as const],
+    libraryAlbumId: "mounted-library",
+    libraryRevision: 0,
+    visibility: "VISIBLE" as const,
+    visibilityRevision: 0,
+    primaryVersionId: "mounted-version",
+    memberVersionIds: ["mounted-version"],
+    currentMemberVersionIds: [],
+    referenceFingerprint: "1".repeat(64),
+    memberFacts: [
+      {
+        localVersionId: "mounted-version",
+        classification: "ORPHAN" as const,
+        reasons: ["NO_CURRENT_FACT" as const],
+        isPrimary: true,
+        referenceFingerprint: "2".repeat(64),
+      },
+    ],
+  };
+  return {
+    schema: "cocean.library-orphan-governance-preview/v1" as const,
+    action: "CLOSE_ORPHAN_IDENTITY" as const,
+    executable: true,
+    before: expected,
+    replacementPrimaryVersionId: null,
+    affectedLibraryAlbumIds: ["mounted-library"],
+    expected,
+    expectedFingerprint: "3".repeat(64),
+    blockers: [],
+  };
+}
+
+function mountedOrphanAlbum(): AlbumDetail {
+  return {
+    id: "mounted-library",
+    title: "Mounted",
+    albumArtist: "Artist",
+    year: null,
+    artwork: {
+      source: "NONE",
+      url: null,
+      mimeType: null,
+      width: null,
+      height: null,
+    },
+    audioBadge: null,
+    audioSummary: null,
+    mixedAudioSpecs: false,
+    hasDigital: false,
+    physicalMedia: [],
+    matchStatus: "UNMATCHED",
+    primaryVersionSource: "AUTOMATIC",
+    primaryVersionId: "mounted-version",
+    visibility: "VISIBLE",
+    visibilityRevision: 0,
+    revision: 0,
+    trackCount: 0,
+    discCount: 1,
+    sourceVersionCount: 1,
+    duplicateFileCount: 0,
+    aggregationIssues: [],
+    issues: [],
+    release: {
+      label: null,
+      catalogNumber: null,
+      barcode: null,
+      country: null,
+      releaseDate: null,
+      musicBrainzReleaseId: null,
+    },
+    tracks: [],
+    physicalCopies: [],
+    sourceRoot: null,
+    versionCount: 1,
+    localVersions: [
+      version({
+        id: "mounted-version",
+        title: "Mounted",
+        fileCount: 0,
+        trackCount: 0,
+        sizeBytes: 0,
+        sourceRoot: null,
+        relativePath: null,
+      }),
+    ],
+  } as AlbumDetail;
+}
 
 function version(patch: Partial<LocalVersionSummary>): LocalVersionSummary {
   return {

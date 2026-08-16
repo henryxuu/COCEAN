@@ -96,9 +96,15 @@ importers:
       "@types/react-dom":
         specifier: 19.2.4
         version: 19.2.4(@types/react@19.2.18)
+      "@types/react-test-renderer":
+        specifier: 19.1.0
+        version: 19.1.0
       "@vitejs/plugin-react":
         specifier: 6.0.5
         version: 6.0.5(vite@8.2.1(@types/node@26.2.0)(esbuild@0.28.2)(terser@5.49.2)(tsx@4.23.12))
+      react-test-renderer:
+        specifier: 19.2.8
+        version: 19.2.8(react@19.2.8)
       vite:
         specifier: 8.2.1
         version: 8.2.1(@types/node@26.2.0)(esbuild@0.28.2)(terser@5.49.2)(tsx@4.23.12)
@@ -1892,6 +1898,12 @@ packages:
     peerDependencies:
       "@types/react": ^19.2.0
 
+  "@types/react-test-renderer@19.1.0":
+    resolution:
+      {
+        integrity: sha512-XD0WZrHqjNrxA/MaR9O22w/RNidWR9YZmBdRGI7wcnWGrv/3dA8wKCJ8m63Sn+tLJhcjmuhOi629N66W6kgWzQ==,
+      }
+
   "@types/react@19.2.18":
     resolution:
       {
@@ -3659,6 +3671,12 @@ packages:
     peerDependencies:
       react: ^19.2.8
 
+  react-is@19.2.8:
+    resolution:
+      {
+        integrity: sha512-s5un28nYxKJw5gvUHyW5PCC28CvBqLu9r3cWgzHT4Vo/5fqqkFcdRYsGcKf50WMPpjjFZS5d76fn3YCo2njKwQ==,
+      }
+
   react-router-dom@7.18.2:
     resolution:
       {
@@ -3681,6 +3699,14 @@ packages:
     peerDependenciesMeta:
       react-dom:
         optional: true
+
+  react-test-renderer@19.2.8:
+    resolution:
+      {
+        integrity: sha512-GHKPaDRaNYU24PHTLG8Bx8VMY9t+qNfxQbt/Yjp7aMWBkKU6766SR0n6TnYu7P5I1MfEuAMUadqiyDHyI4Yy9Q==,
+      }
+    peerDependencies:
+      react: ^19.2.8
 
   react@19.2.8:
     resolution:
@@ -5634,6 +5660,10 @@ snapshots:
     dependencies:
       "@types/react": 19.2.18
 
+  "@types/react-test-renderer@19.1.0":
+    dependencies:
+      "@types/react": 19.2.18
+
   "@types/react@19.2.18":
     dependencies:
       csstype: 3.2.3
@@ -6667,6 +6697,8 @@ snapshots:
       react: 19.2.8
       scheduler: 0.27.0
 
+  react-is@19.2.8: {}
+
   react-router-dom@7.18.2(react-dom@19.2.8(react@19.2.8))(react@19.2.8):
     dependencies:
       react: 19.2.8
@@ -6680,6 +6712,12 @@ snapshots:
       set-cookie-parser: 2.6.0
     optionalDependencies:
       react-dom: 19.2.8(react@19.2.8)
+
+  react-test-renderer@19.2.8(react@19.2.8):
+    dependencies:
+      react: 19.2.8
+      react-is: 19.2.8
+      scheduler: 0.27.0
 
   react@19.2.8: {}
 

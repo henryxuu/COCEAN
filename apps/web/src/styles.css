@@ -1900,6 +1900,53 @@ p {
   justify-content: flex-end;
   gap: 8px;
 }
+.orphan-governance {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 14px;
+  border-radius: var(--radius-control);
+  background: var(--bg-secondary);
+}
+.orphan-governance > p,
+.orphan-governance-version small,
+.orphan-governance-preview p,
+.orphan-governance-preview small,
+.orphan-governance-history small {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1.55;
+}
+.orphan-governance-versions,
+.orphan-governance-history {
+  display: grid;
+  gap: 8px;
+}
+.orphan-governance-version,
+.orphan-governance-history > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.orphan-governance-version > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+.orphan-governance-preview {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  background: var(--bg-elevated);
+}
+.orphan-governance-preview > div:first-child {
+  display: grid;
+  gap: 5px;
+}
 .quarantine-page {
   max-width: 980px;
 }

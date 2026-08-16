@@ -8,6 +8,7 @@ import {
   AlbumMetadataDecisionError,
   CoceanDatabase,
   LibraryLifecycleError,
+  OrphanGovernanceError,
   countClosedInventoryPartitionEntries,
 } from "./client.js";
 import {
@@ -242,7 +243,112 @@ describe("CoceanDatabase", () => {
           "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1",
         )
         .get(),
-    ).toEqual({ version: 20 });
+    ).toEqual({ version: 21 });
+  });
+
+  it("upgrades schema 20 to additive schema 21 without rewriting library data", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cocean-orphan-migration-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "cocean.sqlite");
+    const legacy = new BetterSqlite3(path);
+    for (const migration of migrations.slice(0, 20)) {
+      legacy.exec(migration.sql);
+      legacy
+        .prepare(
+          "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+        )
+        .run(migration.version, migration.name, "2026-08-16T00:00:00.000Z");
+    }
+    legacy
+      .prepare(
+        `INSERT INTO albums
+         (id,root_id,group_key,title,album_artist,disc_count,track_count,
+          artwork_json,match_status,created_at,updated_at)
+         VALUES ('schema20-version','physical','schema20-version','Schema 20','Artist',
+                 1,0,'[]','UNMATCHED',?,?)`,
+      )
+      .run("2026-08-16T00:00:00.000Z", "2026-08-16T00:00:00.000Z");
+    legacy.close();
+
+    const database = new CoceanDatabase(path);
+    open.push(database);
+    expect(
+      database.raw
+        .prepare(
+          "SELECT version,name FROM schema_migrations ORDER BY version DESC LIMIT 1",
+        )
+        .get(),
+    ).toEqual({ version: 21, name: "safe_orphan_governance" });
+    expect(
+      database.raw
+        .prepare("SELECT id,title FROM albums WHERE id='schema20-version'")
+        .get(),
+    ).toEqual({ id: "schema20-version", title: "Schema 20" });
+    expect(
+      database.raw
+        .prepare(
+          `SELECT COUNT(*) AS count FROM sqlite_master
+           WHERE type='trigger' AND name IN (
+             'library_orphan_governance_events_no_update',
+             'library_orphan_governance_events_no_delete'
+           )`,
+        )
+        .get(),
+    ).toEqual({ count: 2 });
+    expect(
+      database.raw
+        .prepare("PRAGMA foreign_key_list(library_orphan_governance_events)")
+        .all(),
+    ).toEqual([]);
+    const insertEvent = database.raw.prepare(
+      `INSERT INTO library_orphan_governance_events
+       (id,request_id,local_version_id,status,action,actor_id,
+        actor_display_name,input_json,expected_fingerprint,result_json,
+        error_code,created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+    );
+    insertEvent.run(
+      "schema21-event",
+      "schema21-request",
+      "already-disappeared-version",
+      "REJECTED",
+      "CLOSE_ORPHAN_IDENTITY",
+      "admin",
+      "Admin",
+      "{}",
+      "a".repeat(64),
+      "{}",
+      "ORPHAN_TARGET_NOT_FOUND",
+      "2026-08-16T00:00:00.000Z",
+    );
+    expect(() =>
+      insertEvent.run(
+        "schema21-event-two",
+        "schema21-request",
+        "another-version",
+        "REJECTED",
+        "CLOSE_ORPHAN_IDENTITY",
+        "admin",
+        "Admin",
+        "{}",
+        "b".repeat(64),
+        "{}",
+        "ORPHAN_TARGET_NOT_FOUND",
+        "2026-08-16T00:00:00.000Z",
+      ),
+    ).toThrow(/UNIQUE/);
+    expect(
+      database.raw
+        .prepare("DELETE FROM albums WHERE id='schema20-version'")
+        .run().changes,
+    ).toBe(1);
+    expect(
+      database.raw
+        .prepare(
+          "SELECT local_version_id FROM library_orphan_governance_events WHERE id='schema21-event'",
+        )
+        .get(),
+    ).toEqual({ local_version_id: "already-disappeared-version" });
   });
 
   it("creates and independently verifies an online SQLite backup", async () => {
@@ -283,8 +389,8 @@ describe("CoceanDatabase", () => {
       expect.objectContaining({
         schema: "cocean.database-backup/v1",
         releaseVersion: "0.1.0",
-        schemaVersion: 20,
-        migrationCount: 20,
+        schemaVersion: 21,
+        migrationCount: 21,
         sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       }),
     );
@@ -520,8 +626,8 @@ describe("CoceanDatabase", () => {
         )
         .get(),
     ).toEqual({
-      version: 20,
-      name: "library_lifecycle_governance",
+      version: 21,
+      name: "safe_orphan_governance",
     });
   });
 
@@ -4221,6 +4327,806 @@ describe("CoceanDatabase", () => {
     );
   });
 
+  it("previews and atomically detaches an orphan from a playable sibling without file lifecycle work", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cocean-orphan-detach-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "cocean.sqlite");
+    const database = new CoceanDatabase(path);
+    open.push(database);
+    finalizeSingleFileInventoryScan(database, "orphan-detach-scan");
+    finalizeEmptyInventoryScan(
+      database,
+      "orphan-detach-physical-scan",
+      "physical",
+    );
+    seedPassiveOrphanSideEffectRows(database, "detach");
+    database.raw
+      .prepare(
+        `UPDATE albums SET title='Governed',album_artist='Artist'
+         WHERE id='orphan-detach-scan-version'`,
+      )
+      .run();
+    database.createPhysicalOnlyAlbum({
+      id: "orphan-detach-target",
+      groupKey: "orphan-detach-target",
+      title: "Governed",
+      albumArtist: "Artist",
+      year: null,
+    });
+    database.raw
+      .prepare("DELETE FROM library_issues WHERE album_id=?")
+      .run("orphan-detach-target");
+    database.raw
+      .prepare(
+        `UPDATE library_album_members SET library_album_id=(
+           SELECT library_album_id FROM library_album_members WHERE album_id='orphan-detach-scan-version'
+         ) WHERE album_id='orphan-detach-target'`,
+      )
+      .run();
+    const sourceId = database.getAlbumSummary("orphan-detach-scan-version")!.id;
+    const businessBefore = {
+      albums: Number(
+        (
+          database.raw
+            .prepare("SELECT COUNT(*) AS count FROM albums")
+            .get() as {
+            count: number;
+          }
+        ).count,
+      ),
+      files: Number(
+        (
+          database.raw
+            .prepare("SELECT COUNT(*) AS count FROM media_files")
+            .get() as { count: number }
+        ).count,
+      ),
+      lifecycle: Number(
+        (
+          database.raw
+            .prepare("SELECT COUNT(*) AS count FROM library_change_plans")
+            .get() as { count: number }
+        ).count,
+      ),
+      lifecycleEvents: Number(
+        (
+          database.raw
+            .prepare("SELECT COUNT(*) AS count FROM library_change_events")
+            .get() as { count: number }
+        ).count,
+      ),
+      deliveryJobs: Number(
+        (
+          database.raw
+            .prepare("SELECT COUNT(*) AS count FROM delivery_jobs")
+            .get() as { count: number }
+        ).count,
+      ),
+      deliveryRecords: Number(
+        (
+          database.raw
+            .prepare("SELECT COUNT(*) AS count FROM delivery_records")
+            .get() as { count: number }
+        ).count,
+      ),
+    };
+
+    const preview = database.previewOrphanGovernance("orphan-detach-target", {
+      localVersionId: "orphan-detach-target",
+    });
+    expect(preview).toEqual(
+      expect.objectContaining({
+        action: "DETACH_TO_HIDDEN_HISTORY",
+        executable: true,
+        replacementPrimaryVersionId: "orphan-detach-scan-version",
+        blockers: [],
+      }),
+    );
+    expect(
+      database.raw
+        .prepare(
+          "SELECT COUNT(*) AS count FROM library_orphan_governance_events",
+        )
+        .get(),
+    ).toEqual({ count: 0 });
+
+    const command = {
+      requestId: "orphan-detach-request",
+      action: "DETACH_TO_HIDDEN_HISTORY" as const,
+      expectedFingerprint: preview.expectedFingerprint,
+      scanJobId: preview.expected.scanJobId,
+      localVersionId: preview.expected.localVersionId,
+      expected: preview.expected,
+    };
+    const result = database.confirmOrphanGovernance(
+      "orphan-detach-target",
+      command,
+      {
+        id: "admin",
+        displayName: "Admin",
+      },
+    );
+    expect(
+      database.confirmOrphanGovernance("orphan-detach-target", command, {
+        id: "admin",
+        displayName: "Admin",
+      }),
+    ).toEqual(result);
+    expect(result).toEqual(
+      expect.objectContaining({
+        status: "APPLIED",
+        action: "DETACH_TO_HIDDEN_HISTORY",
+      }),
+    );
+    expect(result.resultingLibraryAlbumId).not.toBe(sourceId);
+    expect(database.getAlbumSummary(sourceId)).toEqual(
+      expect.objectContaining({
+        primaryVersionId: "orphan-detach-scan-version",
+        visibility: "VISIBLE",
+      }),
+    );
+    expect(database.getAlbumSummary(result.resultingLibraryAlbumId!)).toEqual(
+      expect.objectContaining({
+        primaryVersionId: "orphan-detach-target",
+        visibility: "HIDDEN",
+      }),
+    );
+    finalizeEmptyInventoryScan(database, "post-detach-rescan", "physical");
+    expect(
+      database
+        .getLibraryInventoryReport("post-detach-rescan")
+        .versions.find(
+          (version) => version.localVersionId === "orphan-detach-target",
+        ),
+    ).toEqual(
+      expect.objectContaining({
+        classification: "REFERENCED_HISTORY",
+        reasons: expect.arrayContaining(["ORPHAN_GOVERNANCE"]),
+      }),
+    );
+    expect(
+      database.raw.prepare("SELECT COUNT(*) AS count FROM albums").get(),
+    ).toEqual({ count: businessBefore.albums });
+    expect(
+      database.raw.prepare("SELECT COUNT(*) AS count FROM media_files").get(),
+    ).toEqual({ count: businessBefore.files });
+    expect(
+      database.raw
+        .prepare("SELECT COUNT(*) AS count FROM library_change_plans")
+        .get(),
+    ).toEqual({ count: businessBefore.lifecycle });
+    expect(
+      database.raw
+        .prepare("SELECT COUNT(*) AS count FROM library_change_events")
+        .get(),
+    ).toEqual({ count: businessBefore.lifecycleEvents });
+    expect(
+      database.raw.prepare("SELECT COUNT(*) AS count FROM delivery_jobs").get(),
+    ).toEqual({ count: businessBefore.deliveryJobs });
+    expect(
+      database.raw
+        .prepare("SELECT COUNT(*) AS count FROM delivery_records")
+        .get(),
+    ).toEqual({ count: businessBefore.deliveryRecords });
+    const resultingLibraryAlbumId = result.resultingLibraryAlbumId!;
+    open.splice(open.indexOf(database), 1);
+    database.close();
+    const reopened = new CoceanDatabase(path);
+    open.push(reopened);
+    expect(reopened.getAlbumSummary(sourceId)?.primaryVersionId).toBe(
+      "orphan-detach-scan-version",
+    );
+    expect(reopened.getAlbumSummary(resultingLibraryAlbumId)).toEqual(
+      expect.objectContaining({
+        visibility: "HIDDEN",
+        primaryVersionId: "orphan-detach-target",
+      }),
+    );
+    expect(
+      reopened.listOrphanGovernanceHistory("orphan-detach-target"),
+    ).toEqual([expect.objectContaining({ status: "APPLIED" })]);
+  });
+
+  it("hides an all-history group and closes a standalone orphan with append-only audit", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cocean-orphan-close-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "cocean.sqlite");
+    const database = new CoceanDatabase(path);
+    open.push(database);
+    finalizeEmptyInventoryScan(database, "orphan-history-scan", "physical");
+    seedPassiveOrphanSideEffectRows(database, "close");
+    const sideEffectsBefore = {
+      deliveries: database
+        .listDeliveryJobs()
+        .map((job) => [job.id, job.status]),
+      lifecycle: database
+        .listLibraryChangePlans()
+        .map((plan) => [plan.id, plan.status]),
+    };
+    const now = "2026-08-16T00:00:00.000Z";
+    database.createPhysicalOnlyAlbum({
+      id: "history-govern-target",
+      groupKey: "history-govern-target",
+      title: "History",
+      albumArtist: "Artist",
+      year: null,
+    });
+    database.raw
+      .prepare("DELETE FROM library_issues WHERE album_id=?")
+      .run("history-govern-target");
+    database.raw
+      .prepare(
+        `INSERT INTO album_introductions
+         (album_id,content,model,factual_basis_json,source_hash,generated_at)
+         VALUES (?,?,?,?,?,?)`,
+      )
+      .run(
+        "history-govern-target",
+        "history",
+        "local",
+        "{}",
+        "c".repeat(64),
+        now,
+      );
+    const historyGroup = database.getAlbumSummary("history-govern-target")!.id;
+    const historyPreview = database.previewOrphanGovernance(
+      "history-govern-target",
+      {
+        localVersionId: "history-govern-target",
+      },
+    );
+    expect(historyPreview.action).toBe("HIDE_HISTORY_GROUP");
+    database.confirmOrphanGovernance(
+      "history-govern-target",
+      {
+        requestId: "hide-history-request",
+        action: "HIDE_HISTORY_GROUP",
+        expectedFingerprint: historyPreview.expectedFingerprint,
+        scanJobId: historyPreview.expected.scanJobId,
+        localVersionId: "history-govern-target",
+        expected: historyPreview.expected,
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    expect(database.getAlbumSummary(historyGroup)!.visibility).toBe("HIDDEN");
+    expect(
+      database.previewOrphanGovernance("history-govern-target", {
+        localVersionId: "history-govern-target",
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        executable: false,
+        blockers: expect.arrayContaining([
+          expect.objectContaining({ code: "ALREADY_GOVERNED" }),
+        ]),
+      }),
+    );
+
+    database.createPhysicalOnlyAlbum({
+      id: "standalone-orphan",
+      groupKey: "standalone-orphan",
+      title: "Orphan",
+      albumArtist: "Artist",
+      year: null,
+    });
+    database.raw
+      .prepare("DELETE FROM library_issues WHERE album_id=?")
+      .run("standalone-orphan");
+    const orphanGroup = database.getAlbumSummary("standalone-orphan")!.id;
+    const orphanPreview = database.previewOrphanGovernance(
+      "standalone-orphan",
+      {
+        localVersionId: "standalone-orphan",
+      },
+    );
+    expect(orphanPreview.action).toBe("CLOSE_ORPHAN_IDENTITY");
+    const orphanResult = database.confirmOrphanGovernance(
+      "standalone-orphan",
+      {
+        requestId: "close-orphan-request",
+        action: "CLOSE_ORPHAN_IDENTITY",
+        expectedFingerprint: orphanPreview.expectedFingerprint,
+        scanJobId: orphanPreview.expected.scanJobId,
+        localVersionId: "standalone-orphan",
+        expected: orphanPreview.expected,
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    expect(orphanResult.resultingLibraryAlbumId).toBe(orphanGroup);
+    expect(database.getAlbumSummary(orphanGroup)!.visibility).toBe("HIDDEN");
+    finalizeEmptyInventoryScan(database, "post-governance-rescan", "physical");
+    expect(
+      database.raw
+        .prepare("SELECT COUNT(*) AS count FROM albums WHERE id=?")
+        .get("standalone-orphan"),
+    ).toEqual({ count: 1 });
+    expect(
+      database
+        .getLibraryInventoryReport("post-governance-rescan")
+        .versions.find(
+          (version) => version.localVersionId === "standalone-orphan",
+        ),
+    ).toEqual(
+      expect.objectContaining({
+        classification: "REFERENCED_HISTORY",
+        reasons: expect.arrayContaining(["ORPHAN_GOVERNANCE"]),
+      }),
+    );
+    expect(() =>
+      database.raw
+        .prepare(
+          "UPDATE library_orphan_governance_events SET actor_display_name='tampered'",
+        )
+        .run(),
+    ).toThrow(/append-only/);
+    expect(() =>
+      database.raw
+        .prepare("DELETE FROM library_orphan_governance_events")
+        .run(),
+    ).toThrow(/append-only/);
+    open.splice(open.indexOf(database), 1);
+    database.close();
+    const reopened = new CoceanDatabase(path);
+    open.push(reopened);
+    expect(reopened.getAlbumSummary(historyGroup)?.visibility).toBe("HIDDEN");
+    expect(reopened.getAlbumSummary(orphanGroup)?.visibility).toBe("HIDDEN");
+    expect(
+      reopened.listOrphanGovernanceHistory("history-govern-target"),
+    ).toEqual([
+      expect.objectContaining({
+        status: "APPLIED",
+        action: "HIDE_HISTORY_GROUP",
+      }),
+    ]);
+    expect(reopened.listOrphanGovernanceHistory("standalone-orphan")).toEqual([
+      expect.objectContaining({
+        status: "APPLIED",
+        action: "CLOSE_ORPHAN_IDENTITY",
+      }),
+    ]);
+    expect(
+      reopened.listDeliveryJobs().map((job) => [job.id, job.status]),
+    ).toEqual(sideEffectsBefore.deliveries);
+    expect(
+      reopened.listLibraryChangePlans().map((plan) => [plan.id, plan.status]),
+    ).toEqual(sideEffectsBefore.lifecycle);
+    expect(reopened.claimNextLibraryChangePlan()).toBeNull();
+  });
+
+  it("rejects drift atomically, records one rejection, and binds requestId to exact input", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    finalizeEmptyInventoryScan(database, "orphan-drift-scan", "physical");
+    database.createPhysicalOnlyAlbum({
+      id: "orphan-drift-target",
+      groupKey: "orphan-drift-target",
+      title: "Drift",
+      albumArtist: "Artist",
+      year: null,
+    });
+    database.raw
+      .prepare("DELETE FROM library_issues WHERE album_id=?")
+      .run("orphan-drift-target");
+    const groupId = database.getAlbumSummary("orphan-drift-target")!.id;
+    const preview = database.previewOrphanGovernance("orphan-drift-target", {
+      localVersionId: "orphan-drift-target",
+    });
+    database.raw
+      .prepare("UPDATE library_albums SET revision=revision+1 WHERE id=?")
+      .run(groupId);
+    const command = {
+      requestId: "orphan-drift-request",
+      action: "CLOSE_ORPHAN_IDENTITY" as const,
+      expectedFingerprint: preview.expectedFingerprint,
+      scanJobId: preview.expected.scanJobId,
+      localVersionId: "orphan-drift-target",
+      expected: preview.expected,
+    };
+    for (let attempt = 0; attempt < 2; attempt += 1)
+      expect(() =>
+        database.confirmOrphanGovernance("orphan-drift-target", command, {
+          id: "admin",
+          displayName: "Admin",
+        }),
+      ).toThrow(OrphanGovernanceError);
+    expect(database.getAlbumSummary(groupId)!.visibility).toBe("VISIBLE");
+    expect(
+      database.raw
+        .prepare(
+          `SELECT COUNT(*) AS count FROM library_orphan_governance_events
+           WHERE request_id='orphan-drift-request' AND status='REJECTED'`,
+        )
+        .get(),
+    ).toEqual({ count: 1 });
+    expect(() =>
+      database.confirmOrphanGovernance(
+        "orphan-drift-target",
+        { ...command, expectedFingerprint: "f".repeat(64) },
+        { id: "admin", displayName: "Admin" },
+      ),
+    ).toThrow(/requestId 已用于不同/);
+    expect(
+      database.raw
+        .prepare(
+          "SELECT COUNT(*) AS count FROM library_orphan_governance_events",
+        )
+        .get(),
+    ).toEqual({ count: 1 });
+  });
+
+  it("audits a rejected confirmation when its authoritative scan is superseded", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    finalizeEmptyInventoryScan(database, "orphan-old-scan", "physical");
+    database.createPhysicalOnlyAlbum({
+      id: "orphan-scan-drift-target",
+      groupKey: "orphan-scan-drift-target",
+      title: "Scan Drift",
+      albumArtist: "Artist",
+      year: null,
+    });
+    database.raw
+      .prepare("DELETE FROM library_issues WHERE album_id=?")
+      .run("orphan-scan-drift-target");
+    const groupId = database.getAlbumSummary("orphan-scan-drift-target")!.id;
+    const preview = database.previewOrphanGovernance(
+      "orphan-scan-drift-target",
+      {
+        localVersionId: "orphan-scan-drift-target",
+      },
+    );
+    database.raw
+      .prepare(
+        `INSERT INTO album_introductions
+         (album_id,content,model,factual_basis_json,source_hash,generated_at)
+         VALUES (?,?,?,?,?,?)`,
+      )
+      .run(
+        "orphan-scan-drift-target",
+        "retained",
+        "local",
+        "{}",
+        "d".repeat(64),
+        "2026-08-16T00:00:00.000Z",
+      );
+    finalizeEmptyInventoryScan(database, "orphan-new-scan", "physical");
+    expect(() =>
+      database.confirmOrphanGovernance(
+        "orphan-scan-drift-target",
+        {
+          requestId: "orphan-scan-drift-request",
+          action: "CLOSE_ORPHAN_IDENTITY",
+          expectedFingerprint: preview.expectedFingerprint,
+          scanJobId: "orphan-old-scan",
+          localVersionId: "orphan-scan-drift-target",
+          expected: preview.expected,
+        },
+        { id: "admin", displayName: "Admin" },
+      ),
+    ).toThrow(/重新预览/);
+    expect(
+      database.raw
+        .prepare(
+          `SELECT status,error_code FROM library_orphan_governance_events
+           WHERE request_id='orphan-scan-drift-request'`,
+        )
+        .get(),
+    ).toEqual({
+      status: "REJECTED",
+      error_code: "ORPHAN_GOVERNANCE_CONFLICT",
+    });
+  });
+
+  it("scopes an ungrouped preview to only its target and never falls back across roots", () => {
+    const noPhysicalScan = new CoceanDatabase(":memory:");
+    open.push(noPhysicalScan);
+    finalizeEmptyInventoryScan(noPhysicalScan, "music-only-authority");
+    noPhysicalScan.createPhysicalOnlyAlbum({
+      id: "no-authority-target",
+      groupKey: "no-authority-target",
+      title: "No Authority",
+      albumArtist: "Artist",
+      year: null,
+    });
+    expect(() =>
+      noPhysicalScan.previewOrphanGovernance("no-authority-target", {
+        localVersionId: "no-authority-target",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "NO_AUTHORITATIVE_SCAN" }));
+
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    finalizeEmptyInventoryScan(database, "physical-authority", "physical");
+    for (const id of ["ungrouped-target", "ungrouped-neighbor"])
+      database.createPhysicalOnlyAlbum({
+        id,
+        groupKey: id,
+        title: id,
+        albumArtist: "Artist",
+        year: null,
+      });
+    database.raw
+      .prepare(
+        `DELETE FROM library_album_members
+         WHERE album_id IN ('ungrouped-target','ungrouped-neighbor')`,
+      )
+      .run();
+    const preview = database.previewOrphanGovernance("ungrouped-target", {
+      localVersionId: "ungrouped-target",
+    });
+    expect(preview.expected.libraryAlbumId).toBeNull();
+    expect(preview.expected.memberVersionIds).toEqual(["ungrouped-target"]);
+    expect(
+      preview.expected.memberFacts.map((fact) => fact.localVersionId),
+    ).toEqual(["ungrouped-target"]);
+    expect(() =>
+      database.previewOrphanGovernance("ungrouped-neighbor", {
+        localVersionId: "ungrouped-target",
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "ORPHAN_RESOURCE_MISMATCH" }),
+    );
+  });
+
+  it("records exactly one stable rejection when the target disappears", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    finalizeEmptyInventoryScan(database, "disappearing-authority", "physical");
+    database.createPhysicalOnlyAlbum({
+      id: "disappearing-target",
+      groupKey: "disappearing-target",
+      title: "Disappearing",
+      albumArtist: "Artist",
+      year: null,
+    });
+    database.raw
+      .prepare(
+        "DELETE FROM library_issues WHERE album_id='disappearing-target'",
+      )
+      .run();
+    const preview = database.previewOrphanGovernance("disappearing-target", {
+      localVersionId: "disappearing-target",
+    });
+    database.raw
+      .prepare(
+        "DELETE FROM library_album_members WHERE album_id='disappearing-target'",
+      )
+      .run();
+    database.raw
+      .prepare("DELETE FROM albums WHERE id='disappearing-target'")
+      .run();
+    const command = {
+      requestId: "disappearing-request",
+      action: "CLOSE_ORPHAN_IDENTITY" as const,
+      expectedFingerprint: preview.expectedFingerprint,
+      scanJobId: preview.expected.scanJobId,
+      localVersionId: "disappearing-target",
+      expected: preview.expected,
+    };
+    for (let attempt = 0; attempt < 2; attempt += 1)
+      expect(() =>
+        database.confirmOrphanGovernance("disappearing-target", command, {
+          id: "admin",
+          displayName: "Admin",
+        }),
+      ).toThrowError(
+        expect.objectContaining({ code: "ORPHAN_TARGET_NOT_FOUND" }),
+      );
+    const events = database.listOrphanGovernanceHistory("disappearing-target");
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual(
+      expect.objectContaining({
+        status: "REJECTED",
+        errorCode: "ORPHAN_TARGET_NOT_FOUND",
+        expected: preview.expected,
+        before: null,
+      }),
+    );
+  });
+
+  it("does not let a rejected event retain a target through a later scan", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    finalizeEmptyInventoryScan(database, "rejected-authority", "physical");
+    database.createPhysicalOnlyAlbum({
+      id: "rejected-rescan-target",
+      groupKey: "rejected-rescan-target",
+      title: "Rejected",
+      albumArtist: "Artist",
+      year: null,
+    });
+    database.raw
+      .prepare(
+        "DELETE FROM library_issues WHERE album_id='rejected-rescan-target'",
+      )
+      .run();
+    const preview = database.previewOrphanGovernance("rejected-rescan-target", {
+      localVersionId: "rejected-rescan-target",
+    });
+    database.raw
+      .prepare("UPDATE library_albums SET revision=revision+1 WHERE id=?")
+      .run(preview.expected.libraryAlbumId);
+    expect(() =>
+      database.confirmOrphanGovernance(
+        "rejected-rescan-target",
+        {
+          requestId: "rejected-rescan-request",
+          action: "CLOSE_ORPHAN_IDENTITY",
+          expectedFingerprint: preview.expectedFingerprint,
+          scanJobId: preview.expected.scanJobId,
+          localVersionId: "rejected-rescan-target",
+          expected: preview.expected,
+        },
+        { id: "admin", displayName: "Admin" },
+      ),
+    ).toThrow(OrphanGovernanceError);
+    finalizeEmptyInventoryScan(database, "after-rejected-rescan", "physical");
+    expect(database.getAlbum("rejected-rescan-target")).toBeNull();
+    expect(
+      database.listOrphanGovernanceHistory("rejected-rescan-target"),
+    ).toEqual([expect.objectContaining({ status: "REJECTED" })]);
+  });
+
+  it("blocks and rejects governance while a formally produced lifecycle plan is active", () => {
+    const database = new CoceanDatabase(":memory:", {
+      musicRootPolicy: "MANAGED",
+    });
+    open.push(database);
+    finalizeSingleFileInventoryScan(database, "lifecycle-blocker-source");
+    const album = database.getAlbumSummary("lifecycle-blocker-source-version")!;
+    const actor = { id: "admin", displayName: "Admin" };
+    const plan = database.createQuarantinePlan(
+      album.id,
+      {
+        requestId: "lifecycle-blocker-preview",
+        expectedLibraryRevision: album.revision,
+        localVersionId: "lifecycle-blocker-source-version",
+      },
+      actor,
+    );
+    finalizeEmptyInventoryScan(database, "lifecycle-blocker-empty");
+    const preview = database.previewOrphanGovernance(
+      "lifecycle-blocker-source-version",
+      { localVersionId: "lifecycle-blocker-source-version" },
+    );
+    expect(preview.blockers).toContainEqual(
+      expect.objectContaining({ code: "ACTIVE_LIFECYCLE_PLAN" }),
+    );
+    expect(() =>
+      database.confirmOrphanGovernance(
+        "lifecycle-blocker-source-version",
+        {
+          requestId: "lifecycle-blocker-confirm",
+          action: "HIDE_HISTORY_GROUP",
+          expectedFingerprint: preview.expectedFingerprint,
+          scanJobId: preview.expected.scanJobId,
+          localVersionId: "lifecycle-blocker-source-version",
+          expected: preview.expected,
+        },
+        actor,
+      ),
+    ).toThrowError(
+      expect.objectContaining({ code: "ORPHAN_GOVERNANCE_NOT_EXECUTABLE" }),
+    );
+    expect(database.getLibraryChangePlan(plan.id)?.status).toBe("PREVIEWED");
+    expect(database.claimNextLibraryChangePlan()).toBeNull();
+  });
+
+  it("uses an independent visibility-event request namespace", () => {
+    const database = new CoceanDatabase(":memory:");
+    open.push(database);
+    finalizeEmptyInventoryScan(
+      database,
+      "visibility-namespace-scan",
+      "physical",
+    );
+    for (const id of [
+      "visibility-collision-source",
+      "visibility-collision-target",
+    ])
+      database.createPhysicalOnlyAlbum({
+        id,
+        groupKey: id,
+        title: id,
+        albumArtist: "Artist",
+        year: null,
+      });
+    database.raw
+      .prepare("DELETE FROM library_issues WHERE album_id=?")
+      .run("visibility-collision-target");
+    const source = database.getAlbumSummary("visibility-collision-source")!;
+    database.applyAlbumVisibility(
+      source.id,
+      {
+        action: "HIDE",
+        requestId: "orphan:visibility-collision",
+        expectedVisibilityRevision: source.visibilityRevision,
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    const preview = database.previewOrphanGovernance(
+      "visibility-collision-target",
+      { localVersionId: "visibility-collision-target" },
+    );
+    const result = database.confirmOrphanGovernance(
+      "visibility-collision-target",
+      {
+        requestId: "visibility-collision",
+        action: "CLOSE_ORPHAN_IDENTITY",
+        expectedFingerprint: preview.expectedFingerprint,
+        scanJobId: preview.expected.scanJobId,
+        localVersionId: "visibility-collision-target",
+        expected: preview.expected,
+      },
+      { id: "admin", displayName: "Admin" },
+    );
+    expect(result.status).toBe("APPLIED");
+    expect(
+      database.raw
+        .prepare(
+          `SELECT request_id FROM library_visibility_events
+           WHERE library_album_id=? ORDER BY created_at DESC LIMIT 1`,
+        )
+        .get(result.resultingLibraryAlbumId),
+    ).toEqual({ request_id: expect.stringMatching(/^orphan-visibility:/) });
+  });
+
+  it("replays exact input and rejects different input across two database connections", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cocean-orphan-race-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "cocean.sqlite");
+    const first = new CoceanDatabase(path);
+    const second = new CoceanDatabase(path);
+    open.push(first, second);
+    finalizeEmptyInventoryScan(first, "dual-connection-scan", "physical");
+    first.createPhysicalOnlyAlbum({
+      id: "dual-connection-target",
+      groupKey: "dual-connection-target",
+      title: "Dual",
+      albumArtist: "Artist",
+      year: null,
+    });
+    first.raw
+      .prepare(
+        "DELETE FROM library_issues WHERE album_id='dual-connection-target'",
+      )
+      .run();
+    const preview = first.previewOrphanGovernance("dual-connection-target", {
+      localVersionId: "dual-connection-target",
+    });
+    const command = {
+      requestId: "dual-connection-request",
+      action: "CLOSE_ORPHAN_IDENTITY" as const,
+      expectedFingerprint: preview.expectedFingerprint,
+      scanJobId: preview.expected.scanJobId,
+      localVersionId: "dual-connection-target",
+      expected: preview.expected,
+    };
+    const applied = first.confirmOrphanGovernance(
+      "dual-connection-target",
+      command,
+      { id: "admin", displayName: "Admin" },
+    );
+    const replay = second.confirmOrphanGovernance(
+      "dual-connection-target",
+      command,
+      { id: "admin", displayName: "Admin" },
+    );
+    expect(replay).toEqual(applied);
+    expect(() =>
+      second.confirmOrphanGovernance(
+        "dual-connection-target",
+        { ...command, action: "HIDE_HISTORY_GROUP" },
+        { id: "admin", displayName: "Admin" },
+      ),
+    ).toThrowError(
+      expect.objectContaining({ code: "ORPHAN_REQUEST_ID_CONFLICT" }),
+    );
+    expect(
+      first.listOrphanGovernanceHistory("dual-connection-target"),
+    ).toHaveLength(1);
+  });
+
   it("accepts only known structured audit references and never fuzzy JSON text", () => {
     const database = new CoceanDatabase(":memory:");
     open.push(database);
@@ -5175,10 +6081,68 @@ describe("CoceanDatabase", () => {
   });
 });
 
-function createRunningScan(database: CoceanDatabase, id: string): void {
+function seedPassiveOrphanSideEffectRows(
+  database: CoceanDatabase,
+  prefix: string,
+): void {
+  const localVersionId = `${prefix}-side-effect-version`;
+  database.createPhysicalOnlyAlbum({
+    id: localVersionId,
+    groupKey: localVersionId,
+    title: "Passive Side Effect",
+    albumArtist: "Artist",
+    year: null,
+  });
+  const libraryAlbumId = database.getAlbumSummary(localVersionId)!.id;
+  const targetId = `${prefix}-side-effect-target`;
+  createDeliveryTarget(database, targetId);
+  database.createDeliveryJob({
+    id: `${prefix}-side-effect-delivery`,
+    albumId: localVersionId,
+    targetId,
+    targetName: "Target",
+    transport: "AK_FILE_DROP",
+    status: "COMPLETED",
+    fileCount: 0,
+    completedFileCount: 0,
+    totalBytes: 0,
+    transferredBytes: 0,
+    verified: true,
+    error: null,
+    createdAt: "2026-08-16T00:00:00.000Z",
+    startedAt: "2026-08-16T00:00:00.000Z",
+    finishedAt: "2026-08-16T00:00:00.000Z",
+    planId: null,
+  });
+  database.raw
+    .prepare(
+      `INSERT INTO library_change_plans
+       (id,request_id,action,status,library_album_id,local_version_id,root_id,
+        root_container_path,quarantine_root_path,expected_library_revision,
+        input_json,executable,blockers_json,file_count,total_bytes,actor_id,
+        actor_display_name,created_at,finished_at)
+       VALUES (?,?,?,'CANCELLED',?,?,'physical','/library/physical',
+               '/library/quarantine',0,'{}',1,'[]',0,0,'admin','Admin',?,?)`,
+    )
+    .run(
+      `${prefix}-side-effect-plan`,
+      `${prefix}-side-effect-plan-request`,
+      "QUARANTINE_VERSION",
+      libraryAlbumId,
+      localVersionId,
+      "2026-08-16T00:00:00.000Z",
+      "2026-08-16T00:00:00.000Z",
+    );
+}
+
+function createRunningScan(
+  database: CoceanDatabase,
+  id: string,
+  rootId = "music",
+): void {
   database.createScanJob({
     id,
-    rootId: "music",
+    rootId,
     mode: "FULL",
     status: "QUEUED",
     totalFiles: 0,
@@ -5198,8 +6162,9 @@ function createRunningScan(database: CoceanDatabase, id: string): void {
 function finalizeEmptyInventoryScan(
   database: CoceanDatabase,
   scanJobId: string,
+  rootId = "music",
 ): void {
-  createRunningScan(database, scanJobId);
+  createRunningScan(database, scanJobId, rootId);
   database.recordScanDiscovery({
     scanJobId,
     rulesVersion: "inventory-test/1",
@@ -5212,7 +6177,7 @@ function finalizeEmptyInventoryScan(
   });
   database.finalizeSuccessfulScan({
     scanJobId,
-    rootId: "music",
+    rootId,
     stagedFiles: [],
     seenRelativePaths: [],
     albums: [],

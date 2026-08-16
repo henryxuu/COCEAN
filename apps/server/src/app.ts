@@ -20,6 +20,7 @@ import {
   albumVisibilityCommandSchema,
   catalogRecommendationResponseSchema,
   artworkDecisionCommandSchema,
+  confirmOrphanGovernanceCommandSchema,
   confirmLibraryChangePlanCommandSchema,
   confirmReleaseCandidateCommandSchema,
   coceanSettingsSchema,
@@ -29,6 +30,8 @@ import {
   deviceOwnershipSchema,
   libraryIdentityDecisionCommandSchema,
   libraryInventoryReportSchema,
+  orphanGovernancePreviewSchema,
+  previewOrphanGovernanceCommandSchema,
   importMusicBrainzArtworkCommandSchema,
   physicalMediumSchema,
   scanFileOutcomeSchema,
@@ -47,6 +50,7 @@ import {
   LibraryIdentityDecisionError,
   LibraryLifecycleError,
   LibraryInventoryReportError,
+  OrphanGovernanceError,
 } from "@cocean/database";
 import { parseRuntimeStillCatalog } from "@cocean/still-catalog";
 import { z } from "zod";
@@ -873,6 +877,75 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
             ),
     };
   });
+
+  app.post(
+    "/api/v1/local-versions/:id/orphan-governance/preview",
+    async (request, reply) => {
+      if (!requireAdmin(request, reply)) return;
+      const { id } = z.object({ id: z.string() }).parse(request.params);
+      const command = previewOrphanGovernanceCommandSchema.parse(
+        request.body ?? {},
+      );
+      try {
+        return orphanGovernancePreviewSchema.parse(
+          database.previewOrphanGovernance(id, command),
+        );
+      } catch (error) {
+        return handleOrphanGovernanceError(error, reply);
+      }
+    },
+  );
+
+  app.post(
+    "/api/v1/local-versions/:id/orphan-governance/confirm",
+    async (request, reply) => {
+      const admin = requireAdmin(request, reply);
+      if (!admin) return;
+      const { id } = z.object({ id: z.string() }).parse(request.params);
+      const command = confirmOrphanGovernanceCommandSchema.parse(
+        request.body ?? {},
+      );
+      try {
+        return database.confirmOrphanGovernance(id, command, {
+          id: admin.user.id,
+          displayName: admin.user.displayName,
+        });
+      } catch (error) {
+        return handleOrphanGovernanceError(error, reply);
+      }
+    },
+  );
+
+  app.get(
+    "/api/v1/local-versions/:id/orphan-governance/history",
+    async (request, reply) => {
+      const session = requireSession(request, reply);
+      if (!session) return;
+      const { id } = z.object({ id: z.string() }).parse(request.params);
+      const items = database.listOrphanGovernanceHistory(id);
+      if (!database.getAlbum(id) && items.length === 0)
+        return reply.code(404).send({
+          error: "LOCAL_VERSION_NOT_FOUND",
+          message: "没有找到该本地版本",
+        });
+      return {
+        items:
+          session.user.role === "ADMIN"
+            ? items
+            : items.map(
+                ({
+                  actor: _actor,
+                  requestId: _requestId,
+                  before: _before,
+                  expected: _expected,
+                  after: _after,
+                  expectedFingerprint: _expectedFingerprint,
+                  ...summary
+                }) => summary,
+              ),
+      };
+    },
+  );
 
   app.post("/api/v1/albums/:id/lifecycle-plans", async (request, reply) => {
     const admin = requireAdmin(request, reply);
@@ -2369,6 +2442,31 @@ function handleLifecycleError(
     return reply
       .code(error.code === "INVALID_LIFECYCLE_COMMAND" ? 400 : 409)
       .send({ error: error.code, message: error.message });
+  throw error;
+}
+
+function handleOrphanGovernanceError(
+  error: unknown,
+  reply: FastifyReply,
+): FastifyReply {
+  if (error instanceof LibraryInventoryReportError)
+    return reply.code(error.code === "SCAN_NOT_FOUND" ? 404 : 409).send({
+      error: error.code,
+      message:
+        error.code === "SCAN_NOT_FOUND"
+          ? "没有找到扫描任务"
+          : "扫描快照已失效，请重新预览",
+    });
+  if (error instanceof OrphanGovernanceError)
+    return reply
+      .code(
+        error.code === "ORPHAN_TARGET_NOT_FOUND" && !error.result ? 404 : 409,
+      )
+      .send({
+        error: error.code,
+        message: error.message,
+        ...(error.result ? { result: error.result } : {}),
+      });
   throw error;
 }
 

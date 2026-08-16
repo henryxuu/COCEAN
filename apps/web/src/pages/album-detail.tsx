@@ -14,6 +14,7 @@ import {
   type MetadataCommand,
   type MetadataField,
   type MetadataFieldState,
+  type OrphanGovernancePreview,
   type PhysicalMedium,
 } from "@cocean/contracts";
 import {
@@ -86,6 +87,16 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
   const identityHistory = useAsync(() => api.identityDecisions(id), [id]);
   const metadataHistory = useAsync(() => api.metadataHistory(id), [id]);
   const artworkHistory = useAsync(() => api.artworkHistory(id), [id]);
+  const orphanGovernanceHistory = useAsync(async () => {
+    const detail = await api.album(id);
+    const versions = detail.localVersions ?? legacyLocalVersions(detail);
+    const histories = await Promise.all(
+      versions.map((version) => api.orphanGovernanceHistory(version.id)),
+    );
+    return histories
+      .flat()
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }, [id]);
   const capabilities = useAsync(() => api.capabilities(), []);
   const lifecyclePlans = useAsync(
     () => (canManage ? api.lifecyclePlans() : Promise.resolve([])),
@@ -102,6 +113,15 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
   const [lifecyclePreview, setLifecyclePreview] =
     useState<LibraryChangePlan | null>(null);
   const [lifecycleConfirmed, setLifecycleConfirmed] = useState(false);
+  const [orphanGovernanceWorking, setOrphanGovernanceWorking] = useState(false);
+  const [orphanGovernancePreview, setOrphanGovernancePreview] =
+    useState<OrphanGovernancePreview | null>(null);
+  const [orphanGovernanceConfirmed, setOrphanGovernanceConfirmed] =
+    useState(false);
+  const [orphanGovernanceRequestId, setOrphanGovernanceRequestId] = useState<
+    string | null
+  >(null);
+  const [orphanGovernanceStale, setOrphanGovernanceStale] = useState(false);
   const [identitySearchResults, setIdentitySearchResults] = useState<
     AlbumSummary[]
   >([]);
@@ -157,6 +177,10 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
     setIdentitySearchError(null);
     setIdentityTargetDetail(null);
     setIdentityTargetError(null);
+    setOrphanGovernancePreview(null);
+    setOrphanGovernanceConfirmed(false);
+    setOrphanGovernanceRequestId(null);
+    setOrphanGovernanceStale(false);
   }, [id]);
   useEffect(() => {
     if (lifecyclePreview || !album.data) return;
@@ -273,6 +297,62 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
       await lifecyclePlans.reload();
     } catch (error) {
       toast.show(error instanceof Error ? error.message : "预览取消失败");
+    }
+  };
+  const previewOrphanGovernance = async (localVersionId: string) => {
+    setOrphanGovernanceWorking(true);
+    setOrphanGovernanceConfirmed(false);
+    try {
+      const preview = await api.previewOrphanGovernance(localVersionId);
+      setOrphanGovernancePreview(preview);
+      setOrphanGovernanceRequestId(createBrowserUuid());
+      setOrphanGovernanceStale(false);
+    } catch (error) {
+      toast.show(
+        error instanceof Error ? error.message : "无法生成异常身份治理预览",
+      );
+    } finally {
+      setOrphanGovernanceWorking(false);
+    }
+  };
+  const confirmOrphanGovernance = async () => {
+    const preview = orphanGovernancePreview;
+    if (
+      !preview?.action ||
+      !preview.executable ||
+      !orphanGovernanceConfirmed ||
+      !orphanGovernanceRequestId ||
+      orphanGovernanceStale
+    )
+      return;
+    setOrphanGovernanceWorking(true);
+    try {
+      await api.confirmOrphanGovernance(preview.expected.localVersionId, {
+        requestId: orphanGovernanceRequestId,
+        action: preview.action,
+        expectedFingerprint: preview.expectedFingerprint,
+        scanJobId: preview.expected.scanJobId,
+        localVersionId: preview.expected.localVersionId,
+        expected: preview.expected,
+      });
+      setOrphanGovernancePreview(null);
+      setOrphanGovernanceConfirmed(false);
+      setOrphanGovernanceRequestId(null);
+      setOrphanGovernanceStale(false);
+      await Promise.allSettled([
+        album.reload(),
+        orphanGovernanceHistory.reload(),
+      ]);
+      toast.show("异常版本身份已安全闭合；历史、文件与审计记录均已保留");
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        setOrphanGovernanceConfirmed(false);
+        setOrphanGovernanceStale(true);
+        toast.show("状态已变化，当前预览已过期；请重新预览后再确认");
+      } else
+        toast.show(error instanceof Error ? error.message : "异常身份治理失败");
+    } finally {
+      setOrphanGovernanceWorking(false);
     }
   };
   const addDetailedCopy = async (event: React.FormEvent) => {
@@ -931,6 +1011,83 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
 
           <details className="management-disclosure">
             <summary>
+              <span>异常版本治理</span>
+              <small>预览并闭合孤立展示身份，不移动或删除音乐文件</small>
+            </summary>
+            <div className="orphan-governance">
+              <p>
+                系统会基于最新权威扫描复核版本、主版本、成员关系、显示状态和历史引用；确认时如有变化会拒绝执行。
+              </p>
+              {canManage ? (
+                <div className="orphan-governance-versions">
+                  {localVersions.map((version) => (
+                    <div className="orphan-governance-version" key={version.id}>
+                      <div>
+                        <strong>
+                          {version.isPrimary ? "主版本" : "本地版本"} ·{" "}
+                          {version.title}
+                        </strong>
+                        <small>
+                          {version.fileCount} 个当前文件 · 仅治理展示身份
+                        </small>
+                      </div>
+                      <Button
+                        variant="secondary"
+                        disabled={orphanGovernanceWorking}
+                        onClick={() => void previewOrphanGovernance(version.id)}
+                      >
+                        <ShieldCheck />
+                        检查异常状态
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <small>
+                  只有管理员可以生成预览和确认治理；下方仅显示脱敏结果。
+                </small>
+              )}
+
+              {orphanGovernancePreview ? (
+                <OrphanGovernancePreviewCard
+                  preview={orphanGovernancePreview}
+                  confirmed={orphanGovernanceConfirmed}
+                  stale={orphanGovernanceStale}
+                  working={orphanGovernanceWorking}
+                  onConfirmedChange={setOrphanGovernanceConfirmed}
+                  onCancel={() => {
+                    setOrphanGovernancePreview(null);
+                    setOrphanGovernanceConfirmed(false);
+                    setOrphanGovernanceRequestId(null);
+                    setOrphanGovernanceStale(false);
+                  }}
+                  onConfirm={() => void confirmOrphanGovernance()}
+                />
+              ) : null}
+
+              <div className="orphan-governance-history">
+                <strong>最近治理结果</strong>
+                {orphanGovernanceHistory.error ? (
+                  <small>治理记录暂时不可用</small>
+                ) : orphanGovernanceHistory.data?.length ? (
+                  orphanGovernanceHistory.data.map((event) => (
+                    <div key={event.id}>
+                      <span>
+                        {event.status === "APPLIED" ? "已执行" : "已拒绝"} ·{" "}
+                        {orphanGovernanceActionLabel(event.action)}
+                      </span>
+                      <small>{formatHistoryTime(event.createdAt)}</small>
+                    </div>
+                  ))
+                ) : (
+                  <small>尚无异常版本治理记录</small>
+                )}
+              </div>
+            </div>
+          </details>
+
+          <details className="management-disclosure">
+            <summary>
               <span>合并或拆分版本</span>
               <small>处理重复唱片、残缺版本与错误聚合</small>
             </summary>
@@ -1125,6 +1282,79 @@ export function AlbumDetailPage({ canManage }: { canManage: boolean }) {
         </section>
       ) : null}
       <Toast message={toast.message} />
+    </div>
+  );
+}
+
+export function OrphanGovernancePreviewCard({
+  preview,
+  confirmed,
+  stale,
+  working,
+  onConfirmedChange,
+  onCancel,
+  onConfirm,
+}: {
+  preview: OrphanGovernancePreview;
+  confirmed: boolean;
+  stale: boolean;
+  working: boolean;
+  onConfirmedChange: (confirmed: boolean) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div
+      className="orphan-governance-preview"
+      role="region"
+      aria-label="异常版本治理预览"
+    >
+      <div>
+        <strong>
+          {preview.action
+            ? orphanGovernanceActionLabel(preview.action)
+            : "当前不能安全治理"}
+        </strong>
+        <p>
+          分类：{preview.expected.classification} · 引用依据：
+          {preview.expected.reasons.join("、")}
+        </p>
+        <small>
+          扫描 {preview.expected.scanJobId} · 指纹{" "}
+          {preview.expectedFingerprint.slice(0, 12)}
+        </small>
+      </div>
+      {preview.blockers.length ? (
+        <div className="lifecycle-blockers" role="alert">
+          {preview.blockers.map((blocker) => (
+            <span key={blocker.code}>{blocker.message}</span>
+          ))}
+        </div>
+      ) : stale ? (
+        <div className="lifecycle-blockers" role="alert">
+          <span>预览已过期，必须重新检查后才能确认。</span>
+        </div>
+      ) : (
+        <label className="lifecycle-confirmation">
+          <input
+            type="checkbox"
+            checked={confirmed}
+            onChange={(event) => onConfirmedChange(event.target.checked)}
+          />
+          我确认只关闭异常展示身份；本地版本、历史账本和音乐文件必须保留
+        </label>
+      )}
+      <div className="lifecycle-preview-actions">
+        <Button variant="quiet" onClick={onCancel}>
+          取消
+        </Button>
+        <Button
+          disabled={working || stale || !preview.executable || !confirmed}
+          onClick={onConfirm}
+        >
+          确认安全闭合
+        </Button>
+      </div>
     </div>
   );
 }
@@ -2623,6 +2853,23 @@ function identityDecisionSummary(decision: LibraryIdentityDecision): string {
       ? `主版本 ${shortStableId(decision.details.primaryVersionId)}`
       : "保留当前主版本";
   return `补偿决定 ${shortStableId(decision.details.compensatedDecisionId ?? "未知")}`;
+}
+
+function orphanGovernanceActionLabel(action: string): string {
+  return (
+    {
+      DETACH_TO_HIDDEN_HISTORY: "将异常版本归入独立隐藏历史",
+      HIDE_HISTORY_GROUP: "隐藏全历史唱片组",
+      CLOSE_ORPHAN_IDENTITY: "关闭无依据孤立身份",
+    }[action] ?? action
+  );
+}
+
+function formatHistoryTime(value: string): string {
+  return new Intl.DateTimeFormat("zh-CN", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(value));
 }
 
 export function AlbumIntegrityIssues({

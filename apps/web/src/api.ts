@@ -29,6 +29,10 @@ import type {
   ModelConfiguration,
   ModelVerificationStatus,
   OwnedDevice,
+  OrphanGovernanceEvent,
+  OrphanGovernancePreview,
+  OrphanGovernanceResult,
+  ConfirmOrphanGovernanceCommand,
   PhysicalCopy,
   PhysicalMedium,
   ReleaseCandidate,
@@ -256,6 +260,33 @@ export const api = {
   albumVisibilityHistory(albumId: string): Promise<AlbumVisibilityEvent[]> {
     return request<{ items: AlbumVisibilityEvent[] }>(
       `/api/v1/albums/${encodeURIComponent(albumId)}/visibility-history`,
+    ).then((result) => result.items);
+  },
+  previewOrphanGovernance(
+    localVersionId: string,
+  ): Promise<OrphanGovernancePreview> {
+    return request(
+      `/api/v1/local-versions/${encodeURIComponent(localVersionId)}/orphan-governance/preview`,
+      {
+        method: "POST",
+        body: JSON.stringify({ localVersionId }),
+      },
+    );
+  },
+  confirmOrphanGovernance(
+    localVersionId: string,
+    command: ConfirmOrphanGovernanceCommand,
+  ): Promise<OrphanGovernanceResult> {
+    return request(
+      `/api/v1/local-versions/${encodeURIComponent(localVersionId)}/orphan-governance/confirm`,
+      { method: "POST", body: JSON.stringify(command) },
+    );
+  },
+  orphanGovernanceHistory(
+    localVersionId: string,
+  ): Promise<OrphanGovernanceEvent[]> {
+    return request<{ items: OrphanGovernanceEvent[] }>(
+      `/api/v1/local-versions/${encodeURIComponent(localVersionId)}/orphan-governance/history`,
     ).then((result) => result.items);
   },
   createQuarantinePlan(
